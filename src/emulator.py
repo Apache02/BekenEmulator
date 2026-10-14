@@ -300,6 +300,11 @@ class BekenEmulator:
         # its own pane; when it is None (every CLI run) nothing changes and the
         # bytes go to stdout exactly as before.
         self.uart_sink = uart_sink
+        # Optional callback(str) for [WIFI]/[NET] lines; see net_log().
+        self.net_sink = None
+        # Optional callback(direction, frame_bytes, now_us) for every frame the
+        # IP bridge carried, so a front end can show the bytes themselves.
+        self.net_frame_sink = None
         # Appends to uart1_rx may come from another thread (a GUI typing into
         # the console) while the emulation thread pops from it. Only appends
         # are locked: the emulator is the sole consumer, and an append can only
@@ -442,7 +447,17 @@ class BekenEmulator:
         Shares stdout with the guest's UART output, so it goes out on a line
         boundary (a leading newline when the UART is mid-line) and leaves the
         stream at a line start.
+
+        A front end that has somewhere better to put these - its own network
+        pane rather than the middle of the firmware's debug log - sets
+        net_sink and gets whole lines instead of a byte stream.
         """
+        if self.net_sink is not None:
+            try:
+                self.net_sink(msg)
+            except Exception:
+                pass
+            return
         data = msg.encode("utf-8", "replace") + b"\n"
         if self.uart_sink is not None:
             # A GUI shows these in its log pane, where the user is looking,
@@ -484,6 +499,10 @@ class BekenEmulator:
                                  ip=_netstack.str2ip("192.168.1.1") if role == "ap" else None,
                                  net_out=net_out, forwards=forwards, http_gets=http_gets,
                                  mqtt_pubs=mqtt_pubs)
+        # Late binding on purpose: a front end may attach its frame sink after
+        # the peer, and the snapshot path rebuilds this stack.
+        net.on_frame = lambda d, f, us: (self.net_frame_sink(d, f, us)
+                                         if self.net_frame_sink is not None else None)
         peer = _wifipeer.WifiPeer(
             mac, net, inject=lambda f: self.wifimac.inject(f, self.state.insn_count),
             log=self.net_log, role=role, ssid=ssid, channel=channel, pcap=pcap,
@@ -1466,7 +1485,7 @@ class BekenEmulator:
             self.wifimac = snap["wifimac"]
             self.wifimac.mem = (lambda addr, size: self.mu.mem_read(addr, size),
                                 lambda addr, data: self.mu.mem_write(addr, bytes(data)))
-            self.wifimac.log = self._print
+            self.wifimac.log = self.net_log      # not _print: --only-uart silences that
             self.wifimac.debug = bool(os.environ.get("WIFIDBG"))
             if peer is not None:
                 # a peer attached before the load binds to the restored MAC

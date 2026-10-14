@@ -183,6 +183,11 @@ def parse_args():
                              "wildcards honoured, as a real broker does). This is the way in: the "
                              "firmware picked those filters itself, so e.g. --mqtt-publish "
                              "\"cmnd/obkSim/POWER=ON\" drives OpenBeken over MQTT. Repeatable.")
+    parser.add_argument("--pcap-ip", dest="pcap_ip", default=None, metavar="FILE",
+                        help="Write every frame the IP bridge carried to FILE (link type "
+                             "Ethernet) for Wireshark: the device's own traffic, both "
+                             "directions, exactly as it crossed. This is the network; --pcap is "
+                             "the air.")
     parser.add_argument("--pcap", dest="pcap", default=None, metavar="FILE",
                         help="Write every 802.11 frame crossing the peer to FILE (link type "
                              "IEEE 802.11, no FCS) for Wireshark.")
@@ -299,6 +304,11 @@ def main():
                                  net_out=args.net_out, pcap=args.pcap,
                                  http_gets=args.net_http_gets,
                                  mqtt_pubs=parse_mqtt_pubs(args.mqtt_pubs))
+        if args.pcap_ip:
+            from src import netstack as _netstack
+            ip_cap = _netstack.EthPcap(args.pcap_ip)
+            emu.net_frame_sink = lambda d, f, us: ip_cap.write(f, us)
+            emu.net_log("[NET] writing the bridge's frames to %s" % args.pcap_ip)
         if args.snapshot_save:
             if not args.snapshot_at:
                 raise ValueError("--snapshot-save needs --snapshot-at (an instruction count or a UART marker)")

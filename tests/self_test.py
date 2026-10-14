@@ -230,7 +230,7 @@ TEST_CASES = [
                                "OpenBK7231T_QIO_1.18.300_obkConfig_staOpen_BekenSim_netTraffic.bin"),
         "args": ["--only-uart", "-key", "TUYA", "--wifi-peer", "auto", "--wifi-ssid", "BekenSim",
                  "--mqtt-publish", "cmnd/obkSim/echo=MqttPushReachedTheFirmware",
-                 "--pcap", "{pcap}"],
+                 "--pcap", "{pcap}", "--pcap-ip", "{pcap_ip}"],
         "timeout": 1200,
         "expected_strings": [
             "[NET] DHCP: device c8:47:8c:00:00:00 got 192.168.1.100",
@@ -253,6 +253,11 @@ TEST_CASES = [
         "pcap_expect": ["beacon", "authentication", "association request", "association response",
                         "data", "GET /hello?dev=obk", "BekenSimulator offline network",
                         "obkSim/connected"],
+        # The same traffic at the IP level, which is what the GUI's details
+        # window shows and what --pcap-ip writes: the frames themselves, both
+        # directions, the bytes the device actually put on the wire.
+        "ip_pcap_expect": ["GET /hello?dev=obk", "api.bekensim.test",
+                           "BekenSimulator offline network", "obkSim", "cmnd/obkSim/echo"],
     },
     {
         # Snapshots (--snapshot-save / --snapshot-load), the core of it: the
@@ -1210,6 +1215,23 @@ TEST_CASES = [
             "[NET] DNS m2.tuyaeu.com -> 10.200.",
             "(m2.tuyaeu.com):8886 (accepted for capture)",
             ("sends: TLS ClientHello", 2),
+            # What the cloud connection says about itself before any key is
+            # exchanged. Tuya authenticates its devices with a shared secret
+            # rather than a certificate, so the hello offers only PSK suites
+            # and carries no server name.
+            "client hello: version 1.2, 4 cipher suites (TLS_PSK_WITH_AES_256_CBC_SHA",
+            "no server name",
+            "answered with TLS_PSK_WITH_AES_256_CBC_SHA, waiting for the key identity",
+            # The device accepts that answer and moves on to naming its key -
+            # and its own TLS library then stops, because this dump holds no
+            # pre-shared key to name. mbedTLS -0x7600 is PRIVATE_KEY_REQUIRED,
+            # "the own private key or pre-shared key is not set, but needed"
+            # (the vendor's own ssl.h). Before the stack answered at all, the
+            # same point reported -0x7280, CONN_EOF, which said nothing about
+            # the device. If a dump ever does carry a usable key, this line
+            # changes and the identity is logged instead - so assert it, and
+            # look again when it fails.
+            "mbedtls_ssl_handshake returned 7600 -30208",
         ],
         "pcap_expect": ["beacon", "probe request", "authentication", "association request",
                         "association response", "data", "HojnikB WiFi"],
@@ -2501,7 +2523,10 @@ DESCRIPTIONS = {
         "Tuya device encrypts the same way, and opens TLS to its cloud twice - once at a fixed "
         "address and once by name. Nothing leaves the machine: the connections are accepted and "
         "decoded locally. The identity it announces matches the product key given on the command "
-        "line, which is what confirms the decryption rather than assuming it.",
+        "line, which is what confirms the decryption rather than assuming it. The cloud connection "
+        "itself is answered far enough to learn how it is secured: Tuya devices authenticate with "
+        "a shared secret rather than a certificate, and this one accepts the answer and then stops, "
+        "because the dump holds no such secret to present.",
     "BK7231N Tuya thermostat: EZ-mode sniffing reported, then falls back to AP pairing":
         "The pairing mode that needs real hardware behaviour: the device opens its receiver to "
         "every frame on the channel and reads the credentials out of the pattern a phone sends. "
@@ -2940,6 +2965,47 @@ def _pcap_frames(path):
     return frames
 
 
+def _ip_pcap_frames(path):
+    """The Ethernet frames in a capture written by --pcap-ip (link type 1)."""
+    import struct
+    with open(path, "rb") as f:
+        raw = f.read()
+    if len(raw) < 24:
+        raise ValueError("%d bytes, no pcap header" % len(raw))
+    magic, vmaj, vmin, _, _, _, link = struct.unpack("<IHHiIII", raw[:24])
+    if magic != 0xA1B2C3D4 or (vmaj, vmin) != (2, 4) or link != 1:
+        raise ValueError("header magic 0x%08X v%d.%d link type %d" % (magic, vmaj, vmin, link))
+    frames, off = [], 24
+    while off + 16 <= len(raw):
+        incl = struct.unpack("<I", raw[off + 8:off + 12])[0]
+        if off + 16 + incl > len(raw):
+            break
+        frames.append(raw[off + 16:off + 16 + incl])
+        off += 16 + incl
+    return frames
+
+
+def _check_ip_pcap(path, expect, checks):
+    """Assert a case's IP-level capture ("{pcap_ip}" in its args).
+
+    Each "ip_pcap_expect" item is text some frame's bytes must contain. This
+    is what proves the bytes a user opens in Wireshark are the device's real
+    traffic and not a reconstruction of the log lines.
+    """
+    try:
+        frames = _ip_pcap_frames(path)
+        ok, detail = bool(frames), "%d frames" % len(frames)
+    except (OSError, ValueError) as e:
+        frames, ok, detail = [], False, str(e)
+    all_ok = _record_check(checks, "pcap-ip: valid Ethernet capture", ok, detail)
+    for item in expect:
+        needle = item.encode("latin-1")
+        n = sum(1 for fr in frames if needle in fr)
+        all_ok = _record_check(checks, "pcap-ip: a frame carries '%s'" % item,
+                               n > 0, "%d frames" % n if n else "none") and all_ok
+    return all_ok
+
+
 def _check_pcap(path, expect, checks):
     """Assert a case's capture file ("{pcap}" in its args).
 
@@ -3210,12 +3276,17 @@ def run_test(test_config):
 
     # "{pcap}" in the args becomes a fresh temporary capture file, checked
     # against the case's "pcap_expect" after the run and then deleted.
-    pcap_path = None
+    pcap_path = ip_pcap_path = None
     if any("{pcap}" in a for a in args):
         import tempfile
         fd, pcap_path = tempfile.mkstemp(prefix="bekensim_", suffix=".pcap")
         os.close(fd)
         args = [a.replace("{pcap}", pcap_path) for a in args]
+    if any("{pcap_ip}" in a for a in args):
+        import tempfile
+        fd, ip_pcap_path = tempfile.mkstemp(prefix="bekensim_ip_", suffix=".pcap")
+        os.close(fd)
+        args = [a.replace("{pcap_ip}", ip_pcap_path) for a in args]
 
     cmd = [sys.executable, MAIN_SCRIPT, binary] + args
     # EMU_REPORT makes the emulator periodically print its approximate
@@ -3360,6 +3431,14 @@ def run_test(test_config):
             all_passed = False
         try:
             os.remove(pcap_path)
+        except OSError:
+            pass
+
+    if ip_pcap_path:
+        if not _check_ip_pcap(ip_pcap_path, test_config.get("ip_pcap_expect") or [], checks):
+            all_passed = False
+        try:
+            os.remove(ip_pcap_path)
         except OSError:
             pass
 

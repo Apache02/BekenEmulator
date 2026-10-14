@@ -49,6 +49,13 @@ jobs:
     - name: Virtual 802.11 peer self-tests (no firmware)
       run: python src/wifipeer.py
 
+    # The UI needs a display to build its widgets. xvfb gives it one; if it is
+    # unavailable the self-tests report a skip rather than failing the build.
+    - name: Simulator UI self-tests (no firmware)
+      run: |
+        sudo apt-get update -qq && sudo apt-get install -y -qq xvfb python3-tk
+        xvfb-run -a python tools/sim_ui.py --selftest
+
     - name: Run self tests (also writes report/index.html)
       id: tests
       run: |

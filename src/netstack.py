@@ -209,6 +209,79 @@ TUYA_SUFFIX_35 = b"\x00\x00\x99\x66"
 TUYA_BROADCAST_KEY = hashlib.md5(b"yGAdlopoPVldABfn").digest()
 
 
+# TLS cipher suites worth naming. Tuya's devices talk to their cloud over
+# TLS-PSK: there is no certificate and no server name, the two sides already
+# share a secret from provisioning. That is why a device's cloud connection
+# offers only these suites, and why the identity it claims is readable.
+TLS_PSK_SUITES = {
+    0x008A: "TLS_PSK_WITH_RC4_128_SHA",
+    0x008B: "TLS_PSK_WITH_3DES_EDE_CBC_SHA",
+    0x008C: "TLS_PSK_WITH_AES_128_CBC_SHA",
+    0x008D: "TLS_PSK_WITH_AES_256_CBC_SHA",
+    0x00A8: "TLS_PSK_WITH_AES_128_GCM_SHA256",
+    0x00AE: "TLS_PSK_WITH_AES_128_CBC_SHA256",
+    0x00AF: "TLS_PSK_WITH_AES_256_CBC_SHA384",
+    0xC0A4: "TLS_PSK_WITH_AES_128_CCM",
+    0xC0A8: "TLS_PSK_WITH_AES_128_CCM_8",
+}
+TLS_VERSIONS = {0x0301: "1.0", 0x0302: "1.1", 0x0303: "1.2", 0x0304: "1.3"}
+
+
+def tls_client_hello(data):
+    """What a TLS ClientHello says in clear, or None if this is not one.
+
+    Returns the record version, the offered cipher suites, the server name if
+    the client sent one, and which of the suites are pre-shared-key ones.
+    Nothing here is decryption: a ClientHello is sent before any key exchange,
+    so all of it is on the wire in the open.
+    """
+    try:
+        if len(data) < 45 or data[0] != 0x16 or data[5] != 0x01:
+            return None
+        ver = struct.unpack("!H", data[9:11])[0]
+        p = 11 + 32                             # past version and random
+        p += 1 + data[p]                        # session id
+        cs_len = struct.unpack("!H", data[p:p + 2])[0]
+        p += 2
+        suites = [struct.unpack("!H", data[p + i:p + i + 2])[0] for i in range(0, cs_len, 2)]
+        p += cs_len
+        p += 1 + data[p]                        # compression methods
+        exts = {}
+        if p + 2 <= len(data):
+            ext_len = struct.unpack("!H", data[p:p + 2])[0]
+            p += 2
+            end = min(p + ext_len, len(data))
+            while p + 4 <= end:
+                et, el = struct.unpack("!HH", data[p:p + 4])
+                exts[et] = data[p + 4:p + 4 + el]
+                p += 4 + el
+        return {"version": TLS_VERSIONS.get(ver, "0x%04x" % ver),
+                "suites": suites,
+                "psk": [s for s in suites if s in TLS_PSK_SUITES],
+                "extensions": exts,
+                "sni": tls_sni(data)}
+    except (IndexError, struct.error):
+        return None
+
+
+def tls_psk_identity(data):
+    """The identity from a TLS-PSK ClientKeyExchange, or None.
+
+    In a PSK handshake the client names which shared key it is using, and that
+    name travels in clear. For a Tuya device it is how the cloud knows which
+    device is calling, so it is the one part of the cloud conversation that can
+    be read without the secret itself.
+    """
+    try:
+        if len(data) < 11 or data[0] != 0x16 or data[5] != 0x10:
+            return None
+        n = struct.unpack("!H", data[9:11])[0]
+        ident = data[11:11 + n]
+        return ident if len(ident) == n else None
+    except (IndexError, struct.error):
+        return None
+
+
 def tuya_lan_decode(data):
     """One line describing a Tuya LAN discovery datagram, or None if it is not one.
 
@@ -265,6 +338,100 @@ def tuya_lan_decode(data):
         return out.decode("utf-8")
     except UnicodeDecodeError:
         return None
+
+
+class EthPcap:
+    """pcap writer for the frames the bridge carried (link type 1, Ethernet).
+
+    The 802.11 capture written by --pcap is a different link type, so the two
+    are separate files on purpose: one is the air, this one is the network.
+    """
+
+    LINK_ETHERNET = 1
+
+    def __init__(self, path):
+        self.f = open(path, "wb") if isinstance(path, str) else path
+        self.f.write(struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, self.LINK_ETHERNET))
+        self.f.flush()
+        self.count = 0
+
+    def write(self, frame, us):
+        self.f.write(struct.pack("<IIII", us // 1_000_000, us % 1_000_000, len(frame), len(frame)))
+        self.f.write(frame)
+        self.f.flush()
+        self.count += 1
+
+    def close(self):
+        try:
+            self.f.close()
+        except Exception:
+            pass
+
+
+def hexdump(data, width=16, base=0):
+    """Classic offset / hex / printable dump, for showing the bytes themselves."""
+    out = []
+    for off in range(0, len(data), width):
+        chunk = data[off:off + width]
+        hexed = " ".join("%02x" % b for b in chunk)
+        text = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        out.append("%08x  %-*s  %s" % (base + off, width * 3 - 1, hexed, text))
+    return "\n".join(out)
+
+
+def describe_frame(frame):
+    """One line saying what an Ethernet frame is, for a packet list.
+
+    Deliberately shallow: enough to find the interesting frame in a list, with
+    the bytes themselves alongside for anything more. Never raises - a short or
+    malformed frame is described as what it is rather than hidden.
+    """
+    if len(frame) < 14:
+        return "runt frame, %d bytes" % len(frame)
+    etype = struct.unpack("!H", frame[12:14])[0]
+    p = frame[14:]
+    if etype == ETH_ARP:
+        if len(p) < 28:
+            return "ARP (truncated)"
+        op = struct.unpack("!H", p[6:8])[0]
+        sender, target = p[14:18], p[24:28]
+        if op == 1:
+            return "ARP who has %s, tell %s" % (ip2str(target), ip2str(sender))
+        if op == 2:
+            return "ARP %s is at %s" % (ip2str(sender), p[8:14].hex(":"))
+        return "ARP opcode %d" % op
+    if etype != ETH_IP:
+        return "ethertype 0x%04x, %d bytes" % (etype, len(p))
+    if len(p) < 20:
+        return "IPv4 (truncated)"
+    ihl = (p[0] & 0x0F) * 4
+    proto, src, dst = p[9], p[12:16], p[16:20]
+    body = p[ihl:]
+    if proto == IP_ICMP and len(body) >= 4:
+        kind = {0: "echo reply", 8: "echo request"}.get(body[0], "type %d" % body[0])
+        return "ICMP %s %s to %s" % (kind, ip2str(src), ip2str(dst))
+    if proto == IP_UDP and len(body) >= 8:
+        sp, dp = struct.unpack("!HH", body[:4])
+        services = {53: "DNS", 67: "DHCP", 68: "DHCP", 123: "NTP", 1900: "SSDP",
+                    5353: "mDNS", 6666: "Tuya LAN", 6667: "Tuya LAN"}
+        # A reply has the service on its SOURCE port, so both ends are
+        # candidates. A well-known port wins, which keeps a DNS reply to a
+        # high port from being named after whatever that port usually means.
+        named = [services[p] for p in (dp, sp) if p in services]
+        low = [services[p] for p in (dp, sp) if p in services and p < 1024]
+        what = (low or named or [None])[0]
+        return "UDP %s:%d to %s:%d%s, %d bytes" % (
+            ip2str(src), sp, ip2str(dst), dp, (" (%s)" % what) if what else "", len(body) - 8)
+    if proto == IP_TCP and len(body) >= 20:
+        sp, dp = struct.unpack("!HH", body[:4])
+        flags = body[13]
+        names = [n for bit, n in ((TCP_SYN, "SYN"), (TCP_ACK, "ACK"), (TCP_PSH, "PSH"),
+                                  (TCP_FIN, "FIN"), (TCP_RST, "RST")) if flags & bit]
+        payload = len(body) - (body[12] >> 4) * 4
+        return "TCP %s:%d to %s:%d [%s]%s" % (
+            ip2str(src), sp, ip2str(dst), dp, ",".join(names) or "none",
+            (", %d bytes" % payload) if payload > 0 else "")
+    return "IPv4 protocol %d, %s to %s" % (proto, ip2str(src), ip2str(dst))
 
 
 def mqtt_varint(n):
@@ -642,12 +809,16 @@ class TcpConn:
                     self.proto = "mqtt"
                 elif self.rx_buf.split(b" ", 1)[0] in HTTP_METHODS:
                     self.proto = "http"
+                elif tls_client_hello(self.rx_buf) is not None:
+                    self.proto = "tls"
                 else:
-                    self.proto = "raw"          # TLS and the rest: capture only
+                    self.proto = "raw"          # anything else: capture only
             if self.proto == "mqtt":
                 self._mqtt_serve()
             elif self.proto == "http":
                 self._http_serve()
+            elif self.proto == "tls":
+                self._tls_serve()
         else:
             with self.stack.io.lock:
                 self.to_host.append(data)
@@ -748,6 +919,92 @@ class TcpConn:
                 self.close_after_flush = True
                 return
 
+    def _tls_serve(self):
+        """Answer a TLS-PSK handshake far enough to learn who is calling.
+
+        A device's cloud connection cannot be decrypted here: the shared secret
+        lives in its provisioning data. But the handshake's first steps are in
+        clear, and a client only sends the identity of the key it intends to
+        use AFTER the server has replied. So this replies: ServerHello picking
+        one of the offered PSK suites, then ServerHelloDone. The device answers
+        with a ClientKeyExchange naming its key, which is logged, and then
+        switches to encryption and the conversation goes dark - as it should.
+
+        Nothing here weakens anything: no key is recovered or guessed, and the
+        handshake cannot complete, because completing it needs the secret.
+        """
+        while True:
+            buf = self.rx_buf
+            if len(buf) < 5:
+                return
+            if buf[0] not in (0x16, 0x14, 0x15, 0x17):
+                self.proto = "raw"              # not TLS after all
+                return
+            n = struct.unpack("!H", buf[3:5])[0]
+            if len(buf) < 5 + n:
+                return                          # record incomplete
+            rec, self.rx_buf = buf[:5 + n], buf[5 + n:]
+            info = tls_client_hello(rec)
+            if info and not self.answered:
+                self.answered = True
+                named = ", ".join(TLS_PSK_SUITES.get(s, "0x%04x" % s) for s in info["suites"])
+                self.stack.log("[NET] TLS %s client hello: version %s, %d cipher suites (%s)%s"
+                               % (self.log_prefix, info["version"], len(info["suites"]), named,
+                                  ", server name %s" % info["sni"] if info["sni"] else
+                                  ", no server name"))
+                if not info["psk"]:
+                    self.stack.log("[NET] TLS %s offers no pre-shared-key suite, so nothing "
+                                   "further can be read" % self.log_prefix)
+                    return
+                self.queue(self._tls_server_hello(info["psk"][0], info.get("extensions") or {}))
+                self.stack.log("[NET] TLS %s answered with %s, waiting for the key identity"
+                               % (self.log_prefix, TLS_PSK_SUITES[info["psk"][0]]))
+                continue
+            ident = tls_psk_identity(rec)
+            if ident is not None:
+                text = ident.decode("utf-8", "replace")
+                self.stack.log("[NET] TLS %s pre-shared key identity: %s"
+                               % (self.log_prefix, text))
+                self.stack.tls_identities.append((self.log_prefix, ident))
+                continue
+            if rec[0] == 0x15:
+                self.stack.log("[NET] TLS %s alert, the device gave up on the handshake"
+                               % self.log_prefix)
+                return
+            if rec[0] == 0x17:
+                self.stack.log("[NET] TLS %s is encrypted from here on (%d bytes), which needs "
+                               "the device's own secret to read" % (self.log_prefix, len(rec) - 5))
+                return
+
+    # Extensions echoed back when the client offers them. A client built to
+    # require these refuses a server that ignores them, and echoing costs
+    # nothing here: they change how keys would be derived, and no key is ever
+    # derived on this side.
+    TLS_ECHO_EXTENSIONS = (0x0001,      # max_fragment_length, echoed with its value
+                           0x0016,      # encrypt_then_mac
+                           0x0017)      # extended_master_secret
+
+    def _tls_server_hello(self, suite, client_exts=()):
+        """ServerHello picking `suite`, then ServerHelloDone, in one record.
+
+        The random is derived from the connection rather than taken from the
+        system, so a run stays reproducible like everything else here.
+        """
+        seed = ("%s|%d" % (self.log_prefix, suite)).encode()
+        rnd = (hashlib.sha256(seed).digest() + hashlib.sha256(seed[::-1]).digest())[:32]
+        ext = b""
+        for et in self.TLS_ECHO_EXTENSIONS:
+            if et in client_exts:
+                val = client_exts[et] if et == 0x0001 else b""
+                ext += struct.pack("!HH", et, len(val)) + val
+        body = struct.pack("!H", 0x0303) + rnd + b"\x00" + struct.pack("!H", suite) + b"\x00"
+        if ext:
+            body += struct.pack("!H", len(ext)) + ext
+        hello = b"\x02" + struct.pack("!I", len(body))[1:] + body
+        done = b"\x0e\x00\x00\x00"
+        payload = hello + done
+        return b"\x16\x03\x03" + struct.pack("!H", len(payload)) + payload
+
     def _mqtt_deliver(self):
         """Send the device any --mqtt-publish message it has now subscribed to.
 
@@ -821,6 +1078,9 @@ class NetStack:
         self.netmask = netmask
         self.net_out = net_out
         self.output = None              # callback(eth_frame)
+        # Optional callback(direction, frame_bytes, now_us) for a front end
+        # that shows the traffic itself; see _trace().
+        self.on_frame = None
         self.io = HostIO()
         self.now_us = 0
         self.arp = {}                   # ip bytes -> mac bytes
@@ -861,6 +1121,7 @@ class NetStack:
         self.http_gets = list(http_gets)  # paths to GET from the device's port 80
         self.http_replies = []
         self.mqtt_publishes = []        # (topic, payload) seen by the offline broker
+        self.tls_identities = []        # (connection, identity bytes) from TLS-PSK handshakes
         # (topic, payload) the offline broker should push TO the device, each
         # sent once the device subscribes to a filter that matches it.
         self.mqtt_pubs = list(mqtt_pubs)
@@ -869,7 +1130,23 @@ class NetStack:
     # --------------------------------------------------------------- output
     def send_eth(self, dst_mac, ethertype, payload):
         if self.output is not None:
-            self.output(eth_frame(dst_mac, self.mac, ethertype, payload))
+            frame = eth_frame(dst_mac, self.mac, ethertype, payload)
+            self._trace("to device", frame)
+            self.output(frame)
+
+    def _trace(self, direction, frame):
+        """Hand a front end every byte that crossed the bridge, as it crossed.
+
+        Both edges of the stack funnel through here, so this is the whole
+        record: not a summary of what was understood, but the frames
+        themselves, including ones nothing here knew what to do with.
+        """
+        if self.on_frame is None:
+            return
+        try:
+            self.on_frame(direction, bytes(frame), self.now_us)
+        except Exception:
+            pass                            # a front end must never break the run
 
     def mac_for(self, ip):
         m = self.arp.get(ip)
@@ -911,6 +1188,10 @@ class NetStack:
         if len(frame) < 14:
             return
         dst, src, etype = frame[:6], frame[6:12], struct.unpack("!H", frame[12:14])[0]
+        if src != self.mac:
+            # Traced before anything is decided about it, so a frame this
+            # stack ignores is still on the record.
+            self._trace("from device", frame)
         if src == self.mac:
             # Our own broadcast, relayed back to the BSS by the device's AP
             # (an AP forwards a station's group frames to all stations).
@@ -1707,6 +1988,170 @@ def _run_selftests():
     check(len(out7) == n_out and any("UDP 192.168.1.100:7000 -> 10.200.0.7:9999 4 bytes (offline, dropped)" in l
                                      for l in logs7),
           "a datagram to any other port is logged and dropped while offline")
+
+    print("== frame trace: every byte that crossed the bridge ==")
+    seen = []
+    logsF, outF = [], []
+    fs = NetStack(bytes.fromhex("020000000001"), log=logsF.append, gateway=True)
+    fs.output = outF.append
+    fs.on_frame = lambda d, f, us: seen.append((d, f, us))
+    fs.device_ip, fs.device_mac = str2ip("192.168.1.100"), dev_mac
+    fs.arp[fs.device_ip] = dev_mac
+    fs.now_us = 1234
+    ping = b"\x08\x00\x00\x00\x00\x01\x00\x07" + b"hello"
+    ping = ping[:2] + struct.pack("!H", checksum(ping)) + ping[4:]
+    inframe = eth_frame(fs.mac, dev_mac, ETH_IP, ipv4_packet(fs.device_ip, fs.ip, IP_ICMP, ping))
+    fs.input(inframe)
+    check(len(seen) == 2, "one frame in, one frame out, both on the record")
+    check(seen[0][0] == "from device" and seen[0][1] == inframe and seen[0][2] == 1234,
+          "the device's frame is recorded whole, byte for byte, with the time it arrived")
+    check(seen[1][0] == "to device" and seen[1][1] == outF[-1],
+          "and so is the reply, exactly as it went out")
+    # A frame nothing here understands must still be recorded: the point is to
+    # show what crossed, not what this stack happened to parse.
+    odd = eth_frame(fs.mac, dev_mac, 0x88CC, b"\x01\x02\x03")
+    fs.input(odd)
+    check(seen[-1] == ("from device", odd, 1234), "a frame the stack ignores is recorded too")
+    n_before = len(seen)
+    fs.input(eth_frame(fs.mac, fs.mac, ETH_IP, bytes(20)))
+    check(len(seen) == n_before, "our own frame echoed back by the device's AP is not double-counted")
+    fs.on_frame = lambda d, f, us: (_ for _ in ()).throw(RuntimeError("front end bug"))
+    fs.input(inframe)
+    check(True, "a front end that raises cannot break the run")
+
+    print("== frame summaries for a packet list ==")
+    def summ(pkt, src=None, dst=None):
+        return describe_frame(eth_frame(dst or BCAST_MAC, src or dev_mac, ETH_IP, pkt))
+    ip = fs.device_ip
+    check(describe_frame(inframe) == "ICMP echo request 192.168.1.100 to 192.168.1.1",
+          "an echo request is named with both addresses")
+    syn = tcp_segment(ip, str2ip("10.200.0.1"), 40127, 1883, 1, 0, TCP_SYN, 8192)
+    check(summ(syn) == "TCP 192.168.1.100:40127 to 10.200.0.1:1883 [SYN]", "a SYN names its ports and flag")
+    data = tcp_segment(ip, str2ip("10.200.0.1"), 40127, 1883, 2, 1, TCP_ACK | TCP_PSH, 8192, b"hello there")
+    check(summ(data) == "TCP 192.168.1.100:40127 to 10.200.0.1:1883 [ACK,PSH], 11 bytes",
+          "a data segment says how many bytes it carried")
+    dns = udp_packet(ip, str2ip("192.168.1.1"), 5353, 53, b"q" * 20)
+    check(summ(dns) == "UDP 192.168.1.100:5353 to 192.168.1.1:53 (DNS), 20 bytes",
+          "a datagram is named by the service on its port")
+    tuya = udp_packet(ip, b"\xff\xff\xff\xff", 63035, 6667, b"x" * 40)
+    check("(Tuya LAN)" in summ(tuya), "...including Tuya's own discovery port")
+    reply = udp_packet(str2ip("192.168.1.1"), ip, 53, 5353, b"a" * 22)
+    check("(DNS)" in summ(reply),
+          "a reply is named for the service it came FROM, not whatever its destination port means")
+    arp = struct.pack("!HHBBH", 1, ETH_IP, 6, 4, 1) + dev_mac + ip + bytes(6) + str2ip("192.168.1.1")
+    check(describe_frame(eth_frame(BCAST_MAC, dev_mac, ETH_ARP, arp))
+          == "ARP who has 192.168.1.1, tell 192.168.1.100", "an ARP request reads as a question")
+    check(describe_frame(b"\x00" * 8) == "runt frame, 8 bytes"
+          and "truncated" in describe_frame(eth_frame(BCAST_MAC, dev_mac, ETH_IP, b"\x45")),
+          "a short or malformed frame is described as such, not hidden or raised over")
+
+    print("== writing the captured frames as an Ethernet pcap ==")
+    import tempfile as _tf
+    fd, cap_path = _tf.mkstemp(suffix=".pcap")
+    os.close(fd)
+    try:
+        cap = EthPcap(cap_path)
+        cap.write(inframe, 1_500_000)
+        cap.write(outF[0], 2_250_500)
+        cap.close()
+        blob = open(cap_path, "rb").read()
+    finally:
+        os.remove(cap_path)
+    magic, vmaj, vmin, _z, _z2, snap, link = struct.unpack("<IHHiIII", blob[:24])
+    check((magic, vmaj, vmin, link) == (0xA1B2C3D4, 2, 4, EthPcap.LINK_ETHERNET),
+          "the header says pcap 2.4, link type 1, which is what Wireshark reads as Ethernet")
+    off, recs = 24, []
+    while off + 16 <= len(blob):
+        sec, usec, incl, orig = struct.unpack("<IIII", blob[off:off + 16])
+        recs.append((sec * 1_000_000 + usec, incl, orig, blob[off + 16:off + 16 + incl]))
+        off += 16 + incl
+    check(off == len(blob) and [r[3] for r in recs] == [inframe, outF[0]],
+          "both frames are written whole, in order, with nothing added between them")
+    check(recs[0][0] == 1_500_000 and recs[1][0] == 2_250_500,
+          "each keeps the device time it crossed, seconds and microseconds apart")
+    check(all(r[1] == r[2] == len(r[3]) for r in recs), "and is recorded at its full length")
+
+    print("== hex dump ==")
+    dump = hexdump(bytes(range(8)) + b"Hi!\x7f")
+    check(dump.startswith("00000000  00 01 02 03 04 05 06 07 48 69 21 7f"), "offset then the bytes")
+    check(dump.endswith("  ........Hi!."), "then the printable ones, with the rest as dots")
+    check(hexdump(b"") == "", "an empty buffer dumps to nothing")
+    two = hexdump(bytes(20))
+    check(two.count("\n") == 1 and two.splitlines()[1].startswith("00000010  00 00 00 00  "),
+          "a second row starts at the right offset and is padded so the text column lines up")
+
+    print("== TLS-PSK: reading who is calling the cloud ==")
+    # The exact ClientHello a BK7231N 3-phase meter dump sent to its Tuya cloud
+    # in this emulator: TLS 1.2, four suites, three of them pre-shared-key, no
+    # server name. Tuya's devices authenticate to their cloud with a shared
+    # secret rather than a certificate, which is why it looks like this.
+    real_hello = bytes.fromhex(
+        "16030300460100004203032aec34e9f5ba50499bcdd89e1070246f6db6ee0ef786727acdbfa08a4a07fd0a"
+        "000008008d00ae008c00ff010000110001000102001600000017000000230000")
+    info = tls_client_hello(real_hello)
+    check(info is not None and info["version"] == "1.2", "the hello is read, and names TLS 1.2")
+    check(info["suites"] == [0x008D, 0x00AE, 0x008C, 0x00FF],
+          "all four offered cipher suites are listed, in the order offered")
+    check(info["psk"] == [0x008D, 0x00AE, 0x008C] and
+          TLS_PSK_SUITES[info["psk"][0]] == "TLS_PSK_WITH_AES_256_CBC_SHA",
+          "the pre-shared-key suites are picked out by name")
+    check(info["sni"] is None, "and it carries no server name, as a PSK client need not")
+    check(tls_client_hello(b"GET / HTTP/1.1\r\n\r\n") is None
+          and tls_client_hello(real_hello[:20]) is None,
+          "something that is not a complete hello is not read as one")
+
+    logsT2, outT2 = [], []
+    ts3 = NetStack(bytes.fromhex("020000000001"), log=logsT2.append, gateway=True)
+    ts3.output = outT2.append
+    ts3.device_ip, ts3.device_mac = str2ip("192.168.1.100"), dev_mac
+    ts3.arp[ts3.device_ip] = dev_mac
+    cloud = str2ip("10.200.0.5")
+    tc, sq = open_capture(ts3, outT2, cloud, 8886, 6700, isn=31000)
+    sq = dev_send(ts3, tc, cloud, 8886, 6700, sq, real_hello)
+    ts3.tick(1_000_000)
+    check(any("client hello: version 1.2, 4 cipher suites" in l and "TLS_PSK_WITH_AES_256_CBC_SHA" in l
+              for l in logsT2), "a device's hello to the cloud is reported with what it offered")
+    reply = b"".join(p for _, _, _, p, sp, _ in segs(outT2, 6700) if sp == 8886)
+    check(reply[:3] == b"\x16\x03\x03" and reply[5] == 0x02,
+          "the stack answers with a ServerHello of its own")
+    chosen = struct.unpack("!H", reply[5 + 4 + 2 + 32 + 1:5 + 4 + 2 + 32 + 3])[0]
+    check(chosen == 0x008D and reply[-4:] == b"\x0e\x00\x00\x00",
+          "...picking one of the PSK suites the device offered, then ServerHelloDone")
+    check(any("answered with TLS_PSK_WITH_AES_256_CBC_SHA" in l for l in logsT2), "which is logged")
+    # Now the device names the key it means to use. That identity is in clear.
+    ident = b"bf0e0f689d000d56656gmp"
+    cke_body = struct.pack("!H", len(ident)) + ident
+    cke = b"\x10" + struct.pack("!I", len(cke_body))[1:] + cke_body
+    sq = dev_send(ts3, tc, cloud, 8886, 6700, sq,
+                  b"\x16\x03\x03" + struct.pack("!H", len(cke)) + cke)
+    ts3.tick(1_100_000)
+    check(any("pre-shared key identity: bf0e0f689d000d56656gmp" in l for l in logsT2),
+          "the identity the device claims is read out of the exchange")
+    check(ts3.tls_identities and ts3.tls_identities[-1][1] == ident,
+          "and kept, so a front end can show which device called")
+    n_logs = len(logsT2)
+    sq = dev_send(ts3, tc, cloud, 8886, 6700, sq, b"\x17\x03\x03\x00\x20" + bytes(32))
+    ts3.tick(1_200_000)
+    check(any("encrypted from here on" in l for l in logsT2[n_logs:]),
+          "once it switches to encryption, the stack says so rather than pretending to read it")
+    # A client offering only certificate suites gets no ServerHello: there is
+    # nothing to learn, and answering would be inventing a certificate.
+    logsT3, outT3 = [], []
+    ts4 = NetStack(bytes.fromhex("020000000001"), log=logsT3.append, gateway=True)
+    ts4.output = outT3.append
+    ts4.device_ip, ts4.device_mac = str2ip("192.168.1.100"), dev_mac
+    ts4.arp[ts4.device_ip] = dev_mac
+    rsa_hello = (b"\x16\x03\x03" + struct.pack("!H", 4 + 2 + 32 + 1 + 2 + 4 + 2)
+                 + b"\x01" + struct.pack("!I", 2 + 32 + 1 + 2 + 4 + 2)[1:]
+                 + b"\x03\x03" + bytes(32) + b"\x00" + struct.pack("!H", 4)
+                 + b"\x00\x2f\x00\x35" + b"\x01\x00" + b"\x00\x00")
+    rc2, sq2 = open_capture(ts4, outT3, cloud, 443, 6701, isn=33000)
+    sq2 = dev_send(ts4, rc2, cloud, 443, 6701, sq2, rsa_hello)
+    ts4.tick(1_000_000)
+    check(any("offers no pre-shared-key suite" in l for l in logsT3),
+          "a certificate-based hello is reported and left alone")
+    check(not [p for _, _, _, p, sp, _ in segs(outT3, 6701) if sp == 443 and p],
+          "...with no ServerHello sent back, because there is nothing honest to send")
 
     print("== Tuya LAN discovery broadcast decoded ==")
     def tuya_packet(payload, cmd=0x13, retcode=True):
