@@ -183,6 +183,12 @@ class SimulatorUI:
         ttk.Checkbutton(cfg, text="TuyaMCU peer", variable=self.var_tuyamcu).pack(side="left", padx=(8, 0))
         self.var_blecore = tk.BooleanVar(value=False)
         ttk.Checkbutton(cfg, text="BLE core", variable=self.var_blecore).pack(side="left", padx=(8, 0))
+        # Wi-Fi MAC model + virtual AP/station + IP network (src/wifimac.py,
+        # wifipeer.py, netstack.py). The device's port 80 is forwarded to
+        # 127.0.0.1:8080, so a browser reaches the firmware's own web panel.
+        self.var_wifi = tk.BooleanVar(value=False)
+        ttk.Checkbutton(cfg, text="Wi-Fi peer (127.0.0.1:8080 -> :80)",
+                        variable=self.var_wifi).pack(side="left", padx=(8, 0))
 
         run = ttk.Frame(self.root)
         run.pack(fill="x", padx=6)
@@ -494,7 +500,7 @@ class SimulatorUI:
         # thread-safe, so the worker gets plain values, never widgets.
         cfg = {"chip": self.var_chip.get(), "key": self.var_key.get(),
                "boot": self.var_boot.get(), "tuyamcu": self.var_tuyamcu.get(),
-               "blecore": self.var_blecore.get()}
+               "blecore": self.var_blecore.get(), "wifi": self.var_wifi.get()}
         self.thread = threading.Thread(target=self._worker, args=(path, cfg), daemon=True)
         self.thread.start()
 
@@ -513,10 +519,13 @@ class SimulatorUI:
                 uart1_hex=False,
                 tuyamcu=cfg["tuyamcu"],
                 ble_core=cfg["blecore"],
+                wifi=cfg["wifi"],
                 uart_sink=self._sink,
                 # Writing app_decrypted.bin into the working directory is a
                 # command-line convenience, not something a GUI should do.
                 save_decrypted=False)
+            if cfg["wifi"]:
+                emu.attach_wifi_peer(role="auto", forwards=[(8080, 80)])
             emu.setup()
             self.emu = emu
             emu.run()

@@ -13,9 +13,11 @@ from unicorn.arm_const import *
 try:
     from . import tuyamcu as _tuyamcu
     from . import blecore as _blecore
+    from . import wifimac as _wifimac
 except ImportError:
     import tuyamcu as _tuyamcu
     import blecore as _blecore
+    import wifimac as _wifimac
 
 # Known chip identities served from the SCTRL id registers (0x00800000 chip
 # id, 0x00800004 device id), selectable with --chip. Values extracted from
@@ -193,9 +195,31 @@ class BekenEmulator:
     ICU_INT_ENABLE = 0x00802040  # ICU_INTERRUPT_ENABLE (0x802050 is ICU_ARM_WAKEUP_EN)
     ICU_GLOBAL_INT_EN = 0x00802044
 
-    def __init__(self, raw_flash, bootloader, app, with_boot=False, only_uart=False, chip_identity=None, uart1_hex=False, physical_flash=None, uart1_rx=b"", uart1_rx_delay=CONSOLE_RX_HOLDOFF_INSNS, tuyamcu_enabled=False, tuyamcu_pid=None, tuyamcu_raw=False, xvr_selfclear=False, tuyamcu_dps=None, tuyamcu_injects=None, uart_sink=None, ble_core=False):
+    def __init__(self, raw_flash, bootloader, app, with_boot=False, only_uart=False, chip_identity=None, uart1_hex=False, physical_flash=None, uart1_rx=b"", uart1_rx_delay=CONSOLE_RX_HOLDOFF_INSNS, tuyamcu_enabled=False, tuyamcu_pid=None, tuyamcu_raw=False, xvr_selfclear=False, tuyamcu_dps=None, tuyamcu_injects=None, uart_sink=None, ble_core=False, wifi=False):
         self.raw_flash = raw_flash
         self.xvr_selfclear = xvr_selfclear
+        # Opt-in RivieraWaves Wi-Fi MAC model over 0xC0000000 (src/wifimac.py).
+        # Off, the block is plain memory and the firmware's Wi-Fi stack comes up
+        # but can never move a frame or see time pass; on, TX/RX descriptors,
+        # the 1 MHz MAC clock, the ABS timers and the six MAC FIQ lines work,
+        # and a peer (src/wifipeer.py) can be attached to talk 802.11 to it.
+        self.wifimac = None
+        self.wifi_peer = None
+        # Hardware TRNG (TRNG_DATA, irda.h - same address on every family).
+        # None = plain memory, i.e. the same value on every read. The network
+        # needs real randomness: LwIP's LWIP_RAND() is bk_rand() -> TRNG, and
+        # its DNS client loops `do { port = LWIP_RAND(); } while (port < 1024)`
+        # to pick a source port - with a constant 0 that loop never ends, the
+        # TCP/IP thread hangs on the first lookup and every task waiting on it
+        # (OBK's main loop, MQTT) with it. Deterministic xorshift32, so runs
+        # stay reproducible. Tied to --wifi so non-network runs are unchanged.
+        self.trng_state = None
+        if wifi:
+            self.wifimac = _wifimac.MacHw(SLOW_TICK_INSNS // (SLOW_TICK_MS * 1000),
+                                          log=self._print)
+            self.wifimac.mem = (lambda addr, size: self.mu.mem_read(addr, size),
+                                lambda addr, data: self.mu.mem_write(addr, bytes(data)))
+            self.trng_state = 0x2545F491
         # Opt-in RivieraWaves BLE core model over the 0x900000 block (see
         # src/blecore.py). Off, that block stays plain memory plus the
         # --xvr-selfclear bit tricks; on, the controller gets a slot clock,
@@ -288,6 +312,13 @@ class BekenEmulator:
         self._resume = threading.Event()
         self._resume.set()
         self.stopping = False
+        # Snapshot request (see arm_snapshot); None until asked for.
+        self._snapshot_path = None
+        self._snapshot_at_insns = None
+        self._snapshot_marker = None
+        self._snapshot_due = False
+        self._uart_tail = b""
+        self._resume_at = None
         # Advertising payloads already printed, so each is reported once.
         self._ble_adv_seen = set()
         # When EMU_REPORT is set (the self-test harness does this), periodically
@@ -402,6 +433,60 @@ class BekenEmulator:
         except Exception:
             pass
 
+    def net_log(self, msg):
+        """Print a [WIFI]/[NET] line of our own without splitting a UART line.
+
+        Shares stdout with the guest's UART output, so it goes out on a line
+        boundary (a leading newline when the UART is mid-line) and leaves the
+        stream at a line start.
+        """
+        data = msg.encode("utf-8", "replace") + b"\n"
+        if self.uart_sink is not None:
+            # A GUI shows these in its log pane, where the user is looking,
+            # rather than on the console window behind it.
+            for b in b"\n" + data:
+                self.uart_sink(2, b)
+            return
+        out = sys.__stdout__.buffer
+        if not self.state.uart_at_line_start:
+            data = b"\n" + data
+        out.write(data)
+        out.flush()
+        self.state.uart_at_line_start = True
+
+    def attach_wifi_peer(self, role="auto", ssid=None, channel=1, peer_mac=None,
+                         forwards=(), net_out=False, pcap=None, http_gets=()):
+        """Put a virtual station/access point and an IP network behind the MAC model.
+
+        role "auto" lets the peer take the opposite role of whatever the
+        device turns out to be (it beacons -> we are a station; it probes ->
+        we are an access point). forwards is [(local_port, device_port)] for
+        TCP connections from the host into the device; net_out lets the
+        device's own connections reach real hosts instead of a logging
+        sinkhole; pcap is a file path for an 802.11 capture of the exchange;
+        http_gets are paths requested from the device's port 80 once it is
+        reachable, each reply logged as a [NET] line.
+        """
+        if self.wifimac is None:
+            raise ValueError("a Wi-Fi peer needs the MAC model: pass wifi=True / --wifi")
+        try:
+            from . import wifipeer as _wifipeer, netstack as _netstack
+        except ImportError:
+            import wifipeer as _wifipeer
+            import netstack as _netstack
+        mac = peer_mac or b"\x02\x00\x00\x00\x00\x01"
+        net = _netstack.NetStack(mac, log=self.net_log, gateway=(role == "ap"),
+                                 ip=_netstack.str2ip("192.168.1.1") if role == "ap" else None,
+                                 net_out=net_out, forwards=forwards, http_gets=http_gets)
+        peer = _wifipeer.WifiPeer(
+            mac, net, inject=lambda f: self.wifimac.inject(f, self.state.insn_count),
+            log=self.net_log, role=role, ssid=ssid, channel=channel, pcap=pcap,
+            now_us=lambda: self.wifimac.now_us(self.state.insn_count),
+            latency_us=self.NET_LATENCY_US)
+        self.wifimac.on_tx = peer.on_device_tx
+        self.wifi_peer = peer
+        return peer
+
     def _uart_write(self, data):
         """Emit UART bytes verbatim.
 
@@ -420,6 +505,8 @@ class BekenEmulator:
         # marker string once the emission rate went up.
         if data:
             self.state.uart_at_line_start = data.endswith(b"\n")
+            if self._snapshot_marker is not None:
+                self._snapshot_check_uart(data)
 
     def trigger_irq(self):
         if self.state.icu_global_int_en == 0:
@@ -497,6 +584,14 @@ class BekenEmulator:
         if self._paused:
             self._resume.wait()
 
+        # Snapshot request: taken here, at a block boundary, never from inside
+        # a memory hook where an instruction is half done.
+        if self._snapshot_path is not None:
+            if self._snapshot_due or (self._snapshot_at_insns is not None
+                                      and state.insn_count >= self._snapshot_at_insns):
+                path, self._snapshot_path = self._snapshot_path, None
+                self.save_snapshot(path)
+
         # Slow tick: raise the periodic sources' pending.
         if state.insn_count - state.last_slow >= SLOW_TICK_INSNS:
             state.last_slow = state.insn_count
@@ -562,6 +657,14 @@ class BekenEmulator:
                 state.pending_irqs = ((state.pending_irqs & ~((1 << 29) | (1 << 30)))
                                       | ((1 << 29) if core_irq else 0)
                                       | ((1 << 30) if ble_irq else 0))
+            if self.wifimac is not None:
+                # The peer first (it may queue frames), then the MAC: ABS
+                # timers, TX completions, RX delivery, TBTT. The six MAC FIQ
+                # lines (ICU bits 16..22) are levels recomputed by the model.
+                if self.wifi_peer is not None:
+                    self.wifi_peer.tick(state.insn_count)
+                lines = self.wifimac.tick(state.insn_count)
+                state.pending_irqs = (state.pending_irqs & ~_wifimac.LINE_MASK) | lines
 
         if (state.pwmn_stat if state.pwmn_seen else state.pwm_status & 0x3F):
             state.pending_irqs |= (1 << 9)
@@ -582,6 +685,13 @@ class BekenEmulator:
         # Fast tick (~every 1000 insns): UART RX/TX and SARADC interrupts.
         if state.insn_count - state.last_fast >= 1000:
             state.last_fast = state.insn_count
+            # A transmission in flight completes on this finer grain (~200 us
+            # of device time), so a TX confirmation is not held for a whole
+            # slow tick. Nothing to do on the common path: `busy` is one
+            # attribute test.
+            if self.wifimac is not None and self.wifimac.busy:
+                lines = self.wifimac.tick(state.insn_count)
+                state.pending_irqs = (state.pending_irqs & ~_wifimac.LINE_MASK) | lines
             # UART1 interrupt: the firmware's TX path arms bit 0
             # (TX_FIFO_NEED_WRITE_EN); the RX console arms bit 1
             # (RX_FIFO_NEED_READ_EN) / bit 6 (RX_STOP_END_EN). Fire for TX
@@ -682,11 +792,20 @@ class BekenEmulator:
                 # transfer above already happened.
                 self.state.gdma_conf[channel] = value & ~self.GDMA_EN
                 return
+        if self.wifimac is not None and _wifimac.CORE <= address < _wifimac.CORE + _wifimac.SIZE:
+            self.wifimac.write(address, value, self.state.insn_count)
+            self.state.pending_irqs = ((self.state.pending_irqs & ~_wifimac.LINE_MASK)
+                                       | self.wifimac.lines)
         if address == self.ICU_INT_ENABLE:
             self.state.icu_int_enable = value
             self._print(f"[DEBUG] ICU_INT_ENABLE set to: 0x{value:08x}")
         if address == self.ICU_GLOBAL_INT_EN: self.state.icu_global_int_en = value
-        if address == self.ICU_INT_STATUS: self.state.pending_irqs &= ~value
+        if address == self.ICU_INT_STATUS:
+            self.state.pending_irqs &= ~value
+            # The MAC FIQ lines are levels: an ICU clear does not take them
+            # down while their status is still pending in the MAC itself.
+            if self.wifimac is not None:
+                self.state.pending_irqs |= self.wifimac.lines
         if address == 0x00802110: self.state.uart1_int_enable = value
         if address == 0x00802210: self.state.uart2_int_enable = value
         # Arm the XVR RF/BLE busy self-clear (opt-in) when the firmware sets bit
@@ -867,7 +986,25 @@ class BekenEmulator:
         except Exception:
             pass
 
+    TRNG_DATA = 0x00802484
+    # Device time between the peer handing a frame to the air and the MAC
+    # receiving it (see WifiPeer.latency_us): a few ms, like a LAN round trip.
+    NET_LATENCY_US = 3000
+
     def hook_mem_read_mmio(self, mu, access, address, size, value, user_data):
+        if self.wifimac is not None and _wifimac.CORE <= address < _wifimac.CORE + _wifimac.SIZE:
+            served = self.wifimac.read(address, self.state.insn_count)
+            if served is not None:
+                mu.mem_write(address, struct.pack("<I", served & 0xFFFFFFFF))
+            return
+        if address == self.TRNG_DATA and self.trng_state is not None:
+            x = self.trng_state
+            x ^= (x << 13) & 0xFFFFFFFF
+            x ^= x >> 17
+            x ^= (x << 5) & 0xFFFFFFFF
+            self.trng_state = x
+            mu.mem_write(address, struct.pack("<I", x))
+            return
         # SCTRL identity registers; served per the selected chip family.
         if address == 0x00800000:
             mu.mem_write(address, struct.pack("<I", self.chip_id_value))
@@ -1208,8 +1345,139 @@ class BekenEmulator:
         self._tick_hook = self.mu.hook_add(UC_HOOK_BLOCK, self.hook_block)
         self.mu.hook_add(UC_HOOK_INTR, self.hook_intr)
 
+    # ------------------------------------------------------------ snapshots
+    # A boot to the point where a firmware's Wi-Fi is up costs minutes of wall
+    # time; iterating on anything after it (a network exchange, a console
+    # command) should not. A snapshot is the complete device: every mapped
+    # memory region, the CPU context (all modes' banked registers, via
+    # Unicorn), and the emulator's own peripheral state. What it deliberately
+    # leaves out is the OTHER side of the peripherals - host sockets, the GUI,
+    # a pcap writer - which are attached fresh after a load.
+    SNAPSHOT_MAGIC = b"BKSNAP01"
+
+    def arm_snapshot(self, path, at):
+        """Take a snapshot to `path` at `at`: an instruction count, or a UART marker string."""
+        self._snapshot_path = path
+        if isinstance(at, int):
+            self._snapshot_at_insns = at
+            self._snapshot_marker = None
+        else:
+            self._snapshot_at_insns = None
+            self._snapshot_marker = at.encode("utf-8", "replace")
+            self._uart_tail = b""
+        self._snapshot_due = False
+
+    def _snapshot_check_uart(self, data):
+        """Called with every UART byte written; arms the snapshot when the marker shows."""
+        tail = self._uart_tail + data
+        if self._snapshot_marker in tail:
+            self._snapshot_due = True
+            self._snapshot_marker = None
+        self._uart_tail = tail[-len(self._snapshot_marker or b"") - 1:] if self._snapshot_marker else b""
+
+    def save_snapshot(self, path):
+        import pickle
+        import zlib
+        regions = []
+        for begin, end, perms in self.mu.mem_regions():
+            size = end - begin + 1
+            regions.append((begin, size, perms, zlib.compress(bytes(self.mu.mem_read(begin, size)), 1)))
+        ctx = self.mu.context_save()
+        # Detach the callables the models hold into this emulator before pickling.
+        detached = []
+        for obj, names in ((self.wifimac, ("mem", "on_tx", "log")), (self.blecore, ("mem",))):
+            if obj is None:
+                continue
+            saved = {n: getattr(obj, n) for n in names}
+            for n in names:
+                setattr(obj, n, None)
+            detached.append((obj, saved))
+        try:
+            blob = pickle.dumps({
+                "magic": self.SNAPSHOT_MAGIC,
+                "regions": regions,
+                "ctx": ctx,
+                "state": self.state,
+                "flash_state": self.flash_state,
+                "physical_flash": bytes(self.physical_flash) if self.physical_flash is not None else None,
+                "raw_flash": bytes(self.raw_flash),
+                "uart1_rx": bytes(self.uart1_rx),
+                "uart_src": self._uart_src,
+                "tuyamcu": self.tuyamcu,
+                "blecore": self.blecore,
+                "wifimac": self.wifimac,
+                "chip": (self.chip_id_value, self.device_id_value),
+                "ble_adv_seen": self._ble_adv_seen,
+                "trng_state": self.trng_state,
+            }, protocol=4)
+        finally:
+            for obj, saved in detached:
+                for n, v in saved.items():
+                    setattr(obj, n, v)
+        with open(path, "wb") as f:
+            f.write(blob)
+        self.net_log("[SNAPSHOT] saved %s at %d instructions (%d bytes)" % (path, self.state.insn_count, len(blob)))
+
+    def load_snapshot(self, path):
+        """Restore a snapshot taken by save_snapshot; call after setup(), before run()."""
+        import pickle
+        import zlib
+        with open(path, "rb") as f:
+            snap = pickle.load(f)
+        if snap.get("magic") != self.SNAPSHOT_MAGIC:
+            raise ValueError("%s is not a snapshot of this emulator" % path)
+        if snap["chip"] != (self.chip_id_value, self.device_id_value):
+            raise ValueError("snapshot was taken with a different -chip identity")
+        if (snap["wifimac"] is None) != (self.wifimac is None):
+            raise ValueError("snapshot was taken %s the Wi-Fi MAC model (--wifi); use the same option"
+                             % ("with" if snap["wifimac"] is not None else "without"))
+        mapped = {(b, e - b + 1) for b, e, p in self.mu.mem_regions()}
+        for begin, size, perms, data in snap["regions"]:
+            if (begin, size) not in mapped:
+                try:
+                    self.mu.mem_map(begin, size, perms)
+                except UcError:
+                    pass
+            self.mu.mem_write(begin, zlib.decompress(data))
+        self.mu.context_restore(snap["ctx"])
+        self.state = snap["state"]
+        self.flash_state = snap["flash_state"]
+        if snap["physical_flash"] is not None:
+            self.physical_flash = bytearray(snap["physical_flash"])
+        self.raw_flash = bytearray(snap["raw_flash"])
+        self.uart1_rx = bytearray(snap["uart1_rx"])
+        self._uart_src = snap["uart_src"]
+        self.tuyamcu = snap["tuyamcu"]
+        self._ble_adv_seen = snap["ble_adv_seen"]
+        if snap.get("trng_state") is not None:
+            self.trng_state = snap["trng_state"]
+        if snap["blecore"] is not None:
+            self.blecore = snap["blecore"]
+            self.blecore.mem = (lambda addr, size: self.mu.mem_read(addr, size),
+                                lambda addr, data: self.mu.mem_write(addr, bytes(data)))
+        if snap["wifimac"] is not None:
+            peer = self.wifi_peer
+            self.wifimac = snap["wifimac"]
+            self.wifimac.mem = (lambda addr, size: self.mu.mem_read(addr, size),
+                                lambda addr, data: self.mu.mem_write(addr, bytes(data)))
+            self.wifimac.log = self._print
+            self.wifimac.debug = bool(os.environ.get("WIFIDBG"))
+            if peer is not None:
+                # a peer attached before the load binds to the restored MAC
+                self.wifimac.on_tx = peer.on_device_tx
+                peer.inject = lambda f: self.wifimac.inject(f, self.state.insn_count)
+                peer.now_us = lambda: self.wifimac.now_us(self.state.insn_count)
+        # The run starts where the snapshot was taken: a block boundary.
+        pc = self.mu.reg_read(UC_ARM_REG_PC)
+        cpsr = self.mu.reg_read(UC_ARM_REG_CPSR)
+        self._resume_at = pc | (1 if cpsr & 0x20 else 0)
+        self.net_log("[SNAPSHOT] restored %s: %d instructions, pc 0x%08x" % (path, self.state.insn_count, pc))
+
     def run(self):
-        if self.with_boot:
+        if getattr(self, "_resume_at", None) is not None:
+            vector_base = self._resume_at
+            self._print(f"Resuming snapshot at: 0x{vector_base:08x}")
+        elif self.with_boot:
             vector_base = 0x00000000
             self._print(f"Booting from bootloader at: 0x{vector_base:08x}")
         else:

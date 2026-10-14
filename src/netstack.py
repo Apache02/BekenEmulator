@@ -1,0 +1,1798 @@
+"""A small user-mode IP network for the emulated device.
+
+The device's own LwIP talks Ethernet frames (inside 802.11 data frames) to
+"the network". This module is that network: it answers ARP, hands out or
+obtains a DHCP lease, answers pings, proxies DNS, serves NTP, and terminates
+or relays TCP and UDP - the way a user-mode NAT (slirp) does for a VM, with
+nothing installed on the host and no privileges. Everything in here is plain
+Python sockets; the host OS never sees the device's addresses.
+
+Two policies decide what happens to the device's outbound traffic:
+
+  offline (default)  nothing leaves the host. DNS names resolve to private
+                     sinkhole addresses (one per name, so a later TCP connect
+                     can be logged by hostname), TCP connections are accepted
+                     and whatever the firmware sends is captured - HTTP
+                     request lines and TLS server names are printed, the
+                     bytes go to the pcap - then closed; NTP is answered with
+                     the host clock so the firmware gets a valid time.
+  online (--net-out) DNS resolves for real and TCP/UDP flows are relayed to
+                     the real destinations through host sockets.
+
+Inbound: --net-forward LPORT:DPORT listens on 127.0.0.1:LPORT and opens a TCP
+connection from this network into the device at DPORT, so a browser on the
+host reaches the firmware's own HTTP server.
+
+Time: the stack's own timers run on DEVICE time (the emulator's instruction
+count), like the firmware; host sockets are serviced from a helper thread
+that only moves bytes in and out of queues.
+"""
+import os
+import select
+import socket
+import struct
+import threading
+import time
+import collections
+
+ETH_IP, ETH_ARP = 0x0800, 0x0806
+IP_ICMP, IP_TCP, IP_UDP = 1, 6, 17
+BCAST_MAC = b"\xff" * 6
+
+TCP_FIN, TCP_SYN, TCP_RST, TCP_PSH, TCP_ACK = 0x01, 0x02, 0x04, 0x08, 0x10
+MSS = 1400
+RCV_WINDOW = 16384
+RETRANSMIT_US = 1_000_000           # device microseconds before we resend unacked data
+SYN_MAX_TRIES = 6                   # SYN resends before a connection attempt is abandoned
+CAPTURE_IDLE_US = 3_000_000         # offline TCP capture: close this long after the last byte
+CAPTURE_LIMIT = 4096                # bytes of a captured flow kept for decoding
+HTTP_METHODS = (b"GET", b"POST", b"PUT", b"HEAD", b"DELETE", b"OPTIONS", b"PATCH")
+STATIC_FALLBACK_US = 12_000_000     # station side: give up on DHCP after this and pick an address
+# Gateway addresses Beken soft-APs come up with: the SDK/OpenBeken default
+# (APP_DRONE_DEF_NET_IP) first, then the usual consumer-router ones.
+SOFTAP_GUESSES = tuple(bytes(int(x) for x in a.split(".")) for a in (
+    "192.168.4.1", "192.168.175.1", "192.168.0.1", "192.168.1.1", "10.0.0.1"))
+
+
+def ip2str(b):
+    return "%d.%d.%d.%d" % tuple(b)
+
+
+def str2ip(s):
+    return bytes(int(x) for x in s.split("."))
+
+
+def mac2str(b):
+    return ":".join("%02x" % x for x in b)
+
+
+def checksum(data):
+    if len(data) % 2:
+        data += b"\x00"
+    s = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    while s >> 16:
+        s = (s & 0xFFFF) + (s >> 16)
+    return (~s) & 0xFFFF
+
+
+def ipv4_packet(src, dst, proto, payload, ident=0, ttl=64):
+    hdr = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(payload), ident, 0, ttl, proto, 0, src, dst)
+    hdr = hdr[:10] + struct.pack("!H", checksum(hdr)) + hdr[12:]
+    return hdr + payload
+
+
+def l4_checksum(src, dst, proto, segment):
+    pseudo = src + dst + struct.pack("!BBH", 0, proto, len(segment))
+    return checksum(pseudo + segment)
+
+
+def udp_packet(src, dst, sport, dport, payload):
+    seg = struct.pack("!HHHH", sport, dport, 8 + len(payload), 0) + payload
+    c = l4_checksum(src, dst, IP_UDP, seg) or 0xFFFF
+    seg = seg[:6] + struct.pack("!H", c) + seg[8:]
+    return ipv4_packet(src, dst, IP_UDP, seg)
+
+
+def tcp_segment(src, dst, sport, dport, seq, ack, flags, window, payload=b"", options=b""):
+    doff = (20 + len(options)) // 4
+    seg = struct.pack("!HHIIBBHHH", sport, dport, seq & 0xFFFFFFFF, ack & 0xFFFFFFFF,
+                      doff << 4, flags, window, 0, 0) + options + payload
+    c = l4_checksum(src, dst, IP_TCP, seg)
+    seg = seg[:16] + struct.pack("!H", c) + seg[18:]
+    return ipv4_packet(src, dst, IP_TCP, seg)
+
+
+def eth_frame(dst, src, ethertype, payload):
+    return dst + src + struct.pack("!H", ethertype) + payload
+
+
+# ---------------------------------------------------------------- decoders
+def dns_name(data, off):
+    """Decode a DNS name at off; returns (name, next_off)."""
+    labels = []
+    jumped = False
+    nxt = None
+    guard = 0
+    while guard < 64:
+        guard += 1
+        if off >= len(data):
+            break
+        n = data[off]
+        if n == 0:
+            off += 1
+            break
+        if n & 0xC0 == 0xC0:
+            ptr = ((n & 0x3F) << 8) | data[off + 1]
+            if not jumped:
+                nxt = off + 2
+            jumped = True
+            off = ptr
+            continue
+        labels.append(data[off + 1:off + 1 + n].decode("ascii", "replace"))
+        off += 1 + n
+    return ".".join(labels), (nxt if nxt is not None else off)
+
+
+def tls_sni(payload):
+    """Server name from a TLS ClientHello, or None."""
+    try:
+        if len(payload) < 6 or payload[0] != 0x16 or payload[5] != 0x01:
+            return None
+        p = 5 + 4 + 2 + 32              # record hdr, handshake hdr, version, random
+        sid = payload[p]; p += 1 + sid
+        cs = struct.unpack("!H", payload[p:p + 2])[0]; p += 2 + cs
+        cm = payload[p]; p += 1 + cm
+        ext_len = struct.unpack("!H", payload[p:p + 2])[0]; p += 2
+        end = p + ext_len
+        while p + 4 <= end:
+            et, el = struct.unpack("!HH", payload[p:p + 4]); p += 4
+            if et == 0:
+                q = p + 2
+                while q + 3 <= p + el:
+                    nt, nl = payload[q], struct.unpack("!H", payload[q + 1:q + 3])[0]
+                    if nt == 0:
+                        return payload[q + 3:q + 3 + nl].decode("ascii", "replace")
+                    q += 3 + nl
+            p += el
+    except Exception:
+        return None
+    return None
+
+
+def mqtt_connect_info(data):
+    """'MQTT CONNECT ...' summary if data starts with an MQTT CONNECT packet, else None."""
+    if len(data) < 12 or data[0] != 0x10:
+        return None
+    # Remaining length is a 1-4 byte varint after the fixed header byte.
+    p = 1
+    while p < 5 and data[p] & 0x80:
+        p += 1
+    p += 1
+    name_len = int.from_bytes(data[p:p + 2], "big")
+    name = data[p + 2:p + 2 + name_len]
+    if name not in (b"MQTT", b"MQIsdp"):
+        return None
+    q = p + 2 + name_len
+    if q + 6 > len(data):
+        return "MQTT CONNECT"
+    level, flags = data[q], data[q + 1]
+    keepalive = int.from_bytes(data[q + 2:q + 4], "big")
+    cid_len = int.from_bytes(data[q + 4:q + 6], "big")
+    cid = data[q + 6:q + 6 + cid_len].decode("utf-8", "replace")
+    extra = []
+    if flags & 0x80:
+        extra.append("username")
+    if flags & 0x40:
+        extra.append("password")
+    if flags & 0x04:
+        extra.append("will")
+    return "MQTT CONNECT (v%s, client id '%s', keepalive %ds%s)" % (
+        {3: "3.1", 4: "3.1.1", 5: "5"}.get(level, level), cid, keepalive,
+        (", with " + "/".join(extra)) if extra else "")
+
+
+def describe_payload(data):
+    """One line saying what a captured TCP flow starts with."""
+    sni = tls_sni(data)
+    if sni:
+        return "TLS ClientHello, server name %s" % sni
+    if data[:1] == b"\x16":
+        return "TLS ClientHello (no server name)"
+    head = data.split(b"\r\n", 1)[0]
+    if head[:4] in (b"GET ", b"POST", b"PUT ", b"HEAD") or head[:7] == b"OPTIONS":
+        line = head.decode("latin-1", "replace")
+        host = ""
+        for part in data.split(b"\r\n"):
+            if part.lower().startswith(b"host:"):
+                host = " host " + part[5:].strip().decode("latin-1", "replace")
+                break
+        return "HTTP %s%s" % (line, host)
+    mqtt = mqtt_connect_info(data)
+    if mqtt:
+        return mqtt
+    text = "".join(chr(c) if 32 <= c < 127 else "." for c in data[:48])
+    return "%d bytes: %s" % (len(data), text)
+
+
+# ---------------------------------------------------------------- host side
+class HostIO:
+    """Helper thread servicing real sockets; everything else stays in device time."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.socks = {}                 # sock -> conn
+        self.listeners = {}             # sock -> dport
+        self.accepted = collections.deque()      # (sock, dport)
+        self.dns_results = collections.deque()   # (key, ip_bytes or None)
+        self.connect_results = collections.deque()  # (conn, ok)
+        self.udp_in = collections.deque()        # (flow, data)
+        self.udp_socks = {}             # sock -> flow
+        self._stop = False
+        self.thread = threading.Thread(target=self._run, name="netstack-io", daemon=True)
+        self.thread.start()
+
+    def listen(self, lport, dport, host="127.0.0.1"):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            # Windows: SO_REUSEADDR there lets a SECOND listener bind the same
+            # port silently and steal half the connections - two emulators
+            # both "forwarding 127.0.0.1:80". Exclusive use makes the second
+            # one fail loudly instead.
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((host, lport))
+        s.listen(8)
+        s.setblocking(False)
+        with self.lock:
+            self.listeners[s] = dport
+        return s
+
+    def resolve(self, name, key):
+        def work():
+            try:
+                ip = socket.gethostbyname(name)
+                res = str2ip(ip)
+            except Exception:
+                res = None
+            with self.lock:
+                self.dns_results.append((key, res))
+        threading.Thread(target=work, daemon=True).start()
+
+    def connect(self, conn, ip, port):
+        def work():
+            try:
+                s = socket.create_connection((ip, port), timeout=10)
+                s.setblocking(False)
+                conn.sock = s
+                with self.lock:
+                    self.socks[s] = conn
+                    self.connect_results.append((conn, True))
+            except Exception:
+                with self.lock:
+                    self.connect_results.append((conn, False))
+        threading.Thread(target=work, daemon=True).start()
+
+    def attach(self, sock, conn):
+        sock.setblocking(False)
+        with self.lock:
+            self.socks[sock] = conn
+
+    def udp_socket(self, flow):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setblocking(False)
+        with self.lock:
+            self.udp_socks[s] = flow
+        return s
+
+    def _run(self):
+        while not self._stop:
+            with self.lock:
+                rs = list(self.socks) + list(self.listeners) + list(self.udp_socks)
+                ws = [s for s, c in self.socks.items()
+                      if c.to_host or c.shutdown_pending or c.close_pending]
+            if not rs and not ws:
+                time.sleep(0.05)
+                continue
+            try:
+                r, w, _ = select.select(rs, ws, [], 0.05)
+            except Exception:
+                time.sleep(0.05)
+                continue
+            for s in r:
+                with self.lock:
+                    conn = self.socks.get(s)
+                    dport = self.listeners.get(s)
+                    flow = self.udp_socks.get(s)
+                if dport is not None:
+                    try:
+                        c, _ = s.accept()
+                        with self.lock:
+                            self.accepted.append((c, dport))
+                    except Exception:
+                        pass
+                elif flow is not None:
+                    try:
+                        data, _ = s.recvfrom(65535)
+                        with self.lock:
+                            self.udp_in.append((flow, data))
+                    except Exception:
+                        pass
+                elif conn is not None:
+                    try:
+                        data = s.recv(65536)
+                    except BlockingIOError:
+                        continue
+                    except Exception:
+                        data = b""
+                    with self.lock:
+                        if data:
+                            conn.from_host.append(data)
+                        else:
+                            conn.host_closed = True
+                            self.socks.pop(s, None)
+            for s in w:
+                with self.lock:
+                    conn = self.socks.get(s)
+                if conn is None:
+                    continue
+                with self.lock:
+                    chunk = conn.to_host.popleft() if conn.to_host else None
+                if chunk is None:
+                    # Everything queued has gone out: now carry out a close
+                    # or half-close the device asked for (see TcpConn).
+                    if conn.close_pending:
+                        conn.close_pending = False
+                        self.close(s)
+                    elif conn.shutdown_pending:
+                        conn.shutdown_pending = False
+                        try:
+                            s.shutdown(socket.SHUT_WR)
+                        except Exception:
+                            pass
+                    continue
+                try:
+                    n = s.send(chunk)
+                    if n < len(chunk):
+                        with self.lock:
+                            conn.to_host.appendleft(chunk[n:])
+                except BlockingIOError:
+                    with self.lock:
+                        conn.to_host.appendleft(chunk)
+                except Exception:
+                    with self.lock:
+                        conn.host_closed = True
+                        self.socks.pop(s, None)
+
+    def close(self, sock):
+        with self.lock:
+            self.socks.pop(sock, None)
+            self.udp_socks.pop(sock, None)
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------- TCP
+class TcpConn:
+    """One TCP connection between the device and this stack."""
+
+    def __init__(self, stack, local_ip, local_port, remote_ip, remote_port, kind):
+        self.stack = stack
+        self.lip, self.lport, self.rip, self.rport = local_ip, local_port, remote_ip, remote_port
+        self.kind = kind                # "capture" | "relay" | "forward"
+        self.state = "CLOSED"
+        self.snd_una = self.snd_nxt = 0x10000000 + (hash((local_port, remote_port)) & 0xFFFFF)
+        self.rcv_nxt = 0
+        self.peer_window = 4096
+        self.unacked = b""              # bytes sent but not yet acknowledged
+        self.unacked_seq = 0
+        self.send_buf = b""             # bytes waiting to be sent to the device
+        self.last_send_us = 0
+        self.last_activity_us = 0
+        self.captured = b""
+        self.described = False
+        self.rx_buf = b""               # capture: bytes not yet parsed by a responder
+        self.proto = None               # capture: 'http' | 'mqtt' | 'raw' once recognised
+        self.answered = False           # capture/http: reply sent
+        self.fin_sent = False
+        self.fin_rcvd = False
+        self.close_after_flush = False
+        self.sock = None
+        self.to_host = collections.deque()
+        self.from_host = collections.deque()
+        self.host_closed = False
+        self.shutdown_pending = False   # half-close the host socket once to_host is sent
+        self.close_pending = False      # close it once to_host is sent
+        self.syn_tries = 0
+        self.log_prefix = "%s:%d <-> %s:%d" % (ip2str(remote_ip), remote_port, ip2str(local_ip), local_port)
+
+    def send(self, flags, payload=b"", options=b""):
+        pkt = tcp_segment(self.lip, self.rip, self.lport, self.rport, self.snd_nxt, self.rcv_nxt,
+                          flags, RCV_WINDOW, payload, options)
+        self.stack.send_ip(pkt, self.rip)
+
+    def queue(self, data):
+        self.send_buf += data
+
+    def pump(self, now_us):
+        """Push queued data to the device within its window; retransmit stale data."""
+        if self.state == "SYN_SENT":
+            # Our SYN can be lost like any frame (no free RX descriptor, a
+            # full listen backlog). Without a resend the connection - and the
+            # browser waiting on it - hung forever.
+            if now_us - self.last_send_us > RETRANSMIT_US:
+                if self.syn_tries >= SYN_MAX_TRIES:
+                    self.stack.log("[NET] TCP %s: no SYN-ACK after %d tries, giving up"
+                                   % (self.log_prefix, self.syn_tries))
+                    self.state = "CLOSED"
+                    self.close_host()
+                    return
+                self.syn_tries += 1
+                self.snd_nxt = (self.snd_nxt - 1) & 0xFFFFFFFF
+                self.send(TCP_SYN, options=b"\x02\x04" + struct.pack("!H", MSS))
+                self.snd_nxt = (self.snd_nxt + 1) & 0xFFFFFFFF
+                self.last_send_us = now_us
+            return
+        if self.state != "ESTABLISHED" and self.state != "CLOSE_WAIT":
+            return
+        if self.unacked and now_us - self.last_send_us > RETRANSMIT_US:
+            seq_save = self.snd_nxt
+            self.snd_nxt = self.unacked_seq
+            for i in range(0, len(self.unacked), MSS):
+                self.send(TCP_ACK | TCP_PSH, self.unacked[i:i + MSS])
+                self.snd_nxt += len(self.unacked[i:i + MSS])
+            self.snd_nxt = seq_save
+            self.last_send_us = now_us
+        room = min(self.peer_window, 8 * MSS) - len(self.unacked)
+        while self.send_buf and room > 0:
+            chunk = self.send_buf[:min(MSS, room)]
+            self.send_buf = self.send_buf[len(chunk):]
+            if not self.unacked:
+                self.unacked_seq = self.snd_nxt
+            self.send(TCP_ACK | TCP_PSH, chunk)
+            self.snd_nxt += len(chunk)
+            self.unacked += chunk
+            room -= len(chunk)
+            self.last_send_us = now_us
+        if (self.close_after_flush and not self.send_buf and not self.unacked
+                and not self.fin_sent):
+            self.send(TCP_FIN | TCP_ACK)
+            self.snd_nxt += 1
+            self.fin_sent = True
+            self.state = "LAST_ACK" if self.fin_rcvd else "FIN_WAIT_1"
+
+    def on_segment(self, seq, ack, flags, window, payload, now_us):
+        self.last_activity_us = now_us
+        self.peer_window = window or 1
+        if flags & TCP_RST:
+            self.stack.log("[NET] TCP %s reset by device" % self.log_prefix)
+            self.close_host()
+            self.state = "CLOSED"
+            return
+        if flags & TCP_ACK:
+            acked = (ack - self.unacked_seq) & 0xFFFFFFFF
+            if self.unacked and 0 < acked <= len(self.unacked):
+                self.unacked = self.unacked[acked:]
+                self.unacked_seq = ack
+            if self.state == "SYN_SENT" and flags & TCP_SYN:
+                self.rcv_nxt = (seq + 1) & 0xFFFFFFFF
+                self.snd_una = ack
+                self.state = "ESTABLISHED"
+                self.send(TCP_ACK)
+                self.stack.log("[NET] TCP %s established (%s)" % (self.log_prefix, self.kind))
+                return
+            if self.state == "SYN_RECEIVED":
+                self.state = "ESTABLISHED"
+            if self.state in ("FIN_WAIT_1",) and ack == self.snd_nxt:
+                self.state = "FIN_WAIT_2"
+            if self.state == "LAST_ACK" and ack == self.snd_nxt:
+                self.state = "CLOSED"
+                self.close_host()
+                return
+        if payload:
+            if seq == self.rcv_nxt:
+                self.rcv_nxt = (self.rcv_nxt + len(payload)) & 0xFFFFFFFF
+                self.deliver(payload, now_us)
+            # out of order or a retransmission: acknowledge what we have
+            self.send(TCP_ACK)
+        # A FIN occupies the sequence number after the segment's data, so a
+        # last data segment that also carries FIN closes at seq + len(data).
+        fin_seq = (seq + len(payload)) & 0xFFFFFFFF
+        if flags & TCP_FIN and fin_seq == self.rcv_nxt and not self.fin_rcvd:
+            self.fin_rcvd = True
+            self.rcv_nxt = (self.rcv_nxt + 1) & 0xFFFFFFFF
+            if self.state in ("FIN_WAIT_1", "FIN_WAIT_2"):
+                self.send(TCP_ACK)
+                self.state = "CLOSED"
+                self.close_host()
+            else:
+                self.state = "CLOSE_WAIT"
+                self.send(TCP_ACK)
+                if self.kind == "forward" and self.sock is not None:
+                    # Half-close towards the browser - but only once the
+                    # host thread has sent what the device delivered. A
+                    # last data segment that carries the FIN itself would
+                    # otherwise be cut off by an immediate shutdown.
+                    self.shutdown_pending = True
+                self.close_after_flush = True
+
+    def deliver(self, data, now_us):
+        if self.kind == "client":
+            if len(self.captured) < 65536:
+                self.captured += data
+            return
+        if self.kind == "capture":
+            if len(self.captured) < CAPTURE_LIMIT:
+                self.captured += data
+            if not self.described and len(self.captured) >= 5:
+                self.described = True
+                self.stack.log("[NET] TCP %s sends: %s" % (self.log_prefix, describe_payload(self.captured)))
+            self.rx_buf += data
+            if self.proto is None and len(self.rx_buf) >= 5:
+                if mqtt_connect_info(self.rx_buf):
+                    self.proto = "mqtt"
+                elif self.rx_buf.split(b" ", 1)[0] in HTTP_METHODS:
+                    self.proto = "http"
+                else:
+                    self.proto = "raw"          # TLS and the rest: capture only
+            if self.proto == "mqtt":
+                self._mqtt_serve()
+            elif self.proto == "http":
+                self._http_serve()
+        else:
+            with self.stack.io.lock:
+                self.to_host.append(data)
+
+    # -- offline responders ------------------------------------------------
+    # A capture that only listens stops most firmware flows at their first
+    # packet: an HTTP client waits for a status line, an MQTT client only
+    # publishes once the broker has accepted it. These answer just enough of
+    # each protocol for the firmware to carry on, so what it sends AFTER the
+    # handshake is caught too. TLS cannot be answered (no certificate the
+    # firmware would trust), so encrypted flows stay capture-only.
+
+    def _http_serve(self):
+        """Answer one plain-HTTP request with a short 200 and close."""
+        if self.answered:
+            return
+        head, sep, body = self.rx_buf.partition(b"\r\n\r\n")
+        if not sep:
+            return                              # header not complete yet
+        length = 0
+        for line in head.split(b"\r\n")[1:]:
+            if line.lower().startswith(b"content-length:"):
+                try:
+                    length = int(line.split(b":", 1)[1])
+                except ValueError:
+                    pass
+        if len(body) < length:
+            return                              # wait for the whole body
+        self.answered = True
+        request = head.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+        reply = ("BekenSimulator offline network: %s\n" % request).encode("latin-1", "replace")
+        self.queue(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n"
+                   b"Connection: close\r\n\r\n%s" % (len(reply), reply))
+        self.close_after_flush = True
+        self.stack.log("[NET] HTTP %s answered 200 (offline)" % request)
+
+    def _mqtt_serve(self):
+        """A broker that accepts everything: CONNACK, SUBACK, PUBACK, PINGRESP.
+
+        Every PUBLISH is logged as topic = payload. MQTT 3.1/3.1.1 framing:
+        one type/flags byte, a 1-4 byte remaining length, the body.
+        """
+        while True:
+            buf = self.rx_buf
+            if len(buf) < 2:
+                return
+            n, mult, p = 0, 1, 1
+            while True:
+                if p >= len(buf) or p > 4:
+                    return                      # length field incomplete
+                b = buf[p]
+                n += (b & 0x7F) * mult
+                mult *= 128
+                p += 1
+                if not b & 0x80:
+                    break
+            if len(buf) < p + n:
+                return                          # packet incomplete
+            ptype, flags, body = buf[0] >> 4, buf[0] & 0x0F, buf[p:p + n]
+            self.rx_buf = buf[p + n:]
+            if ptype == 1:                      # CONNECT
+                self.queue(b"\x20\x02\x00\x00")
+                self.stack.log("[NET] MQTT %s connected to the offline broker" % self.log_prefix)
+            elif ptype == 3:                    # PUBLISH
+                qos = (flags >> 1) & 3
+                tlen = int.from_bytes(body[:2], "big")
+                topic = body[2:2 + tlen].decode("utf-8", "replace")
+                q = 2 + tlen
+                pid = body[q:q + 2] if qos else b""
+                payload = body[q + (2 if qos else 0):]
+                text = payload.decode("utf-8", "replace")
+                if len(text) > 120:
+                    text = text[:120] + " ..."
+                self.stack.log("[NET] MQTT PUBLISH %s = %s" % (topic, text))
+                self.stack.mqtt_publishes.append((topic, payload))
+                if qos == 1:
+                    self.queue(b"\x40\x02" + pid)
+                elif qos == 2:
+                    self.queue(b"\x50\x02" + pid)
+            elif ptype == 6:                    # PUBREL (QoS 2)
+                self.queue(b"\x70\x02" + body[:2])
+            elif ptype == 8:                    # SUBSCRIBE
+                pid, q, granted, topics = body[:2], 2, b"", []
+                while q + 2 <= len(body):
+                    tlen = int.from_bytes(body[q:q + 2], "big")
+                    topics.append(body[q + 2:q + 2 + tlen].decode("utf-8", "replace"))
+                    granted += bytes([min(body[q + 2 + tlen] if q + 2 + tlen < len(body) else 0, 1)])
+                    q += 3 + tlen
+                self.queue(bytes([0x90, 2 + len(granted)]) + pid + granted)
+                self.stack.log("[NET] MQTT SUBSCRIBE %s" % ", ".join(topics))
+            elif ptype == 10:                   # UNSUBSCRIBE
+                self.queue(b"\xb0\x02" + body[:2])
+            elif ptype == 12:                   # PINGREQ
+                self.queue(b"\xd0\x00")
+            elif ptype == 14:                   # DISCONNECT
+                self.close_after_flush = True
+                return
+
+    def close_host(self):
+        if self.sock is not None:
+            with self.stack.io.lock:
+                unsent = bool(self.to_host)
+            if unsent:
+                self.close_pending = True       # the host thread closes it once flushed
+            else:
+                self.stack.io.close(self.sock)
+            self.sock = None
+
+    def service(self, now_us):
+        """Called every tick: move host bytes toward the device, time out captures."""
+        if self.kind in ("relay", "forward"):
+            with self.stack.io.lock:
+                chunks = list(self.from_host)
+                self.from_host.clear()
+                host_closed = self.host_closed
+            for c in chunks:
+                self.queue(c)
+            if host_closed and not self.close_after_flush:
+                self.close_after_flush = True
+        elif self.kind == "capture":
+            # An MQTT session stays open as long as the firmware keeps it:
+            # it goes quiet between keep-alives, which is not the end of it.
+            if (self.state in ("ESTABLISHED", "CLOSE_WAIT") and not self.close_after_flush
+                    and self.proto != "mqtt"
+                    and now_us - self.last_activity_us > CAPTURE_IDLE_US):
+                if self.captured and not self.described:
+                    self.described = True
+                    self.stack.log("[NET] TCP %s sends: %s" % (self.log_prefix, describe_payload(self.captured)))
+                self.close_after_flush = True
+        elif self.kind == "client":
+            # Our own request (--net-http-get): report the reply once the
+            # device closes, or once it has gone quiet after answering.
+            idle = now_us - self.last_activity_us > CAPTURE_IDLE_US
+            if not self.described and (self.fin_rcvd or (self.captured and idle)):
+                self.described = True
+                self.stack.report_http(self, self.captured)
+                self.close_after_flush = True
+            elif not self.described and idle and now_us - self.opened_us > 30_000_000:
+                self.described = True
+                self.stack.log("[NET] HTTP GET %s: no reply from the device" % self.request_path)
+                self.close_after_flush = True
+        self.pump(now_us)
+
+
+# ------------------------------------------------------------------ the stack
+class NetStack:
+    def __init__(self, mac, log=None, gateway=True, ip=None, netmask=b"\xff\xff\xff\x00",
+                 net_out=False, forwards=(), device_ip=None, http_gets=()):
+        self.mac = mac
+        self.log = log or (lambda *a: None)
+        self.gateway = gateway          # True: we are the router/DHCP server; False: DHCP client
+        self.ip = ip or (str2ip("192.168.1.1") if gateway else None)
+        self.netmask = netmask
+        self.net_out = net_out
+        self.output = None              # callback(eth_frame)
+        self.io = HostIO()
+        self.now_us = 0
+        self.arp = {}                   # ip bytes -> mac bytes
+        self.device_ip = device_ip      # learned from DHCP / ARP / IP source
+        self.device_mac = None
+        self.leases = {}                # mac -> ip (gateway mode)
+        self.pool_next = 100
+        self.conns = {}                 # (lip, lport, rip, rport) -> TcpConn
+        self.next_port = 40000
+        self.dns_cache = {}             # name -> ip bytes
+        self.dns_pending = {}           # key -> (query packet info)
+        self.sinkhole = {}              # name -> ip bytes
+        self.sinkhole_rev = {}
+        self.sink_next = 1
+        self.udp_flows = {}             # (dev_port, dst_ip, dst_port) -> [sock, last_us]
+        self.forwards = list(forwards)  # [(lport, dport)]
+        self.listeners = []
+        for lport, dport in self.forwards:
+            try:
+                self.listeners.append(self.io.listen(lport, dport))
+                self.log("[NET] forwarding 127.0.0.1:%d -> device:%d" % (lport, dport))
+            except Exception as e:
+                self.log("[NET] cannot listen on 127.0.0.1:%d: %s" % (lport, e))
+        # DHCP client state (device-is-AP mode)
+        self.dhcp_state = "INIT"
+        self.dhcp_xid = 0x5A17C0DE
+        self.dhcp_next_us = 0
+        self.dhcp_server = None
+        self.offered = None
+        self.link = False
+        self.link_up_us = None
+        self._next_probe_us = 0
+        self.probe_sent = False
+        self.ping_seq = 0
+        self.ping_replies = 0
+        self.pending_forward_wait = []  # accepted host sockets waiting for the device IP
+        self.ident = 1
+        self.http_gets = list(http_gets)  # paths to GET from the device's port 80
+        self.http_replies = []
+        self.mqtt_publishes = []        # (topic, payload) seen by the offline broker
+        self._http_next_us = 0
+
+    # --------------------------------------------------------------- output
+    def send_eth(self, dst_mac, ethertype, payload):
+        if self.output is not None:
+            self.output(eth_frame(dst_mac, self.mac, ethertype, payload))
+
+    def mac_for(self, ip):
+        m = self.arp.get(ip)
+        if m:
+            return m
+        if self.device_mac and (ip == self.device_ip or not self.gateway):
+            return self.device_mac
+        return BCAST_MAC
+
+    def send_ip(self, pkt, dst_ip):
+        self.send_eth(self.mac_for(dst_ip), ETH_IP, pkt)
+
+    def send_arp_request(self, target_ip):
+        if not self.ip:
+            return
+        req = struct.pack("!HHBBH", 1, ETH_IP, 6, 4, 1) + self.mac + self.ip + bytes(6) + target_ip
+        self.send_eth(BCAST_MAC, ETH_ARP, req)
+
+    def send_ping(self, target_ip):
+        if not self.ip:
+            return
+        self.ping_seq += 1
+        icmp = struct.pack("!BBHHH", 8, 0, 0, 0xBEEF, self.ping_seq) + b"BekenSimulator ping"
+        icmp = icmp[:2] + struct.pack("!H", checksum(icmp)) + icmp[4:]
+        self.send_ip(ipv4_packet(self.ip, target_ip, IP_ICMP, icmp, ident=self.ident), target_ip)
+        self.ident = (self.ident + 1) & 0xFFFF
+
+    # ---------------------------------------------------------------- input
+    def link_up(self, device_mac=None):
+        if device_mac:
+            self.device_mac = device_mac
+        self.link = True
+        self.link_up_us = self.now_us
+        if not self.gateway and self.ip is None:
+            self.dhcp_state = "INIT"
+            self.dhcp_next_us = self.now_us
+
+    def input(self, frame):
+        if len(frame) < 14:
+            return
+        dst, src, etype = frame[:6], frame[6:12], struct.unpack("!H", frame[12:14])[0]
+        if src == self.mac:
+            # Our own broadcast, relayed back to the BSS by the device's AP
+            # (an AP forwards a station's group frames to all stations).
+            return
+        if self.device_mac is None or (self.gateway and src != self.device_mac):
+            self.device_mac = src
+        if etype == ETH_ARP:
+            self._arp(frame[14:], src)
+        elif etype == ETH_IP:
+            self._ipv4(frame[14:], src)
+
+    def _arp(self, p, src_mac):
+        if len(p) < 28:
+            return
+        htype, ptype, hlen, plen, op = struct.unpack("!HHBBH", p[:8])
+        sha, spa, tha, tpa = p[8:14], p[14:18], p[18:24], p[24:28]
+        if spa != b"\x00\x00\x00\x00":
+            self.arp[spa] = sha
+            if sha == self.device_mac:
+                self.device_ip = spa
+        if op == 2 and sha == self.device_mac:
+            self.log("[NET] ARP: device %s is at %s" % (ip2str(spa), mac2str(sha)))
+        if op == 1 and self.ip and tpa == self.ip:
+            reply = struct.pack("!HHBBH", 1, ETH_IP, 6, 4, 2) + self.mac + self.ip + sha + spa
+            self.send_eth(sha, ETH_ARP, reply)
+        elif op == 1 and self.gateway and tpa != spa and not self._local(tpa):
+            # the device asks for an address outside its subnet: we are the way out
+            reply = struct.pack("!HHBBH", 1, ETH_IP, 6, 4, 2) + self.mac + tpa + sha + spa
+            self.send_eth(sha, ETH_ARP, reply)
+
+    def _local(self, ip):
+        if not self.ip:
+            return False
+        return bytes(a & m for a, m in zip(ip, self.netmask)) == bytes(a & m for a, m in zip(self.ip, self.netmask))
+
+    def _ipv4(self, p, src_mac):
+        if len(p) < 20 or p[0] >> 4 != 4:
+            return
+        ihl = (p[0] & 0xF) * 4
+        total = struct.unpack("!H", p[2:4])[0]
+        proto = p[9]
+        src, dst = p[12:16], p[16:20]
+        payload = p[ihl:total] if total >= ihl else p[ihl:]
+        if src != b"\x00\x00\x00\x00" and src_mac == self.device_mac:
+            self.device_ip = src
+            self.arp[src] = src_mac
+        if proto == IP_UDP:
+            self._udp(src, dst, payload)
+        elif proto == IP_TCP:
+            self._tcp(src, dst, payload)
+        elif proto == IP_ICMP:
+            self._icmp(src, dst, payload)
+
+    # ---------------------------------------------------------------- ICMP
+    def _icmp(self, src, dst, p):
+        if len(p) >= 8 and p[0] == 0 and p[4:6] == b"\xbe\xef":
+            self.ping_replies += 1
+            self.log("[NET] ping reply from %s (seq %d)" % (ip2str(src), struct.unpack("!H", p[6:8])[0]))
+            return
+        if len(p) < 8 or p[0] != 8:
+            return
+        if dst != self.ip and not self.gateway:
+            return
+        reply = b"\x00\x00\x00\x00" + p[4:]
+        reply = reply[:2] + struct.pack("!H", checksum(reply)) + reply[4:]
+        self.send_ip(ipv4_packet(dst, src, IP_ICMP, reply), src)
+        self.log("[NET] ping %s -> %s answered" % (ip2str(src), ip2str(dst)))
+
+    # ----------------------------------------------------------------- UDP
+    def _udp(self, src, dst, p):
+        if len(p) < 8:
+            return
+        sport, dport, ulen = struct.unpack("!HHH", p[:6])
+        data = p[8:ulen] if ulen >= 8 else p[8:]
+        if dport == 67 and self.gateway:
+            self._dhcp_server(src, sport, data)
+            return
+        if dport == 68 and not self.gateway:
+            self._dhcp_client_rx(data)
+            return
+        if dport == 53:
+            self._dns(src, sport, dst, data)
+            return
+        if dport == 123:
+            self._ntp(src, sport, dst, data)
+            return
+        if dst[0] >= 224 or dst == b"\xff\xff\xff\xff" or dst[3] == 255:
+            text = "".join(chr(c) if 32 <= c < 127 else "." for c in data[:60])
+            self.log("[NET] UDP broadcast %s:%d -> %s:%d %d bytes: %s"
+                     % (ip2str(src), sport, ip2str(dst), dport, len(data), text))
+            return
+        if self.gateway and self.net_out:
+            key = (sport, dst, dport)
+            ent = self.udp_flows.get(key)
+            if ent is None:
+                try:
+                    s = self.io.udp_socket(key)
+                except Exception:
+                    return
+                ent = [s, self.now_us]
+                self.udp_flows[key] = ent
+                self.log("[NET] UDP %s:%d -> %s:%d relayed" % (ip2str(src), sport, ip2str(dst), dport))
+            ent[1] = self.now_us
+            try:
+                ent[0].sendto(data, (ip2str(dst), dport))
+            except Exception:
+                pass
+            return
+        self.log("[NET] UDP %s:%d -> %s:%d %d bytes (offline, dropped)"
+                 % (ip2str(src), sport, self._name(dst), dport, len(data)))
+
+    def _name(self, ip):
+        n = self.sinkhole_rev.get(ip)
+        return "%s(%s)" % (ip2str(ip), n) if n else ip2str(ip)
+
+    def _ntp(self, src, sport, dst, data):
+        if len(data) < 48:
+            return
+        NTP_DELTA = 2208988800
+        t = time.time() + NTP_DELTA
+        secs = int(t)
+        frac = int((t - secs) * (1 << 32))
+        reply = bytearray(48)
+        reply[0] = (0 << 6) | (4 << 3) | 4        # LI=0, VN=4, mode=server
+        reply[1] = 2                              # stratum
+        reply[2] = data[2] if data[2] else 6
+        reply[3] = 0xEC
+        reply[12:16] = b"LOCL"
+        ts = struct.pack("!II", secs, frac)
+        reply[16:24] = ts                         # reference
+        reply[24:32] = data[40:48]                # originate = client transmit
+        reply[32:40] = ts                         # receive
+        reply[40:48] = ts                         # transmit
+        self.send_ip(udp_packet(dst if dst != b"\xff\xff\xff\xff" else self.ip, src, 123, sport, bytes(reply)), src)
+        self.log("[NET] NTP %s -> %s answered with the host clock" % (ip2str(src), self._name(dst)))
+
+    # ----------------------------------------------------------------- DNS
+    def _dns(self, src, sport, dst, data):
+        if len(data) < 12:
+            return
+        txid, flags, qd = struct.unpack("!HHH", data[:6])
+        if qd < 1:
+            return
+        name, off = dns_name(data, 12)
+        if off + 4 > len(data):
+            return
+        qtype, qclass = struct.unpack("!HH", data[off:off + 4])
+        question = data[12:off + 4]
+        key = (src, sport, txid, name, qtype, dst)
+        if qtype not in (1, 28):
+            self._dns_reply(key, question, None)
+            return
+        if qtype == 28:                           # AAAA: no IPv6 here
+            self._dns_reply(key, question, None)
+            return
+        if not self.net_out:
+            ip = self.sinkhole.get(name)
+            if ip is None:
+                ip = bytes([10, 200, (self.sink_next >> 8) & 0xFF, self.sink_next & 0xFF])
+                self.sink_next += 1
+                self.sinkhole[name] = ip
+                self.sinkhole_rev[ip] = name
+            self.log("[NET] DNS %s -> %s (offline sinkhole)" % (name, ip2str(ip)))
+            self._dns_reply(key, question, ip)
+            return
+        if name in self.dns_cache:
+            self._dns_reply(key, question, self.dns_cache[name])
+            return
+        self.dns_pending[key] = question
+        self.io.resolve(name, key)
+
+    def _dns_reply(self, key, question, ip):
+        src, sport, txid, name, qtype, dst = key
+        if ip:
+            flags = 0x8180
+            answer = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 60, 4) + ip
+            an = 1
+        else:
+            flags = 0x8183 if qtype == 1 else 0x8180   # NXDOMAIN for A, empty for AAAA/other
+            answer = b""
+            an = 0
+        pkt = struct.pack("!HHHHHH", txid, flags, 1, an, 0, 0) + question + answer
+        reply_src = dst if dst != b"\xff\xff\xff\xff" else self.ip
+        self.send_ip(udp_packet(reply_src, src, 53, sport, pkt), src)
+
+    # ---------------------------------------------------------------- DHCP
+    def _dhcp_opts(self, data):
+        opts = {}
+        if len(data) < 240 or data[236:240] != b"\x63\x82\x53\x63":
+            return opts
+        p = 240
+        while p < len(data):
+            t = data[p]
+            if t == 255:
+                break
+            if t == 0:
+                p += 1
+                continue
+            l = data[p + 1]
+            opts[t] = data[p + 2:p + 2 + l]
+            p += 2 + l
+        return opts
+
+    def _dhcp_server(self, src, sport, data):
+        opts = self._dhcp_opts(data)
+        if len(data) < 240 or 53 not in opts:
+            return
+        mtype = opts[53][0]
+        xid = data[4:8]
+        chaddr = data[28:34]
+        lease_ip = self.leases.get(chaddr)
+        if lease_ip is None:
+            lease_ip = self.ip[:3] + bytes([self.pool_next])
+            self.pool_next += 1
+            self.leases[chaddr] = lease_ip
+        if mtype == 1:
+            reply_type = 2
+        elif mtype == 3:
+            reply_type = 5
+        else:
+            return
+        resp = bytearray(240)
+        resp[0:4] = b"\x02\x01\x06\x00"
+        resp[4:8] = xid
+        resp[10:12] = data[10:12]                 # flags (broadcast bit)
+        resp[16:20] = lease_ip
+        resp[20:24] = self.ip
+        resp[28:34] = chaddr
+        resp[236:240] = b"\x63\x82\x53\x63"
+        o = b"\x35\x01" + bytes([reply_type])
+        o += b"\x36\x04" + self.ip                 # server id
+        o += b"\x33\x04" + struct.pack("!I", 86400)
+        o += b"\x01\x04" + self.netmask
+        o += b"\x03\x04" + self.ip                 # router
+        o += b"\x06\x04" + self.ip                 # dns
+        o += b"\xff"
+        pkt = udp_packet(self.ip, b"\xff\xff\xff\xff", 67, 68, bytes(resp) + o)
+        self.send_eth(BCAST_MAC, ETH_IP, pkt)
+        if reply_type == 5:
+            self.device_ip = lease_ip
+            self.device_mac = chaddr
+            self.arp[lease_ip] = chaddr
+            self.log("[NET] DHCP: device %s got %s (gateway/DNS %s)"
+                     % (mac2str(chaddr), ip2str(lease_ip), ip2str(self.ip)))
+        else:
+            self.log("[NET] DHCP: offering %s to %s" % (ip2str(lease_ip), mac2str(chaddr)))
+
+    def _dhcp_client_send(self, mtype):
+        msg = bytearray(240)
+        msg[0:4] = b"\x01\x01\x06\x00"
+        msg[4:8] = struct.pack("!I", self.dhcp_xid)
+        msg[10:12] = b"\x80\x00"                 # broadcast replies
+        msg[28:34] = self.mac
+        msg[236:240] = b"\x63\x82\x53\x63"
+        o = b"\x35\x01" + bytes([mtype])
+        o += b"\x3d\x07\x01" + self.mac
+        if mtype == 3 and self.offered:
+            o += b"\x32\x04" + self.offered
+            if self.dhcp_server:
+                o += b"\x36\x04" + self.dhcp_server
+        o += b"\x37\x03\x01\x03\x06\xff"
+        pkt = udp_packet(b"\x00\x00\x00\x00", b"\xff\xff\xff\xff", 68, 67, bytes(msg) + o)
+        self.send_eth(BCAST_MAC, ETH_IP, pkt)
+
+    def _dhcp_client_rx(self, data):
+        opts = self._dhcp_opts(data)
+        if len(data) < 240 or 53 not in opts or data[4:8] != struct.pack("!I", self.dhcp_xid):
+            return
+        mtype = opts[53][0]
+        if mtype == 2 and self.dhcp_state == "DISCOVER":
+            self.offered = data[16:20]
+            self.dhcp_server = opts.get(54, data[20:24])
+            self.dhcp_state = "REQUEST"
+            self._dhcp_client_send(3)
+            self.dhcp_next_us = self.now_us + 3_000_000
+        elif mtype == 5 and self.dhcp_state == "REQUEST":
+            self.ip = data[16:20]
+            self.netmask = opts.get(1, self.netmask)
+            router = opts.get(3)
+            self.dhcp_state = "BOUND"
+            self.log("[NET] DHCP: we got %s/%s from the device (router %s)"
+                     % (ip2str(self.ip), ip2str(self.netmask), ip2str(router) if router else "-"))
+            if router:
+                self.device_ip = router
+        elif mtype == 6:
+            self.dhcp_state = "INIT"
+            self.dhcp_next_us = self.now_us + 2_000_000
+
+    def _arp_probe_tick(self):
+        """Station side, no address known for the device: ask the usual suspects.
+
+        The device announces itself with a gratuitous ARP when its interface
+        comes up - typically before anything has joined it - so a late joiner
+        may never hear it. An ARP probe (sender 0.0.0.0) for the common
+        soft-AP gateway addresses gets an answer from LwIP for whichever one
+        is the device's, without needing an address of our own first.
+        """
+        if self.device_ip or self.link_up_us is None:
+            return
+        if self.now_us - self.link_up_us < 4_000_000 or self.now_us < self._next_probe_us:
+            return
+        self._next_probe_us = self.now_us + 2_000_000
+        for cand in SOFTAP_GUESSES:
+            req = struct.pack("!HHBBH", 1, ETH_IP, 6, 4, 1) + self.mac + bytes(4) + bytes(6) + cand
+            self.send_eth(BCAST_MAC, ETH_ARP, req)
+
+    def _dhcp_client_tick(self):
+        if self.gateway or not self.link:
+            return
+        self._arp_probe_tick()
+        if self.dhcp_state in ("BOUND", "STATIC"):
+            return
+        # No lease after a few tries: take an address next to the device's own
+        # (learned from its gratuitous ARP), so the rest of the path - ARP,
+        # ping, port forwards - can be exercised and the DHCP failure stays a
+        # finding rather than a dead end.
+        if (self.ip is None and self.device_ip and self.link_up_us is not None
+                and self.now_us - self.link_up_us > STATIC_FALLBACK_US):
+            self.ip = self.device_ip[:3] + bytes([(self.device_ip[3] % 250) + 2])
+            self.dhcp_state = "STATIC"
+            self.log("[NET] no DHCP lease from the device after %d s: using static %s/%s"
+                     % (STATIC_FALLBACK_US // 1_000_000, ip2str(self.ip), ip2str(self.netmask)))
+            return
+        if self.now_us < self.dhcp_next_us:
+            return
+        if self.dhcp_state in ("INIT", "DISCOVER"):
+            self.dhcp_state = "DISCOVER"
+            self._dhcp_client_send(1)
+            self.dhcp_next_us = self.now_us + 3_000_000
+        elif self.dhcp_state == "REQUEST":
+            self._dhcp_client_send(3)
+            self.dhcp_next_us = self.now_us + 3_000_000
+
+    # ----------------------------------------------------------------- TCP
+    def _tcp(self, src, dst, p):
+        if len(p) < 20:
+            return
+        sport, dport, seq, ack, doff_flags, window = struct.unpack("!HHIIHH", p[:16])
+        doff = (doff_flags >> 12) * 4
+        flags = doff_flags & 0x3F
+        payload = p[doff:]
+        key = (dst, dport, src, sport)
+        conn = self.conns.get(key)
+        if conn is None:
+            if flags & TCP_SYN and not (flags & TCP_ACK):
+                self._tcp_new(src, sport, dst, dport, seq, window)
+            elif not (flags & TCP_RST):
+                # unknown connection: reset it so the firmware does not wait
+                pkt = tcp_segment(dst, src, dport, sport, ack, (seq + len(payload)) & 0xFFFFFFFF,
+                                  TCP_RST | TCP_ACK, 0)
+                self.send_ip(pkt, src)
+            return
+        conn.on_segment(seq, ack, flags, window, payload, self.now_us)
+        if conn.state == "CLOSED":
+            self.conns.pop(key, None)
+
+    def _tcp_new(self, src, sport, dst, dport, seq, window):
+        """The device opens a connection to dst:dport."""
+        target = self._name(dst)
+        if dst == self.ip or (self.gateway and not self.net_out) or not self.gateway:
+            kind = "capture"
+        else:
+            kind = "relay"
+        conn = TcpConn(self, dst, dport, src, sport, kind)
+        conn.rcv_nxt = (seq + 1) & 0xFFFFFFFF
+        conn.peer_window = window
+        conn.last_activity_us = self.now_us
+        self.conns[(dst, dport, src, sport)] = conn
+        if kind == "capture":
+            self.log("[NET] TCP connect %s:%d -> %s:%d (accepted for capture)"
+                     % (ip2str(src), sport, target, dport))
+            conn.state = "SYN_RECEIVED"
+            conn.send(TCP_SYN | TCP_ACK, options=b"\x02\x04" + struct.pack("!H", MSS))
+            conn.snd_nxt += 1
+        else:
+            self.log("[NET] TCP connect %s:%d -> %s:%d (relaying)" % (ip2str(src), sport, target, dport))
+            conn.state = "CONNECTING"
+            self.io.connect(conn, ip2str(dst), dport)
+
+    def _http_client_tick(self):
+        """Issue the queued --net-http-get requests to the device, one at a time."""
+        if not self.http_gets or not self.ip or not self.device_ip:
+            return
+        if self.now_us < self._http_next_us:
+            return
+        if any(c.kind == "client" and not c.described for c in self.conns.values()):
+            return
+        path = self.http_gets.pop(0)
+        self._http_next_us = self.now_us + 500_000
+        lport = self.next_port
+        self.next_port = 40000 + ((self.next_port - 40000 + 1) % 20000)
+        conn = TcpConn(self, self.ip, lport, self.device_ip, 80, "client")
+        conn.request_path = path
+        conn.opened_us = self.now_us
+        conn.last_activity_us = self.now_us
+        conn.queue(("GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: BekenSimulator\r\n"
+                    "Connection: close\r\n\r\n" % (path, ip2str(self.device_ip))).encode("latin-1"))
+        self.conns[(self.ip, lport, self.device_ip, 80)] = conn
+        conn.state = "SYN_SENT"
+        conn.last_send_us = self.now_us
+        conn.send(TCP_SYN, options=b"\x02\x04" + struct.pack("!H", MSS))
+        conn.snd_nxt += 1
+        self.log("[NET] HTTP GET http://%s%s" % (ip2str(self.device_ip), path))
+
+    def report_http(self, conn, data):
+        head, sep, body = data.partition(b"\r\n\r\n")
+        if not sep:
+            head, _, body = data.partition(b"\n\n")
+        # OpenBeken ends its status line with a bare LF, so split on LF and
+        # drop any CR rather than assuming CRLF throughout.
+        status = (head.split(b"\n", 1)[0].strip().decode("latin-1", "replace")
+                  if head else "(empty reply)")
+        text = body.decode("utf-8", "replace")
+        one_line = " ".join(text.split())
+        if len(one_line) > 300:
+            one_line = one_line[:300] + " ..."
+        self.log("[NET] HTTP GET %s -> %s, %d byte body: %s"
+                 % (conn.request_path, status, len(body), one_line))
+        self.http_replies.append((conn.request_path, status, body))
+
+    def _forward_open(self, sock, dport):
+        if not self.device_ip or not self.ip:
+            self.pending_forward_wait.append((sock, dport, self.now_us))
+            return
+        lport = self.next_port
+        self.next_port = 40000 + ((self.next_port - 40000 + 1) % 20000)
+        conn = TcpConn(self, self.ip, lport, self.device_ip, dport, "forward")
+        conn.sock = sock
+        self.io.attach(sock, conn)
+        self.conns[(self.ip, lport, self.device_ip, dport)] = conn
+        conn.state = "SYN_SENT"
+        conn.last_send_us = self.now_us
+        conn.last_activity_us = self.now_us
+        conn.send(TCP_SYN, options=b"\x02\x04" + struct.pack("!H", MSS))
+        conn.snd_nxt += 1
+        self.log("[NET] TCP forward: %s:%d -> device %s:%d" % (ip2str(self.ip), lport, ip2str(self.device_ip), dport))
+
+    # ---------------------------------------------------------------- tick
+    def tick(self, now_us):
+        self.now_us = now_us
+        self._dhcp_client_tick()
+        if (not self.gateway and self.link and self.ip and self.device_ip and not self.probe_sent):
+            # First thing on a usable station link: ARP for the device and ping
+            # it, which proves the data path independently of any service above.
+            self.probe_sent = True
+            self.send_arp_request(self.device_ip)
+            self.send_ping(self.device_ip)
+        self._http_client_tick()
+        io = self.io
+        with io.lock:
+            accepted = list(io.accepted); io.accepted.clear()
+            dns = list(io.dns_results); io.dns_results.clear()
+            connects = list(io.connect_results); io.connect_results.clear()
+            udp_in = list(io.udp_in); io.udp_in.clear()
+        for sock, dport in accepted:
+            self._forward_open(sock, dport)
+        if self.pending_forward_wait and self.device_ip and self.ip:
+            waiting, self.pending_forward_wait = self.pending_forward_wait, []
+            for sock, dport, _ in waiting:
+                self._forward_open(sock, dport)
+        for key, ip in dns:
+            q = self.dns_pending.pop(key, None)
+            if q is None:
+                continue
+            name = key[3]
+            if ip:
+                self.dns_cache[name] = ip
+            self.log("[NET] DNS %s -> %s" % (name, ip2str(ip) if ip else "NXDOMAIN"))
+            self._dns_reply(key, q, ip)
+        for conn, ok in connects:
+            if conn.state != "CONNECTING":
+                continue
+            if ok:
+                conn.state = "SYN_RECEIVED"
+                conn.send(TCP_SYN | TCP_ACK, options=b"\x02\x04" + struct.pack("!H", MSS))
+                conn.snd_nxt += 1
+            else:
+                self.log("[NET] TCP %s: remote refused/unreachable" % conn.log_prefix)
+                pkt = tcp_segment(conn.lip, conn.rip, conn.lport, conn.rport, 0, conn.rcv_nxt, TCP_RST | TCP_ACK, 0)
+                self.send_ip(pkt, conn.rip)
+                conn.state = "CLOSED"
+        for flow, data in udp_in:
+            dev_port, dst_ip, dst_port = flow
+            if self.device_ip:
+                self.send_ip(udp_packet(dst_ip, self.device_ip, dst_port, dev_port, data), self.device_ip)
+        for key, conn in list(self.conns.items()):
+            conn.service(now_us)
+            if conn.state == "CLOSED":
+                conn.close_host()
+                self.conns.pop(key, None)
+
+    def summary(self):
+        return {"device_ip": ip2str(self.device_ip) if self.device_ip else None,
+                "our_ip": ip2str(self.ip) if self.ip else None,
+                "conns": len(self.conns), "dns": list(self.sinkhole) + list(self.dns_cache)}
+
+
+# ---------------------------------------------------------------------------
+# Self-tests: a fake device (just the frames) against the stack. Run: python src/netstack.py
+# ---------------------------------------------------------------------------
+def _run_selftests():
+    n = 0
+
+    def check(cond, msg):
+        nonlocal n
+        assert cond, "FAIL: " + msg
+        n += 1
+        print("  [PASS]", msg)
+
+    logs = []
+    out = []
+    st = NetStack(bytes.fromhex("020000000001"), log=logs.append, gateway=True)
+    st.output = out.append
+    dev_mac = bytes.fromhex("c8478c000001")
+
+    print("== ARP ==")
+    req = struct.pack("!HHBBH", 1, ETH_IP, 6, 4, 1) + dev_mac + str2ip("192.168.1.100") + bytes(6) + st.ip
+    st.input(eth_frame(BCAST_MAC, dev_mac, ETH_ARP, req))
+    check(out and out[-1][12:14] == b"\x08\x06" and out[-1][14 + 8:14 + 14] == st.mac, "ARP request for our IP answered with our MAC")
+
+    print("== DHCP server ==")
+    disc = bytearray(240); disc[0:4] = b"\x01\x01\x06\x00"; disc[4:8] = b"\x12\x34\x56\x78"; disc[28:34] = dev_mac; disc[236:240] = b"\x63\x82\x53\x63"
+    st.input(eth_frame(BCAST_MAC, dev_mac, ETH_IP, udp_packet(b"\0\0\0\0", b"\xff\xff\xff\xff", 68, 67, bytes(disc) + b"\x35\x01\x01\xff")))
+    offer = out[-1][14:]
+    yiaddr = offer[20 + 8 + 16:20 + 8 + 20]
+    check(yiaddr == str2ip("192.168.1.100"), "DISCOVER -> OFFER of the first pool address")
+    st.input(eth_frame(BCAST_MAC, dev_mac, ETH_IP, udp_packet(b"\0\0\0\0", b"\xff\xff\xff\xff", 68, 67, bytes(disc) + b"\x35\x01\x03\x32\x04" + yiaddr + b"\xff")))
+    check(st.device_ip == yiaddr and any("got 192.168.1.100" in l for l in logs), "REQUEST -> ACK, device address learned")
+
+    print("== DNS sinkhole + TCP capture ==")
+    q = struct.pack("!HHHHHH", 0xBEEF, 0x0100, 1, 0, 0, 0) + b"\x03api\x04tuya\x03com\x00" + struct.pack("!HH", 1, 1)
+    st.input(eth_frame(st.mac, dev_mac, ETH_IP, udp_packet(yiaddr, st.ip, 5000, 53, q)))
+    resp = out[-1][14 + 20 + 8:]
+    check(resp[:2] == b"\xbe\xef" and resp[-4:-2] == b"\x0a\xc8", "A query answered from the 10.200/16 sinkhole")
+    sink = resp[-4:]
+    check(st.sinkhole_rev[sink] == "api.tuya.com", "name remembered for that address")
+    syn = tcp_segment(yiaddr, sink, 6000, 443, 1000, 0, TCP_SYN, 8192)
+    st.input(eth_frame(st.mac, dev_mac, ETH_IP, syn))
+    sa = out[-1][14 + 20:]
+    check(sa[13] & TCP_SYN and sa[13] & TCP_ACK and struct.unpack("!I", sa[8:12])[0] == 1001, "SYN to a sinkhole address gets SYN-ACK")
+    conn = st.conns[(sink, 443, yiaddr, 6000)]
+    isn = conn.snd_nxt
+    ext = b"\x00\x00" + struct.pack("!H", 2 + 3 + 12) + struct.pack("!H", 3 + 12) + b"\x00" + struct.pack("!H", 12) + b"a1.tuyaeu.com"[:12]
+    body = b"\x03\x03" + bytes(32) + b"\x00" + b"\x00\x02\x13\x01" + b"\x01\x00" + struct.pack("!H", len(ext)) + ext
+    hs = b"\x01" + struct.pack("!I", len(body))[1:] + body
+    rec = b"\x16\x03\x01" + struct.pack("!H", len(hs)) + hs
+    st.input(eth_frame(st.mac, dev_mac, ETH_IP, tcp_segment(yiaddr, sink, 6000, 443, 1001, isn, TCP_ACK | TCP_PSH, 8192, rec)))
+    check(any("server name a1.tuyaeu.co" in l for l in logs), "captured ClientHello decoded to its server name")
+    st.tick(10_000_000)
+    check(conn.fin_sent, "idle capture is closed with FIN")
+    mq = b"\x00\x04MQTT\x04\xc2\x00\x3c\x00\x0bobk8C000000\x00\x04user\x00\x04pass"
+    check(describe_payload(b"\x10" + bytes([len(mq)]) + mq)
+          == "MQTT CONNECT (v3.1.1, client id 'obk8C000000', keepalive 60s, with username/password)",
+          "MQTT CONNECT decoded: protocol level, client id, keepalive, credential flags")
+    check(describe_payload(b"\x10\x90\x01" + mq + bytes(144 - len(mq))).startswith("MQTT CONNECT (v3.1.1"),
+          "...also behind a two-byte remaining-length field")
+
+    print("== NTP ==")
+    ntp = bytes([0x23]) + bytes(47)
+    st.input(eth_frame(st.mac, dev_mac, ETH_IP, udp_packet(yiaddr, str2ip("10.200.0.9"), 123, 123, ntp)))
+    r = out[-1][14 + 20 + 8:]
+    check(len(r) == 48 and (r[0] & 7) == 4 and struct.unpack("!I", r[40:44])[0] > 3_900_000_000, "NTP answered with a server-mode packet carrying the host clock")
+
+    print("== ping ==")
+    icmp = b"\x08\x00\x00\x00\x00\x01\x00\x01" + b"abc"
+    icmp = icmp[:2] + struct.pack("!H", checksum(icmp)) + icmp[4:]
+    st.input(eth_frame(st.mac, dev_mac, ETH_IP, ipv4_packet(yiaddr, st.ip, IP_ICMP, icmp)))
+    check(out[-1][14 + 20] == 0 and out[-1][14 + 20 + 8:] == b"abc", "echo request answered")
+
+    print("== forward: our side opens TCP into the device ==")
+    class FakeSock:
+        def __init__(self): self.sent = b""; self.closed = False
+        def setblocking(self, b): pass
+        def send(self, d): self.sent += d; return len(d)
+        def recv(self, n): raise BlockingIOError
+        def shutdown(self, how): pass
+        def close(self): self.closed = True
+        def fileno(self): return -1
+    fs = FakeSock()
+    st._forward_open(fs, 80)
+    syn = out[-1][14 + 20:]
+    check(syn[13] == TCP_SYN and struct.unpack("!H", syn[2:4])[0] == 80, "SYN sent to device port 80")
+    fconn = [c for c in st.conns.values() if c.kind == "forward"][0]
+    synack = tcp_segment(st.device_ip, st.ip, 80, fconn.lport, 5000, fconn.snd_nxt, TCP_SYN | TCP_ACK, 2048)
+    st.input(eth_frame(st.mac, dev_mac, ETH_IP, synack))
+    check(fconn.state == "ESTABLISHED" and out[-1][14 + 20 + 13] == TCP_ACK, "SYN-ACK -> ACK, established")
+    with st.io.lock:
+        fconn.from_host.append(b"GET / HTTP/1.0\r\n\r\n")
+    st.tick(11_000_000)
+    seg = out[-1][14 + 20:]
+    check(seg[20:] == b"GET / HTTP/1.0\r\n\r\n", "host bytes pushed to the device")
+    st.input(eth_frame(st.mac, dev_mac, ETH_IP, tcp_segment(st.device_ip, st.ip, 80, fconn.lport, 5001, fconn.snd_nxt, TCP_ACK | TCP_PSH, 2048, b"HTTP/1.0 200 OK\r\n")))
+    check(fconn.to_host and fconn.to_host[0] == b"HTTP/1.0 200 OK\r\n", "device bytes queued for the host socket")
+    check(not fconn.unacked, "our data acknowledged")
+
+    print("== station side: DHCP fallback, ARP/ping probe ==")
+    logs2, out2 = [], []
+    cl = NetStack(bytes.fromhex("020000000001"), log=logs2.append, gateway=False)
+    cl.output = out2.append
+    garp = struct.pack("!HHBBH", 1, ETH_IP, 6, 4, 1) + dev_mac + str2ip("192.168.4.1") + bytes(6) + str2ip("192.168.4.1")
+    cl.input(eth_frame(BCAST_MAC, dev_mac, ETH_ARP, garp))
+    check(cl.device_ip == str2ip("192.168.4.1") and cl.device_mac == dev_mac, "device address learned from its gratuitous ARP")
+    cl.tick(1_000_000); cl.link_up(dev_mac); cl.tick(1_000_001)
+    check(out2 and out2[-1][14 + 20 + 8 + 240:][:3] == b"\x35\x01\x01", "DHCP DISCOVER sent once the link is up")
+    cl.tick(1_000_000 + STATIC_FALLBACK_US + 1)
+    check(cl.ip == str2ip("192.168.4.3") and cl.dhcp_state == "STATIC", "static fallback next to the device's address")
+    kinds = [(f[12:14], f[14 + 20 + 0] if f[12:14] == b"\x08\x00" else None) for f in out2[-2:]]
+    check(any(k[0] == b"\x08\x06" for k in kinds) and any(k == (b"\x08\x00", 8) for k in kinds), "ARP request and ping sent to the device")
+    echo = b"\x00\x00\x00\x00\xbe\xef\x00\x01" + b"BekenSimulator ping"
+    echo = echo[:2] + struct.pack("!H", checksum(echo)) + echo[4:]
+    cl.input(eth_frame(cl.mac, dev_mac, ETH_IP, ipv4_packet(str2ip("192.168.4.1"), cl.ip, IP_ICMP, echo)))
+    check(cl.ping_replies == 1 and any("ping reply from 192.168.4.1" in l for l in logs2), "ping reply recognised")
+
+    print("== --net-http-get: our own request to the device ==")
+    logs3, out3 = [], []
+    hc = NetStack(bytes.fromhex("020000000001"), log=logs3.append, gateway=False, http_gets=["/cm?cmnd=echo%20hi"])
+    hc.output = out3.append
+    hc.ip, hc.device_ip, hc.device_mac = str2ip("192.168.4.100"), str2ip("192.168.4.1"), dev_mac
+    hc.link, hc.probe_sent, hc.dhcp_state = True, True, "BOUND"
+    hc.tick(1_000_000)
+    syn = out3[-1][14 + 20:]
+    check(syn[13] == TCP_SYN and struct.unpack("!H", syn[2:4])[0] == 80, "queued GET opens a connection to the device's port 80")
+    cc = [x for x in hc.conns.values() if x.kind == "client"][0]
+    hc.input(eth_frame(hc.mac, dev_mac, ETH_IP, tcp_segment(hc.device_ip, hc.ip, 80, cc.lport, 7000, cc.snd_nxt, TCP_SYN | TCP_ACK, 4096)))
+    hc.tick(1_100_000)
+    check(out3[-1][14 + 40:].startswith(b"GET /cm?cmnd=echo%20hi HTTP/1.0\r\n"), "request sent once established")
+    reply = b"HTTP/1.1 200 OK\r\nContent-type: application/json\r\n\r\nhi"
+    hc.input(eth_frame(hc.mac, dev_mac, ETH_IP, tcp_segment(hc.device_ip, hc.ip, 80, cc.lport, 7001, cc.snd_nxt,
+                                                         TCP_ACK | TCP_PSH | TCP_FIN, 4096, reply)))
+    hc.tick(1_200_000)
+    check(hc.http_replies == [("/cm?cmnd=echo%20hi", "HTTP/1.1 200 OK", b"hi")],
+          "reply whose last segment also carries FIN is complete (FIN at seq + data length)")
+    check(any("-> HTTP/1.1 200 OK, 2 byte body: hi" in l for l in logs3), "status and body logged")
+
+    def segs(frames, dport=None):
+        """TCP segments we sent: [(seq, ack, flags, payload, sport, dport)]."""
+        res = []
+        for f in frames:
+            if f[12:14] == b"\x08\x00" and f[14 + 9] == IP_TCP:
+                t = f[14 + 20:]
+                sp, dp, sq, ak = struct.unpack("!HHII", t[:12])
+                if dport is None or dp == dport:
+                    res.append((sq, ak, t[13], t[(t[12] >> 4) * 4:], sp, dp))
+        return res
+
+    def open_capture(stack, out, dst, dport, sport, isn=5000):
+        """Device SYN to dst:dport; returns (conn, next device seq)."""
+        stack.input(eth_frame(stack.mac, dev_mac, ETH_IP, tcp_segment(stack.device_ip, dst, sport, dport, isn, 0, TCP_SYN, 8192)))
+        c = stack.conns[(dst, dport, stack.device_ip, sport)]
+        stack.input(eth_frame(stack.mac, dev_mac, ETH_IP, tcp_segment(stack.device_ip, dst, sport, dport, isn + 1, c.snd_nxt, TCP_ACK, 8192)))
+        return c, isn + 1
+
+    def dev_send(stack, c, dst, dport, sport, seq, payload, flags=TCP_ACK | TCP_PSH, window=8192):
+        stack.input(eth_frame(stack.mac, dev_mac, ETH_IP, tcp_segment(stack.device_ip, dst, sport, dport, seq,
+                                                                     c.snd_nxt, flags, window, payload)))
+        return seq + len(payload)
+
+    print("== offline HTTP responder: the device's HTTP client gets an answer ==")
+    logs7, out7 = [], []
+    hs = NetStack(bytes.fromhex("020000000001"), log=logs7.append, gateway=True)
+    hs.output = out7.append
+    hs.device_ip, hs.device_mac = str2ip("192.168.1.100"), dev_mac
+    hs.arp[hs.device_ip] = dev_mac
+    sink2 = str2ip("10.200.0.7")
+    hc2, sq = open_capture(hs, out7, sink2, 80, 6100)
+    sq = dev_send(hs, hc2, sink2, 80, 6100, sq, b"GET /hello?dev=obk HTTP/1.1\r\nHost: api.bekensim.test\r\n\r\n")
+    hs.tick(1_000_000)
+    rep = b"".join(p for _, _, _, p, sp, _ in segs(out7) if sp == 80)
+    check(rep.startswith(b"HTTP/1.1 200 OK\r\n") and b"GET /hello?dev=obk" in rep,
+          "GET to a sinkhole address answered 200, the reply names the request")
+    check(any("HTTP GET /hello?dev=obk HTTP/1.1 answered 200 (offline)" in l for l in logs7), "answer logged")
+    hs.input(eth_frame(hs.mac, dev_mac, ETH_IP, tcp_segment(hs.device_ip, sink2, 6100, 80, sq, hc2.snd_nxt, TCP_ACK, 8192)))
+    hs.tick(1_100_000)
+    check(segs(out7)[-1][2] & TCP_FIN, "connection closed after the reply is acknowledged (Connection: close)")
+    pc_, sq = open_capture(hs, out7, sink2, 80, 6101, isn=7000)
+    n_before = len(segs(out7))
+    sq = dev_send(hs, pc_, sink2, 80, 6101, sq, b"POST /api HTTP/1.1\r\nContent-Length: 10\r\n\r\n12345")
+    hs.tick(1_200_000)
+    check(not any(p.startswith(b"HTTP/1.1") for _, _, _, p, _, _ in segs(out7)[n_before:]),
+          "POST with half its body: no answer yet")
+    sq = dev_send(hs, pc_, sink2, 80, 6101, sq, b"67890")
+    hs.tick(1_300_000)
+    check(any(p.startswith(b"HTTP/1.1 200 OK") for _, _, _, p, _, _ in segs(out7)[n_before:]),
+          "...answered once Content-Length bytes have arrived")
+
+    print("== offline MQTT broker: CONNACK, SUBACK, PUBACK, PINGRESP, PUBLISH logged ==")
+    mc, sq = open_capture(hs, out7, sink2, 1883, 6200, isn=9000)
+    connect = b"\x00\x04MQTT\x04\x02\x00\x3c\x00\x06obkSim"
+    sq = dev_send(hs, mc, sink2, 1883, 6200, sq, b"\x10" + bytes([len(connect)]) + connect)
+    hs.tick(2_000_000)
+    check(segs(out7, 6200)[-1][3] == b"\x20\x02\x00\x00", "CONNECT -> CONNACK (accepted)")
+    sub = b"\x00\x01" + b"\x00\x0cobkSim/+/set" + b"\x01"
+    sq = dev_send(hs, mc, sink2, 1883, 6200, sq, b"\x82" + bytes([len(sub)]) + sub)
+    hs.tick(2_100_000)
+    check(segs(out7, 6200)[-1][3] == b"\x90\x03\x00\x01\x01", "SUBSCRIBE -> SUBACK with the packet id and granted QoS")
+    pub0 = b"\x00\x10obkSim/connected" + b"online"
+    pub1 = b"\x00\x0cobkSim/1/get" + b"\x00\x05" + b"1"
+    sq = dev_send(hs, mc, sink2, 1883, 6200, sq, b"\x30" + bytes([len(pub0)]) + pub0 + b"\x32" + bytes([len(pub1)]) + pub1)
+    hs.tick(2_200_000)
+    check(("obkSim/connected", b"online") in hs.mqtt_publishes and ("obkSim/1/get", b"1") in hs.mqtt_publishes,
+          "two PUBLISHes in one segment both decoded (topic, payload)")
+    check(any("MQTT PUBLISH obkSim/connected = online" in l for l in logs7), "publish logged as topic = payload")
+    check(segs(out7, 6200)[-1][3] == b"\x40\x02\x00\x05", "QoS 1 PUBLISH -> PUBACK with its packet id")
+    sq = dev_send(hs, mc, sink2, 1883, 6200, sq, b"\xc0\x00")
+    hs.tick(2_300_000)
+    check(segs(out7, 6200)[-1][3] == b"\xd0\x00", "PINGREQ -> PINGRESP")
+    hs.input(eth_frame(hs.mac, dev_mac, ETH_IP, tcp_segment(hs.device_ip, sink2, 6200, 1883, sq, mc.snd_nxt, TCP_ACK, 8192)))
+    hs.tick(30_000_000)
+    check(not mc.fin_sent and mc.state == "ESTABLISHED", "an idle MQTT session is kept open (keep-alive, not end of flow)")
+
+    print("== offline MQTT broker: QoS 2, UNSUBSCRIBE, split packets, DISCONNECT ==")
+    m2, sq = open_capture(hs, out7, sink2, 1883, 6400, isn=13000)
+    sq = dev_send(hs, m2, sink2, 1883, 6400, sq, b"\x10" + bytes([len(connect)]) + connect)
+    hs.tick(31_000_000)
+    pub2 = b"\x00\x08obkSim/q" + b"\x00\x07" + b"two"
+    sq = dev_send(hs, m2, sink2, 1883, 6400, sq, b"\x34" + bytes([len(pub2)]) + pub2)
+    hs.tick(31_100_000)
+    check(segs(out7, 6400)[-1][3] == b"\x50\x02\x00\x07", "QoS 2 PUBLISH -> PUBREC with its packet id")
+    sq = dev_send(hs, m2, sink2, 1883, 6400, sq, b"\x62\x02\x00\x07")
+    hs.tick(31_200_000)
+    check(segs(out7, 6400)[-1][3] == b"\x70\x02\x00\x07", "PUBREL -> PUBCOMP, the QoS 2 exchange completes")
+    uns = b"\x00\x09" + b"\x00\x0cobkSim/+/set"
+    sq = dev_send(hs, m2, sink2, 1883, 6400, sq, b"\xa2" + bytes([len(uns)]) + uns)
+    hs.tick(31_300_000)
+    check(segs(out7, 6400)[-1][3] == b"\xb0\x02\x00\x09", "UNSUBSCRIBE -> UNSUBACK with its packet id")
+    big = b"\x00\x0cobkSim/state" + b"x" * 300
+    pkt = b"\x30" + bytes([(len(big) & 0x7F) | 0x80, len(big) >> 7]) + big
+    sq = dev_send(hs, m2, sink2, 1883, 6400, sq, pkt[:2])           # ends inside the length field
+    sq = dev_send(hs, m2, sink2, 1883, 6400, sq, pkt[2:100])
+    hs.tick(31_400_000)
+    check(not any(t == "obkSim/state" for t, _ in hs.mqtt_publishes),
+          "a PUBLISH split across segments (even inside its length field) waits for the rest")
+    sq = dev_send(hs, m2, sink2, 1883, 6400, sq, pkt[100:])
+    hs.tick(31_500_000)
+    check(("obkSim/state", b"x" * 300) in hs.mqtt_publishes,
+          "...and is decoded whole once it arrives (two-byte remaining length)")
+    sq = dev_send(hs, m2, sink2, 1883, 6400, sq, b"\xe0\x00")
+    hs.tick(31_600_000)
+    check(segs(out7, 6400)[-1][2] & TCP_FIN, "DISCONNECT -> the broker closes the connection")
+
+    print("== offline UDP: broadcasts logged, other datagrams dropped ==")
+    n_out = len(out7)
+    hs.input(eth_frame(BCAST_MAC, dev_mac, ETH_IP, udp_packet(hs.device_ip, b"\xff\xff\xff\xff", 6666, 6667,
+                                                             b"\x00\x00\x55\xaa{\"gwId\":\"sim\"}")))
+    check(len(out7) == n_out and any("UDP broadcast 192.168.1.100:6666 -> 255.255.255.255:6667" in l
+                                     and "gwId" in l for l in logs7),
+          "a LAN broadcast (Tuya's discovery port 6667) is logged with its text, nothing answered")
+    hs.input(eth_frame(hs.mac, dev_mac, ETH_IP, udp_packet(hs.device_ip, sink2, 7000, 9999, b"data")))
+    check(len(out7) == n_out and any("UDP 192.168.1.100:7000 -> 10.200.0.7:9999 4 bytes (offline, dropped)" in l
+                                     for l in logs7),
+          "a datagram to any other port is logged and dropped while offline")
+
+    print("== offline DNS: stable sinkhole names, AAAA without records ==")
+    def dns_ask(stack, name, qtype=1, txid=0x4242, sport=5353):
+        labels = b"".join(bytes([len(p)]) + p.encode() for p in name.split(".")) + b"\x00"
+        q = struct.pack("!HHHHHH", txid, 0x0100, 1, 0, 0, 0) + labels + struct.pack("!HH", qtype, 1)
+        stack.input(eth_frame(stack.mac, dev_mac, ETH_IP, udp_packet(stack.device_ip, stack.ip, sport, 53, q)))
+
+    def udp_out(frames, sport=None, dport=None):
+        """UDP datagrams we sent: [(src ip, sport, dport, payload)]."""
+        res = []
+        for f in frames:
+            if f[12:14] == b"\x08\x00" and f[14 + 9] == IP_UDP:
+                u = f[14 + (f[14] & 0x0F) * 4:]
+                sp, dp = struct.unpack("!HH", u[:4])
+                if (sport is None or sp == sport) and (dport is None or dp == dport):
+                    res.append((f[14 + 12:14 + 16], sp, dp, u[8:]))
+        return res
+
+    dns_ask(hs, "api.bekensim.test", txid=0x4141)
+    r1 = udp_out(out7, sport=53)[-1][3]
+    dns_ask(hs, "api.bekensim.test", txid=0x4343)
+    r2 = udp_out(out7, sport=53)[-1][3]
+    dns_ask(hs, "mqtt.bekensim.test", txid=0x4444)
+    r3 = udp_out(out7, sport=53)[-1][3]
+    check(r1[-4:] == r2[-4:] and r1[:2] == b"\x41\x41" and r2[:2] == b"\x43\x43",
+          "a name keeps its sinkhole address across lookups; each reply carries its query's id")
+    check(r3[-4:] != r1[-4:] and r3[-4:-2] == b"\x0a\xc8", "another name gets its own 10.200/16 address")
+    dns_ask(hs, "api.bekensim.test", qtype=28, txid=0x4545)
+    r4 = udp_out(out7, sport=53)[-1][3]
+    check(r4[:2] == b"\x45\x45" and struct.unpack("!HH", r4[2:4] + r4[6:8]) == (0x8180, 0),
+          "AAAA answered with no records (no IPv6 here), not NXDOMAIN, so the A lookup still counts")
+
+    print("== TCP: the device closes (FIN) or resets (RST) a captured connection ==")
+    fc, sq = open_capture(hs, out7, sink2, 8883, 6300, isn=11000)
+    sq = dev_send(hs, fc, sink2, 8883, 6300, sq, b"\x16\x03\x01\x00\x05hello")
+    hs.input(eth_frame(hs.mac, dev_mac, ETH_IP, tcp_segment(hs.device_ip, sink2, 6300, 8883, sq, fc.snd_nxt,
+                                                         TCP_FIN | TCP_ACK, 8192)))
+    hs.tick(32_000_000)
+    last = segs(out7, 6300)[-1]
+    check(last[1] == sq + 1 and last[2] & TCP_FIN, "device FIN acknowledged and answered with our own FIN")
+    hs.input(eth_frame(hs.mac, dev_mac, ETH_IP, tcp_segment(hs.device_ip, sink2, 6300, 8883, sq + 1, fc.snd_nxt,
+                                                         TCP_ACK, 8192)))
+    hs.tick(32_100_000)
+    check((sink2, 8883, hs.device_ip, 6300) not in hs.conns,
+          "...and the connection is gone once the device acknowledges that FIN")
+    rc_, sq = open_capture(hs, out7, sink2, 8883, 6301, isn=12000)
+    hs.input(eth_frame(hs.mac, dev_mac, ETH_IP, tcp_segment(hs.device_ip, sink2, 6301, 8883, sq, rc_.snd_nxt,
+                                                         TCP_RST | TCP_ACK, 0)))
+    n_before = len(segs(out7, 6301))
+    hs.tick(32_200_000)
+    check(rc_.state == "CLOSED" and (sink2, 8883, hs.device_ip, 6301) not in hs.conns
+          and len(segs(out7, 6301)) == n_before and any("reset by device" in l for l in logs7),
+          "device RST drops the connection at once and nothing more is sent on it")
+    hs.input(eth_frame(hs.mac, dev_mac, ETH_IP, tcp_segment(hs.device_ip, sink2, 6301, 8883, sq, 777,
+                                                         TCP_ACK | TCP_PSH, 8192, b"late")))
+    late = segs(out7, 6301)[-1]
+    check(late[2] == (TCP_RST | TCP_ACK) and late[0] == 777 and late[1] == sq + 4,
+          "a segment for a connection we no longer know is answered with RST, so the firmware does not hang")
+
+    print("== TCP: window, segmentation, retransmission, duplicates ==")
+    logs8, out8 = [], []
+    ts = NetStack(bytes.fromhex("020000000001"), log=logs8.append, gateway=False)
+    ts.output = out8.append
+    ts.ip, ts.device_ip, ts.device_mac = str2ip("192.168.4.100"), str2ip("192.168.4.1"), dev_mac
+    tc = TcpConn(ts, ts.ip, 41000, ts.device_ip, 80, "forward")
+    ts.conns[(ts.ip, 41000, ts.device_ip, 80)] = tc
+    tc.state, tc.rcv_nxt, tc.peer_window = "ESTABLISHED", 100, 3000
+    tc.unacked_seq = tc.snd_nxt
+    blob = bytes(i & 0xFF for i in range(10000))
+    tc.queue(blob)
+    tc.pump(0)
+    first = [s for s in segs(out8) if s[3]]
+    check(sum(len(s[3]) for s in first) <= 3000 and all(len(s[3]) <= MSS for s in first),
+          "10000 bytes queued: no more than the device's 3000-byte window in flight, segments <= MSS")
+    resend_from = len(segs(out8))
+    tc.pump(RETRANSMIT_US + 1)
+    again = [s for s in segs(out8)[resend_from:] if s[3]]
+    check(again and again[0][0] == first[0][0] and again[0][3] == first[0][3],
+          "no ACK within the retransmit time: the unacknowledged data is sent again from the same seq")
+    got, t = b"", RETRANSMIT_US + 2
+    while len(got) < len(blob) and t < 50_000_000:
+        sent = [s for s in segs(out8) if s[3]]
+        # the device acknowledges everything it has seen so far, in order
+        stream = {}
+        for sq_, _, _, p, _, _ in sent:
+            stream[sq_] = p
+        seq0 = first[0][0]
+        got = b""
+        while seq0 + len(got) in stream:
+            got += stream[seq0 + len(got)]
+        tc.on_segment(100, (seq0 + len(got)) & 0xFFFFFFFF, TCP_ACK, 3000, b"", t)
+        tc.pump(t)
+        t += 1000
+    check(got == blob, "all 10000 bytes arrive in order once the device keeps acknowledging")
+    n_cap = len(tc.to_host)
+    tc.on_segment(100, tc.snd_nxt, TCP_ACK | TCP_PSH, 3000, b"abc", t)
+    tc.on_segment(100, tc.snd_nxt, TCP_ACK | TCP_PSH, 3000, b"abc", t)
+    check(len(tc.to_host) == n_cap + 1 and tc.rcv_nxt == 103,
+          "a retransmitted (duplicate) segment from the device is delivered once")
+    tc.on_segment(200, tc.snd_nxt, TCP_ACK | TCP_PSH, 3000, b"later", t)
+    check(len(tc.to_host) == n_cap + 1 and tc.rcv_nxt == 103,
+          "an out-of-order segment is not delivered ahead of the gap")
+    check(segs(out8)[-1][1] == 103, "...and is answered with an ACK for what was actually received")
+
+    print("== SYN retransmission ==")
+    logs9, out9 = [], []
+    ss = NetStack(bytes.fromhex("020000000001"), log=logs9.append, gateway=False, http_gets=["/x"])
+    ss.output = out9.append
+    ss.ip, ss.device_ip, ss.device_mac = str2ip("192.168.4.100"), str2ip("192.168.4.1"), dev_mac
+    ss.link, ss.probe_sent, ss.dhcp_state = True, True, "BOUND"
+    ss.tick(1_000_000)
+    syns = [s for s in segs(out9) if s[2] == TCP_SYN]
+    check(len(syns) == 1, "first SYN sent")
+    ss.tick(1_000_000 + RETRANSMIT_US + 1)
+    syns2 = [s for s in segs(out9) if s[2] == TCP_SYN]
+    check(len(syns2) == 2 and syns2[1][0] == syns2[0][0], "no SYN-ACK: the SYN is resent with the same sequence number")
+    t = 1_000_000 + RETRANSMIT_US + 1
+    for _ in range(SYN_MAX_TRIES + 2):
+        t += RETRANSMIT_US + 1
+        ss.tick(t)
+    check(any("no SYN-ACK after" in l for l in logs9) and not any(c.kind == "client" and c.state == "SYN_SENT"
+                                                                for c in ss.conns.values()),
+          "after %d resends the attempt is abandoned instead of hanging" % SYN_MAX_TRIES)
+
+    print("== --net-forward: a real listener on 127.0.0.1 into the device ==")
+    tmp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    tmp.bind(("127.0.0.1", 0))
+    fport = tmp.getsockname()[1]
+    tmp.close()
+    logs5, out5 = [], []
+    fw = NetStack(bytes.fromhex("020000000001"), log=logs5.append, gateway=False, forwards=[(fport, 80)])
+    fw.output = out5.append
+    fw.ip, fw.device_ip, fw.device_mac = str2ip("192.168.4.100"), str2ip("192.168.4.1"), dev_mac
+    fw.link, fw.probe_sent, fw.dhcp_state = True, True, "BOUND"
+    check(any("forwarding 127.0.0.1:%d -> device:80" % fport in l for l in logs5),
+          "listening on 127.0.0.1:%d" % fport)
+    logs6 = []
+    NetStack(bytes.fromhex("020000000002"), log=logs6.append, gateway=False, forwards=[(fport, 80)])
+    check(any("cannot listen on 127.0.0.1:%d" % fport in l for l in logs6),
+          "a second instance on the same port is refused, not silently sharing it")
+    browser = socket.create_connection(("127.0.0.1", fport), timeout=5)
+
+    def tcp_out(frames):
+        # [(sport, dport, flags, payload)] of the TCP segments sent towards the device
+        res = []
+        for f in frames:
+            if f[12:14] == b"\x08\x00" and f[14 + 9] == IP_TCP:
+                t = f[14 + 20:]
+                res.append((struct.unpack("!H", t[0:2])[0], struct.unpack("!H", t[2:4])[0],
+                            t[13], t[(t[12] >> 4) * 4:]))
+        return res
+
+    deadline = time.time() + 5
+    while time.time() < deadline and not any(fl == TCP_SYN and dp == 80 for _, dp, fl, _ in tcp_out(out5)):
+        fw.tick(20_000_000); time.sleep(0.02)
+    check(any(fl == TCP_SYN and dp == 80 for _, dp, fl, _ in tcp_out(out5)),
+          "browser connect accepted -> SYN to the device's port 80")
+    fc = [c for c in fw.conns.values() if c.kind == "forward"][0]
+    fw.input(eth_frame(fw.mac, dev_mac, ETH_IP, tcp_segment(fw.device_ip, fw.ip, 80, fc.lport, 9000, fc.snd_nxt,
+                                                         TCP_SYN | TCP_ACK, 4096)))
+    request = b"GET /index HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+    browser.sendall(request)
+    deadline = time.time() + 5
+    while time.time() < deadline and not any(p == request for _, _, _, p in tcp_out(out5)):
+        fw.tick(21_000_000); time.sleep(0.02)
+    check(any(p == request for _, _, _, p in tcp_out(out5)), "the browser's request reaches the device")
+    page = b"HTTP/1.1 200 OK\r\nContent-type: text/html\r\n\r\n<html>OBK panel</html>"
+    # The device's last segment carries the FIN too: the page must still arrive whole.
+    fw.input(eth_frame(fw.mac, dev_mac, ETH_IP, tcp_segment(fw.device_ip, fw.ip, 80, fc.lport, 9001, fc.snd_nxt,
+                                                         TCP_ACK | TCP_PSH | TCP_FIN, 4096, page)))
+    browser.settimeout(5)
+    got = b""
+    try:
+        while True:
+            fw.tick(22_000_000)
+            chunk = browser.recv(65536)
+            if not chunk:
+                break
+            got += chunk
+    except socket.timeout:
+        pass
+    check(got == page, "the whole page reaches the browser even though data and FIN came in one segment")
+    check(got == page and not browser.recv(1), "then the browser sees the connection closed")
+    browser.close()
+
+    print("== --net-out: device TCP relayed through a host socket (to 127.0.0.1 only) ==")
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0)); srv.listen(1)
+    port = srv.getsockname()[1]
+    logs4, out4 = [], []
+    gw = NetStack(bytes.fromhex("020000000001"), log=logs4.append, gateway=True, net_out=True)
+    gw.output = out4.append
+    gw.device_ip, gw.device_mac = str2ip("192.168.1.100"), dev_mac
+    gw.arp[gw.device_ip] = dev_mac
+    lo = str2ip("127.0.0.1")
+    gw.input(eth_frame(gw.mac, dev_mac, ETH_IP, tcp_segment(gw.device_ip, lo, 5555, port, 100, 0, TCP_SYN, 8192)))
+    srv.settimeout(5)
+    peer_sock, _ = srv.accept()
+    deadline = time.time() + 5
+    while time.time() < deadline and not (out4 and out4[-1][14 + 20 + 13] & TCP_SYN):
+        gw.tick(1); time.sleep(0.02)
+    sa = out4[-1][14 + 20:]
+    check(sa[13] == (TCP_SYN | TCP_ACK), "device SYN -> real host connect -> SYN-ACK back to the device")
+    rc = gw.conns[(lo, port, gw.device_ip, 5555)]
+    gw.input(eth_frame(gw.mac, dev_mac, ETH_IP, tcp_segment(gw.device_ip, lo, 5555, port, 101, rc.snd_nxt,
+                                                         TCP_ACK | TCP_PSH, 8192, b"hello host")))
+    peer_sock.settimeout(5)
+    check(peer_sock.recv(100) == b"hello host", "device bytes arrive at the real host socket")
+    peer_sock.sendall(b"hello device")
+    deadline = time.time() + 5
+    got = b""
+    while time.time() < deadline and not got:
+        gw.tick(2_000_000)
+        for f in out4:
+            if f[12:14] == b"\x08\x00" and f[14 + 9] == IP_TCP and f[14 + 40:] == b"hello device":
+                got = f[14 + 40:]
+        time.sleep(0.02)
+    check(got == b"hello device", "host reply relayed back to the device")
+    peer_sock.close(); srv.close()
+
+    print("== --net-out: DNS through the host resolver, UDP relayed both ways ==")
+    t_us = 3_000_000
+    n4 = len(out4)
+    dns_ask(gw, "localhost", txid=0x5151)
+    check(not udp_out(out4[n4:], sport=53), "an online lookup is not answered from the sinkhole")
+    deadline = time.time() + 10
+    while time.time() < deadline and not udp_out(out4[n4:], sport=53):
+        t_us += 10_000; gw.tick(t_us); time.sleep(0.02)
+    rr = udp_out(out4[n4:], sport=53)
+    check(rr and rr[0][3][:2] == b"\x51\x51" and rr[0][3][-4:] == lo,
+          "the name is resolved by the host (localhost -> 127.0.0.1) and the answer reaches the device")
+    check(any("[NET] DNS localhost -> 127.0.0.1" in l for l in logs4), "the lookup is logged")
+    n4 = len(out4)
+    dns_ask(gw, "localhost", txid=0x5252)
+    rr = udp_out(out4[n4:], sport=53)
+    check(rr and rr[0][3][:2] == b"\x52\x52" and rr[0][3][-4:] == lo, "a repeat lookup is answered at once from the cache")
+    us = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    us.bind(("127.0.0.1", 0)); us.settimeout(5)
+    uport = us.getsockname()[1]
+    gw.input(eth_frame(gw.mac, dev_mac, ETH_IP, udp_packet(gw.device_ip, lo, 5600, uport, b"ping udp")))
+    data, addr = us.recvfrom(100)
+    check(data == b"ping udp", "a device datagram leaves through a host UDP socket")
+    gw.input(eth_frame(gw.mac, dev_mac, ETH_IP, udp_packet(gw.device_ip, lo, 5600, uport, b"again")))
+    data2, addr2 = us.recvfrom(100)
+    check(data2 == b"again" and addr2 == addr and sum("relayed" in l and ":5600 ->" in l for l in logs4) == 1,
+          "the flow keeps its host socket: same source port, logged once")
+    n4 = len(out4)
+    us.sendto(b"pong udp", addr)
+    deadline = time.time() + 5
+    while time.time() < deadline and not udp_out(out4[n4:], dport=5600):
+        t_us += 10_000; gw.tick(t_us); time.sleep(0.02)
+    rr = udp_out(out4[n4:], dport=5600)
+    check(rr and rr[0][0] == lo and rr[0][1] == uport and rr[0][3] == b"pong udp",
+          "the host's reply comes back to the device from the address it wrote to")
+    us.close()
+
+    print("\nAll %d netstack self-tests passed." % n)
+    return n
+
+
+if __name__ == "__main__":
+    _run_selftests()

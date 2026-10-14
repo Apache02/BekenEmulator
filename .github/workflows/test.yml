@@ -40,6 +40,15 @@ jobs:
     - name: BLE core register model self-tests (no firmware)
       run: python src/blecore.py
 
+    - name: Wi-Fi MAC hardware model self-tests (no firmware)
+      run: python src/wifimac.py
+
+    - name: Virtual IP network self-tests (no firmware)
+      run: python src/netstack.py
+
+    - name: Virtual 802.11 peer self-tests (no firmware)
+      run: python src/wifipeer.py
+
     - name: Run self tests (also writes report/index.html)
       id: tests
       run: |

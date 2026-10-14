@@ -46,6 +46,18 @@ CMDLINE_OFF = 0x5E0             # offsetof(mainConfig_t, initCommandLine)
 # which reads the flag straight from the persisted config, so it must be set
 # HERE rather than by a startup command (that runs too late for this boot).
 FLAGS_OFF = 0x08
+# Station credentials: wifi_ssid[64] follows the two counters at 0x10, and
+# wifi_pass[64] follows it (new_pins.h mainConfig_t). An empty password means
+# an open network; OBK then joins as a station instead of raising its own AP.
+SSID_OFF = 0x14
+PASS_OFF = 0x54
+CRED_MAX = 64
+# MQTT broker (mainConfig_t: mqtt_host[256] at 0x94, mqtt_port int at 0x294).
+MQTT_HOST_OFF = 0x94
+MQTT_HOST_MAX = 256
+MQTT_PORT_OFF = 0x294
+MQTT_CLIENT_OFF = 0x194           # mqtt_clientId[64]; OBK builds its topics from it
+MQTT_CLIENT_MAX = 64
 CMDLINE_MAX = 1568              # sizeof(initCommandLine)
 SECTOR_SIZE = 4096              # flash sector; images grow to a whole sector
 
@@ -69,14 +81,27 @@ def tiny_crc8_signed(data):
     return crc & 0xFF
 
 
-def build_config(startup_command, flags=()):
+def build_config(startup_command, flags=(), ssid=None, password=None, mqtt_host=None, mqtt_port=1883,
+                 mqtt_client=None):
     """Build a 3584-byte mainConfig_t with the given startup command and flags.
 
-    flags is an iterable of OBK flag bit numbers (0..63) to set.
+    flags is an iterable of OBK flag bit numbers (0..63) to set. ssid/password
+    fill the station credentials; with an SSID set OBK connects as a station
+    (password "" = open network) rather than starting its own access point.
     """
     cmd = startup_command.encode("ascii")
     if len(cmd) >= CMDLINE_MAX:
         raise ValueError("startup command too long (max %d bytes)" % (CMDLINE_MAX - 1))
+    ssid_b = (ssid or "").encode("utf-8")
+    pass_b = (password or "").encode("utf-8")
+    if len(ssid_b) >= CRED_MAX or len(pass_b) >= CRED_MAX:
+        raise ValueError("SSID/password too long (max %d bytes)" % (CRED_MAX - 1))
+    mqtt_b = (mqtt_host or "").encode("utf-8")
+    client_b = (mqtt_client or "").encode("utf-8")
+    if len(client_b) >= MQTT_CLIENT_MAX:
+        raise ValueError("MQTT client id too long (max %d bytes)" % (MQTT_CLIENT_MAX - 1))
+    if len(mqtt_b) >= MQTT_HOST_MAX:
+        raise ValueError("MQTT host too long (max %d bytes)" % (MQTT_HOST_MAX - 1))
 
     generic0 = generic1 = 0
     for f in flags:
@@ -91,6 +116,13 @@ def build_config(startup_command, flags=()):
     cfg[0:3] = b"CFG"
     cfg[4:8] = struct.pack("<i", CFG_VERSION)
     cfg[FLAGS_OFF:FLAGS_OFF + 8] = struct.pack("<II", generic0, generic1)
+    cfg[SSID_OFF:SSID_OFF + len(ssid_b)] = ssid_b
+    cfg[PASS_OFF:PASS_OFF + len(pass_b)] = pass_b
+    if mqtt_b:
+        cfg[MQTT_HOST_OFF:MQTT_HOST_OFF + len(mqtt_b)] = mqtt_b
+        cfg[MQTT_PORT_OFF:MQTT_PORT_OFF + 4] = struct.pack("<i", mqtt_port)
+    if client_b:
+        cfg[MQTT_CLIENT_OFF:MQTT_CLIENT_OFF + len(client_b)] = client_b
     cfg[CMDLINE_OFF:CMDLINE_OFF + len(cmd)] = cmd
     cfg[3] = tiny_crc8_signed(cfg[4:CONFIG_SIZE])
     return bytes(cfg)
@@ -156,7 +188,8 @@ def patch_striped(raw, stripped_addr, payload, offset):
     return bytes(out)
 
 
-def inject(raw, startup_command, addr=CONFIG_ADDR, flags=()):
+def inject(raw, startup_command, addr=CONFIG_ADDR, flags=(), ssid=None, password=None,
+           mqtt_host=None, mqtt_port=1883, mqtt_client=None):
     """Return a copy of raw carrying a valid config at PHYSICAL offset addr.
 
     No CRC re-striping: the firmware reads this partition through the flash
@@ -164,7 +197,7 @@ def inject(raw, startup_command, addr=CONFIG_ADDR, flags=()):
     that offset. The image is padded with erased flash if it is too short (an
     app-only image ends well before the config partition).
     """
-    cfg = build_config(startup_command, flags)
+    cfg = build_config(startup_command, flags, ssid, password, mqtt_host, mqtt_port, mqtt_client)
     out = bytearray(raw)
     end = addr + CONFIG_SIZE
     if len(out) < end:
@@ -179,9 +212,20 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("input", help="Base BK7231 flash image")
     parser.add_argument("output", help="Image to write with the config injected")
-    parser.add_argument("-c", "--command", required=True,
+    parser.add_argument("-c", "--command", default="",
                         help="Startup command placed in initCommandLine, e.g. "
                              "\"uartInit 9600; uartSendHex 55AA00000000FF\"")
+    parser.add_argument("--ssid", default=None,
+                        help="Wi-Fi SSID for OBK to join as a station (wifi_ssid). Without it "
+                             "OBK starts its own open access point.")
+    parser.add_argument("--mqtt-host", dest="mqtt_host", default=None,
+                        help="MQTT broker host OBK connects to once it is on the network.")
+    parser.add_argument("--mqtt-client", dest="mqtt_client", default=None,
+                        help="MQTT client id (mqtt_clientId). OBK publishes under <client id>/...")
+    parser.add_argument("--mqtt-port", dest="mqtt_port", type=int, default=1883,
+                        help="MQTT broker port (default 1883).")
+    parser.add_argument("--pass", dest="password", default=None,
+                        help="Wi-Fi password for --ssid; omit or \"\" for an open network.")
     parser.add_argument("--addr", default=None,
                         help="Physical config address. Default: 0x1E1000, or "
                              "0x1D1000 when the filename looks like a BK7231N/M image.")
@@ -200,7 +244,8 @@ def main():
         name = os.path.basename(args.input).upper()
         addr = CONFIG_ADDR_N if ("7231N" in name or "7231M" in name) else CONFIG_ADDR
 
-    patched, addr, cfg = inject(raw, args.command, addr, args.flags)
+    patched, addr, cfg = inject(raw, args.command, addr, args.flags, args.ssid, args.password,
+                                args.mqtt_host, args.mqtt_port, args.mqtt_client)
 
     with open(args.output, "wb") as f:
         f.write(patched)
@@ -211,6 +256,12 @@ def main():
     print("  startup cmd   : %s" % args.command)
     if args.flags:
         print("  flags set     : %s" % ", ".join(str(f) for f in args.flags))
+    if args.ssid is not None:
+        print("  station ssid  : %s (%s)" % (args.ssid, "open" if not args.password else "with password"))
+    if args.mqtt_host:
+        print("  mqtt broker   : %s:%d" % (args.mqtt_host, args.mqtt_port))
+    if args.mqtt_client:
+        print("  mqtt client id: %s" % args.mqtt_client)
 
 
 if __name__ == "__main__":

@@ -48,6 +48,27 @@ def parse_hex_blobs(specs):
     return out
 
 
+def parse_forwards(specs):
+    """Parse --net-forward 'LPORT:DPORT' items into [(lport, dport)]."""
+    out = []
+    for spec in specs:
+        parts = spec.split(":")
+        if len(parts) != 2 or not all(p.isdigit() for p in parts):
+            raise ValueError("bad --net-forward %r (want LPORT:DPORT, e.g. 8080:80)" % spec)
+        out.append((int(parts[0]), int(parts[1])))
+    return out
+
+
+def parse_mac(text):
+    parts = text.replace("-", ":").split(":")
+    if len(parts) != 6:
+        raise ValueError("bad --wifi-mac %r (want aa:bb:cc:dd:ee:ff)" % text)
+    try:
+        return bytes(int(p, 16) for p in parts)
+    except ValueError:
+        raise ValueError("bad --wifi-mac %r (want aa:bb:cc:dd:ee:ff)" % text)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="BK7231T/N Emulator")
     parser.add_argument("dump_file", help="Path to the raw BK7231 flash dump")
@@ -105,6 +126,59 @@ def parse_args():
                              "images), 5.2 for BK7238. Advertising payloads the controller stages "
                              "are printed as [BLE_ADV] lines. No radio is modelled: nothing goes "
                              "on air. Opt-in.")
+    parser.add_argument("--wifi", dest="wifi", action="store_true",
+                        help="Model the RivieraWaves Wi-Fi MAC hardware at 0xC0000000 (TX/RX "
+                             "descriptor DMA, the 1 MHz MAC clock, ABS timers, TBTT and the "
+                             "six MAC FIQ lines) so the firmware's own Wi-Fi stack can "
+                             "actually move frames. Pair with --wifi-peer to put a virtual "
+                             "access point / station and an IP network on the other side.")
+    parser.add_argument("--wifi-peer", dest="wifi_peer", default=None, choices=["auto", "sta", "ap"],
+                        metavar="ROLE",
+                        help="Attach a virtual 802.11 peer plus a user-mode IP network to the MAC "
+                             "model (implies --wifi). ROLE auto: take the opposite role of what "
+                             "the device does (it beacons -> we join it as a station; it probes "
+                             "or authenticates -> we are the access point it connects to). "
+                             "sta/ap force one. Open (no cipher) networks only.")
+    parser.add_argument("--wifi-ssid", dest="wifi_ssid", default=None, metavar="SSID",
+                        help="SSID the peer beacons as an access point, or the one it joins as a "
+                             "station. In the AP role without this, the first SSID the device "
+                             "probes for is adopted.")
+    parser.add_argument("--wifi-channel", dest="wifi_channel", type=int, default=1, metavar="N",
+                        help="Channel the peer's access point announces (default 1).")
+    parser.add_argument("--wifi-mac", dest="wifi_mac", default="02:00:00:00:00:01", metavar="MAC",
+                        help="MAC address of the peer (default 02:00:00:00:00:01).")
+    parser.add_argument("--net-forward", dest="net_forwards", action="append", default=[],
+                        metavar="LPORT:DPORT",
+                        help="Listen on 127.0.0.1:LPORT and connect each accepted TCP connection "
+                             "to the device's port DPORT over the virtual network, e.g. "
+                             "--net-forward 8080:80 then open http://127.0.0.1:8080/ for the "
+                             "firmware's own web panel. Repeatable.")
+    parser.add_argument("--net-out", dest="net_out", action="store_true",
+                        help="Let the device's outgoing DNS/TCP/UDP reach real hosts through "
+                             "the host's sockets. Default off: an offline network where DNS "
+                             "names resolve to private sinkhole addresses, TCP connections are "
+                             "accepted and what the firmware sends is logged ([NET] lines) and "
+                             "captured, NTP is answered with the host clock.")
+    parser.add_argument("--net-http-get", dest="net_http_gets", action="append", default=[],
+                        metavar="PATH",
+                        help="Once the device is reachable on the virtual network, send it "
+                             "\"GET PATH\" on port 80 and log the status line and body as a [NET] "
+                             "line. Repeatable; requests go one after another. E.g. "
+                             "--net-http-get \"/cm?cmnd=POWER%%20ON\" drives OpenBeken's command API.")
+    parser.add_argument("--pcap", dest="pcap", default=None, metavar="FILE",
+                        help="Write every 802.11 frame crossing the peer to FILE (link type "
+                             "IEEE 802.11, no FCS) for Wireshark.")
+    parser.add_argument("--snapshot-save", dest="snapshot_save", default=None, metavar="FILE",
+                        help="Save a snapshot of the whole device (memory, CPU, peripheral state) "
+                             "to FILE when --snapshot-at is reached, and keep running.")
+    parser.add_argument("--snapshot-at", dest="snapshot_at", default=None, metavar="WHEN",
+                        help="When to take the --snapshot-save snapshot: an instruction count, or a "
+                             "text marker that must appear in the UART output, e.g. "
+                             "\"sending broadcast_deauth\" for OpenBeken's AP being up.")
+    parser.add_argument("--snapshot-load", dest="snapshot_load", default=None, metavar="FILE",
+                        help="Resume from a snapshot instead of booting. The dump, -chip and --wifi "
+                             "must match the run that saved it; a peer / port forwards / pcap "
+                             "given now are attached to the restored device.")
     parser.add_argument("-key", "--key", dest="key", default=None, metavar="KEY",
                         help="Firmware decryption key: a known name (%s), 32 hex chars, or base64 of 16 bytes. "
                              "Omit for plaintext images (no decryption)." % ", ".join(sorted(KNOWN_KEYS)))
@@ -117,7 +191,7 @@ def build_emulator(dump_path, key=None, chip="BK7231", with_boot=False, only_uar
                    uart1_hex=False, uart1_rx=b"", uart1_rx_delay=None, tuyamcu=False,
                    tuyamcu_pid=None, tuyamcu_raw=False, tuyamcu_dps=None,
                    tuyamcu_injects=None, xvr_selfclear=False, uart_sink=None,
-                   save_decrypted=True, log=None, ble_core=False):
+                   save_decrypted=True, log=None, ble_core=False, wifi=False):
     """Load a dump and return a configured, not-yet-started BekenEmulator.
 
     Everything between "here is an image and some options" and "start running"
@@ -170,7 +244,7 @@ def build_emulator(dump_path, key=None, chip="BK7231", with_boot=False, only_uar
                          tuyamcu_pid=tuyamcu_pid, tuyamcu_raw=tuyamcu_raw,
                          xvr_selfclear=xvr_selfclear, tuyamcu_dps=tuyamcu_dps,
                          tuyamcu_injects=tuyamcu_injects, uart_sink=uart_sink,
-                         ble_core=ble_core)
+                         ble_core=ble_core, wifi=wifi)
 
 
 def main():
@@ -196,12 +270,31 @@ def main():
             tuyamcu_pid=args.tuyamcu_pid, tuyamcu_raw=args.tuyamcu_raw,
             tuyamcu_dps=parse_dp_specs(args.tuyamcu_dps),
             tuyamcu_injects=parse_hex_blobs(args.tuyamcu_injects),
-            xvr_selfclear=args.xvr_selfclear, ble_core=args.ble_core)
+            xvr_selfclear=args.xvr_selfclear, ble_core=args.ble_core,
+            wifi=(args.wifi or bool(args.wifi_peer) or bool(args.net_forwards) or bool(args.pcap)
+                  or bool(args.net_http_gets) or bool(args.wifi_ssid)))
+        if args.wifi_peer or args.net_forwards or args.pcap or args.wifi_ssid or args.net_http_gets:
+            emu.attach_wifi_peer(role=args.wifi_peer or "auto", ssid=args.wifi_ssid,
+                                 channel=args.wifi_channel, peer_mac=parse_mac(args.wifi_mac),
+                                 forwards=parse_forwards(args.net_forwards),
+                                 net_out=args.net_out, pcap=args.pcap,
+                                 http_gets=args.net_http_gets)
+        if args.snapshot_save:
+            if not args.snapshot_at:
+                raise ValueError("--snapshot-save needs --snapshot-at (an instruction count or a UART marker)")
+            at = int(args.snapshot_at) if args.snapshot_at.isdigit() else args.snapshot_at
+            emu.arm_snapshot(args.snapshot_save, at)
     except ValueError as e:
         print(e)
         sys.exit(1)
 
     emu.setup()
+    if args.snapshot_load:
+        try:
+            emu.load_snapshot(args.snapshot_load)
+        except (ValueError, OSError) as e:
+            print(e)
+            sys.exit(1)
     emu.run()
 
 if __name__ == "__main__":

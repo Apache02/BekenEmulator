@@ -95,6 +95,196 @@ TEST_CASES = [
         ]
     },
     {
+        # Guards parse_forwards(): a malformed port forward must be refused up
+        # front with the expected shape, not crash once the network starts.
+        "name": "CLI: malformed --net-forward is rejected",
+        "binary": os.path.join(ROOT_DIR, "firmwares", "OpenBK7231T_QIO_1.18.300.bin"),
+        "args": ["--only-uart", "-key", "TUYA", "--net-forward", "eighty"],
+        "timeout": 60,
+        "expected_strings": [
+            "bad --net-forward 'eighty'",
+            "want LPORT:DPORT",
+        ]
+    },
+    {
+        # The Wi-Fi path end to end, IP traffic into the firmware's own stack.
+        # --wifi-peer auto models the MAC (src/wifimac.py) and puts a virtual
+        # station (src/wifipeer.py) plus a user-mode IP network
+        # (src/netstack.py) on the far side of the air. OpenBeken with no
+        # config raises its open AP; the peer sees its beacons, joins it, gets
+        # a lease from the device's own DHCP server, pings it, and then sends
+        # an HTTP GET to the device's command API. The echo argument showing
+        # up in the device's UART log proves the request crossed 802.11 ->
+        # LwIP -> OBK's HTTP server -> its command parser, and the logged
+        # reply proves the answer made it back. Markers asserted in that
+        # order are the stages that each needed a MAC-model fix: frmlen
+        # without FCS (association), keyIndexValid in the RX descriptor (DHCP),
+        # TX completion + TX trigger (every reply).
+        #
+        # The second half is the browser's route: --net-forward puts a real
+        # listening socket on 127.0.0.1 (a free port, picked per run), and
+        # once the device has answered the command the harness itself
+        # connects to it and GETs /index with browser headers, exactly what
+        # visiting http://127.0.0.1/ does. The page markers are text only the
+        # real panel carries ("drivers active", "MQTT State:") - OpenBeken's
+        # "Not found" page has the same title and footer, so the title alone
+        # would prove nothing.
+        "name": "OpenBK7231T Wi-Fi AP: virtual station joins, DHCP, ping, HTTP command runs, panel on localhost",
+        "binary": os.path.join(ROOT_DIR, "firmwares", "OpenBK7231T_QIO_1.18.300.bin"),
+        "args": ["--only-uart", "-key", "TUYA", "--wifi-peer", "auto",
+                 "--net-http-get", "/cm?cmnd=echo%20HttpOverEmulatedWifiOK",
+                 "--net-forward", "{free_port}:80"],
+        "http_probe": {
+            "after": "[NET] HTTP GET /cm?cmnd=echo%20HttpOverEmulatedWifiOK -> HTTP/1.1 200 OK",
+            "path": "/index",
+            "expect": ["drivers active", "MQTT State:", "version 1.18.300"],
+        },
+        "timeout": 900,
+        "expected_strings": [
+            "[WIFI] device acts as an access point (it sends beacons)",
+            "[WIFI] found BSS 'OpenBK7231T_",
+            "[WIFI] associated with 'OpenBK7231T_",
+            "[NET] DHCP: we got 192.168.4.100/255.255.255.0 from the device (router 192.168.4.1)",
+            "[NET] ping reply from 192.168.4.1",
+            "Info:CMD:HttpOverEmulatedWifiOK",
+            "[NET] HTTP GET /cm?cmnd=echo%20HttpOverEmulatedWifiOK -> HTTP/1.1 200 OK",
+            "[NET] TCP forward: 192.168.4.100:",
+            "[HTTP_PROBE] GET /index -> HTTP/1.1 200 OK",
+            "[HTTP_PROBE] page contains: drivers active",
+            "[HTTP_PROBE] page contains: MQTT State:",
+            "[HTTP_PROBE] page contains: version 1.18.300",
+        ]
+    },
+    {
+        # Same path on a different silicon generation: BK7238 (-chip BK7238)
+        # carries the same RivieraWaves MAC, so the model is unchanged. This
+        # is the guard on "one method for all dumps" - a MAC-model change
+        # that only suits the BK7231T image fails here.
+        "name": "OpenBK7238 Wi-Fi AP: virtual station joins, DHCP, ping, HTTP command runs",
+        "binary": os.path.join(ROOT_DIR, "firmwares", "OpenBK7238_QIO_1.18.300.bin"),
+        "args": ["--only-uart", "-chip", "BK7238", "--wifi-peer", "auto",
+                 "--net-http-get", "/cm?cmnd=echo%20BK7238HttpOverWifiOK"],
+        "timeout": 1200,
+        "expected_strings": [
+            "[WIFI] found BSS 'OpenBK7238_",
+            "[WIFI] associated with 'OpenBK7238_",
+            "[NET] DHCP: we got 192.168.4.100/255.255.255.0 from the device (router 192.168.4.1)",
+            "[NET] ping reply from 192.168.4.1",
+            "Info:CMD:BK7238HttpOverWifiOK",
+            "[NET] HTTP GET /cm?cmnd=echo%20BK7238HttpOverWifiOK -> HTTP/1.1 200 OK",
+        ]
+    },
+    {
+        # The other direction: OpenBeken as a Wi-Fi STATION. The image carries
+        # an OBK config for an open network (tools/make_obk_config.py --ssid
+        # BekenSim --mqtt-host mqtt.bekensim.test, plus the startup command the
+        # next case exercises; the exact command is in the header of
+        # run_OpenBK7231T_QIO_1.18.300_wifi_STA_mqttCapture.bat), so the
+        # virtual peer plays the access point (--wifi-ssid BekenSim) and
+        # src/netstack.py is the
+        # network behind it: DHCP server, DNS, gateway. Offline by default -
+        # the broker name resolves to a 10.200.x.x sinkhole and the firmware's
+        # TCP connection is accepted and decoded, which is how a stock
+        # firmware's cloud traffic is caught without letting it out. The
+        # assoc/DHCP/connected markers need the RX rate fix: with an invalid
+        # L-SIG code in the RX vector the connected station hit
+        # ASSERT_ERR nxmac_ppdu_mcs_index_setf and wedged.
+        "name": "OpenBK7231T Wi-Fi station: joins virtual AP, DHCP, HTTP in, MQTT out captured",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "OpenBK7231T_QIO_1.18.300_obkConfig_staOpen_BekenSim_netTraffic.bin"),
+        "args": ["--only-uart", "-key", "TUYA", "--wifi-peer", "auto", "--wifi-ssid", "BekenSim",
+                 "--net-http-get", "/cm?cmnd=echo%20StationHttpGetOK"],
+        "timeout": 1200,
+        "expected_strings": [
+            "Info:MAIN:Using SSID [BekenSim]",
+            "[WIFI] station c8:47:8c:00:00:00 associated to 'BekenSim'",
+            "[NET] DHCP: device c8:47:8c:00:00:00 got 192.168.1.100",
+            "WIFI_STA_CONNECTED",
+            "Info:CMD:StationHttpGetOK",
+            "[NET] HTTP GET /cm?cmnd=echo%20StationHttpGetOK -> HTTP/1.1 200 OK",
+            "[NET] DNS mqtt.bekensim.test -> 10.200.",
+            "MQTT CONNECT",
+        ]
+    },
+    {
+        # The device's own outgoing traffic, three protocols in one boot. The
+        # image's OBK config (make_obk_config.py --ssid BekenSim --mqtt-host
+        # mqtt.bekensim.test --mqtt-client obkSim) carries the startup command
+        # "startDriver NTP; ntp_setServer 192.168.1.1; addRepeatingEvent 4 -1
+        # sendGet http://api.bekensim.test/hello?dev=obk". Offline, each gets a
+        # local answer: NTP from the host clock (OBK prints the time it
+        # parsed), the GET from the offline HTTP responder - OBK's client
+        # reports the whole 144-byte reply as received - and MQTT from the
+        # offline broker: CONNECT, SUBSCRIBEs and the "connected = online"
+        # PUBLISH, after which OBK reports the session up. The repeating GET
+        # must be answered twice: a fresh connection, port and sequence each
+        # time. "{pcap}" captures the air, and the capture is checked to hold
+        # the same exchange in both directions.
+        "name": "OpenBK7231T Wi-Fi station: outgoing NTP, HTTP GET and MQTT answered offline, pcap holds them",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "OpenBK7231T_QIO_1.18.300_obkConfig_staOpen_BekenSim_netTraffic.bin"),
+        "args": ["--only-uart", "-key", "TUYA", "--wifi-peer", "auto", "--wifi-ssid", "BekenSim",
+                 "--pcap", "{pcap}"],
+        "timeout": 1200,
+        "expected_strings": [
+            "[NET] DHCP: device c8:47:8c:00:00:00 got 192.168.1.100",
+            "[NET] NTP 192.168.1.100 -> 192.168.1.1 answered with the host clock",
+            "Info:NTP:Unix time:",
+            "[NET] DNS api.bekensim.test -> 10.200.",
+            "sends: HTTP GET /hello?dev=obk HTTP/1.1 host api.bekensim.test",
+            ("[NET] HTTP GET /hello?dev=obk HTTP/1.1 answered 200 (offline)", 2),
+            "httpclient - no response buff, skipped 144",
+            "[NET] DNS mqtt.bekensim.test -> 10.200.",
+            "sends: MQTT CONNECT (v3.1.1, client id 'obkSim'",
+            "connected to the offline broker",
+            "[NET] MQTT SUBSCRIBE obkSim/+/set",
+            "[NET] MQTT SUBSCRIBE cmnd/obkSim/+",
+            "[NET] MQTT PUBLISH obkSim/connected = online",
+            "Info:MQTT:mqtt_connection_cb: Successfully connected",
+        ],
+        "pcap_expect": ["beacon", "authentication", "association request", "association response",
+                        "data", "GET /hello?dev=obk", "BekenSimulator offline network",
+                        "obkSim/connected"],
+    },
+    {
+        # Snapshots (--snapshot-save / --snapshot-load), the core of it: the
+        # emulator is deterministic - device time is the instruction count -
+        # so a run resumed from a snapshot must print exactly what the
+        # original run printed after the same point. MathDemo boots fast and
+        # prints a quicktick line every few hundred thousand instructions, so
+        # the comparison covers dozens of lines of timer, scheduler and UART
+        # activity. See run_snapshot_roundtrip().
+        "name": "Snapshot: resumed MathDemo run reproduces the original run",
+        "kind": "snapshot_roundtrip",
+        "binary": os.path.join(ROOT_DIR, "firmwares", "OpenBK7231T_QIO_1.18.300_mathDemo.bin"),
+        "args": ["--only-uart", "-key", "TUYA"],
+        "snapshot_at": 1500000,
+        "min_compared_lines": 20,
+        "timeout": 300,
+        "expected_strings": [
+            ("Info:MAIN:quicktick", 60),
+        ]
+    },
+    {
+        # The same guarantee for what the web-panel launcher relies on: a
+        # snapshot of OpenBeken with its AP up and the Wi-Fi MAC modelled,
+        # resumed with a fresh virtual peer attached. The MAC model, TRNG and
+        # every descriptor pointer must survive the round trip, or the
+        # resumed device associates, leases and answers ping differently.
+        "name": "Snapshot: resumed OpenBK7231T Wi-Fi AP run reproduces the original run",
+        "kind": "snapshot_roundtrip",
+        "binary": os.path.join(ROOT_DIR, "firmwares", "OpenBK7231T_QIO_1.18.300.bin"),
+        "args": ["--only-uart", "-key", "TUYA", "--wifi-peer", "auto"],
+        "snapshot_at": 37000000,
+        "min_compared_lines": 8,
+        "timeout": 900,
+        "expected_strings": [
+            "[WIFI] associated with 'OpenBK7231T_",
+            "[NET] DHCP: we got 192.168.4.100",
+            "[NET] ping reply from 192.168.4.1",
+        ]
+    },
+    {
         "name": "OpenBK7231T_QIO_1.18.300 Boot to MQTT and 1s timers",
         "binary": os.path.join(ROOT_DIR, "firmwares", "OpenBK7231T_QIO_1.18.300.bin"),
         "args": ["--only-uart", "-key", "TUYA"],
@@ -2092,6 +2282,38 @@ DESCRIPTIONS = {
     "Tuya TMWF02 TuyaMCU Boots past crypto accel":
         "A stock Tuya fan-switch dump. Boots past the 0x810000 crypto-accelerator stall into the "
         "BLE host stack and network-config advertising.",
+    "CLI: malformed --net-forward is rejected":
+        "A port forward that is not LPORT:DPORT must be refused with a one-line message before "
+        "anything boots.",
+    "OpenBK7231T Wi-Fi AP: virtual station joins, DHCP, ping, HTTP command runs, panel on localhost":
+        "The emulated Wi-Fi path end to end: the RivieraWaves MAC is modelled, a virtual station "
+        "joins OpenBeken's open AP, takes a DHCP lease from it, pings it and sends an HTTP GET to "
+        "its command API - the command runs in the firmware and its reply comes back over the air. "
+        "Then the harness opens the device's web panel through a real port forward on 127.0.0.1, "
+        "the way a browser does, and checks the page is the real panel.",
+    "OpenBK7231T Wi-Fi station: joins virtual AP, DHCP, HTTP in, MQTT out captured":
+        "OpenBeken configured for an open network joins the virtual access point, gets its address "
+        "from the virtual network, answers an HTTP command coming in, and its outgoing MQTT "
+        "connection is resolved to a sinkhole and decoded instead of leaving the machine.",
+    "OpenBK7231T Wi-Fi station: outgoing NTP, HTTP GET and MQTT answered offline, pcap holds them":
+        "Everything the device starts itself, answered without a real network: its NTP query gets "
+        "the host clock, its repeating HTTP GET to a cloud-style name gets a 200 from the offline "
+        "responder each time, and its MQTT client completes CONNECT, SUBSCRIBE and PUBLISH against "
+        "the offline broker until the firmware reports the session up. The 802.11 capture file "
+        "written alongside is parsed back and must hold the same exchange in both directions.",
+    "OpenBK7238 Wi-Fi AP: virtual station joins, DHCP, ping, HTTP command runs":
+        "The same emulated Wi-Fi path on BK7238 silicon, with the MAC model unchanged: join, DHCP "
+        "from the device, ping and an HTTP command executed by the firmware.",
+    "Snapshot: resumed MathDemo run reproduces the original run":
+        "Saves a snapshot mid-boot and resumes from it in a second run. The emulator is "
+        "deterministic, so the resumed run must print the same firmware lines as the original "
+        "after the snapshot point, with the instruction counter within a small tolerance (it is "
+        "estimated per translated block, which a cold translation cache can split differently). "
+        "Anything the snapshot forgets shows up as a difference.",
+    "Snapshot: resumed OpenBK7231T Wi-Fi AP run reproduces the original run":
+        "The same round trip with the Wi-Fi MAC modelled and OpenBeken's AP up - the path the "
+        "web-panel launcher takes. The resumed device must associate, lease and answer ping "
+        "exactly as the original run did.",
     "Woox Tuya Original Firmware Boot":
         "Original Tuya (non-OpenBeken) light firmware. Verifies the fix that serves the un-striped "
         "protected-key region at 0x1ee000: instead of inventing a key from blank flash, the "
@@ -2328,6 +2550,21 @@ def tags_for(test_config):
         feat.append("crypto")
     if "SPI mirror" in name:
         feat.append("SPI mirror")
+    # The emulated air: a case that asserts what crossed it.
+    if "[WIFI] " in exp:
+        feat.append("Wi-Fi")
+    if "[NET] " in exp:
+        feat.append("IP network")
+    if "[HTTP_PROBE]" in exp:
+        feat.append("localhost forward")
+    if "[NET] MQTT" in exp:
+        feat.append("MQTT")
+    if "[NET] NTP" in exp:
+        feat.append("NTP")
+    if test_config.get("pcap_expect"):
+        feat.append("pcap")
+    if test_config.get("kind") == "snapshot_roundtrip":
+        feat.append("snapshot")
     if "XVR" in name:
         feat.append("XVR")
     for f in feat:
@@ -2460,10 +2697,307 @@ def _result(test_config, passed, elapsed=0.0, insns=None, timed_out=False, outpu
     }
 
 
-def run_test(test_config):
+def _free_port():
+    """A TCP port on 127.0.0.1 that nothing listens on right now."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+# 802.11 frame kinds a case can require in its capture ("pcap_expect"), as
+# (type, subtype); a subtype of None matches every frame of that type.
+PCAP_FRAME_KINDS = {
+    "beacon": (0, 8), "probe request": (0, 4), "probe response": (0, 5),
+    "authentication": (0, 11), "association request": (0, 0),
+    "association response": (0, 1), "data": (2, None),
+}
+
+
+def _pcap_frames(path):
+    """The 802.11 frames in a capture written by --pcap.
+
+    Raises ValueError unless it is a little-endian pcap 2.4 with link type
+    105. A record cut short at the end - the emulator is killed mid-run - is
+    ignored rather than failing the file.
+    """
+    import struct
+    with open(path, "rb") as f:
+        raw = f.read()
+    if len(raw) < 24:
+        raise ValueError("%d bytes, no pcap header" % len(raw))
+    magic, vmaj, vmin, _, _, _, link = struct.unpack("<IHHiIII", raw[:24])
+    if magic != 0xA1B2C3D4 or (vmaj, vmin) != (2, 4) or link != 105:
+        raise ValueError("header magic 0x%08X v%d.%d link type %d" % (magic, vmaj, vmin, link))
+    frames, off = [], 24
+    while off + 16 <= len(raw):
+        incl = struct.unpack("<I", raw[off + 8:off + 12])[0]
+        if off + 16 + incl > len(raw):
+            break
+        frames.append(raw[off + 16:off + 16 + incl])
+        off += 16 + incl
+    return frames
+
+
+def _check_pcap(path, expect, checks):
+    """Assert a case's capture file ("{pcap}" in its args).
+
+    The file must parse as an 802.11 capture, and each "pcap_expect" item
+    must be in it: a frame kind from PCAP_FRAME_KINDS, or any other text,
+    which some frame's bytes must contain (an HTTP request line, an MQTT
+    topic, the offline responder's reply). This is what proves the file a
+    user opens in Wireshark holds the traffic the [NET] lines describe.
+    """
+    try:
+        frames = _pcap_frames(path)
+        ok, detail = bool(frames), "%d frames" % len(frames)
+    except (OSError, ValueError) as e:
+        frames, ok, detail = [], False, str(e)
+    all_ok = _record_check(checks, "pcap: valid 802.11 capture", ok, detail)
+    for item in expect:
+        kind = PCAP_FRAME_KINDS.get(item)
+        if kind:
+            n = sum(1 for fr in frames if len(fr) >= 2 and (fr[0] >> 2) & 3 == kind[0]
+                    and (kind[1] is None or fr[0] >> 4 == kind[1]))
+            label = "pcap: %s frame" % item
+        else:
+            needle = item.encode("latin-1")
+            n = sum(1 for fr in frames if needle in fr)
+            label = "pcap: a frame carries '%s'" % item
+        all_ok = _record_check(checks, label, n > 0, "%d frames" % n if n else "none") and all_ok
+    return all_ok
+
+
+def _http_probes(port, probes, emit):
+    """Run a case's http_probe request(s) one after another (see _http_probe)."""
+    for pr in probes:
+        _http_probe(port, pr["path"], pr.get("expect", []), emit,
+                    method=pr.get("method", "GET"), body=pr.get("body"), tail=pr.get("expect_tail"))
+
+
+def _http_probe(port, path, expect, emit, timeout=180, method="GET", body=None, tail=None):
+    """Send METHOD http://127.0.0.1:port/path the way a browser would; report via emit(line).
+
+    The lines are what a case asserts on, so a probe that fails leaves its
+    markers missing and the case fails with the reason in its log:
+        [HTTP_PROBE] GET /index -> HTTP/1.1 200 OK (4909 bytes)
+        [HTTP_PROBE] page contains: Built on
+        [HTTP_PROBE] GET /x ends with: }}      (with `tail`: the reply is complete)
+    Browser-style headers on purpose: OpenBeken answered a bare HTTP/1.0
+    request with its "Not found" page, and what matters is what a browser gets.
+    """
+    import socket
+    payload = body.encode("utf-8") if body is not None else b""
+    req = ("%s %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nUser-Agent: Mozilla/5.0 (BekenSimulator self-test)\r\n"
+           "Accept: text/html,application/xhtml+xml,application/json\r\nConnection: close\r\n"
+           % (method, path, port))
+    if body is not None:
+        req += "Content-Type: text/plain\r\nContent-Length: %d\r\n" % len(payload)
+    req = req.encode("ascii") + b"\r\n" + payload
+    data = b""
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        s.settimeout(timeout)
+        s.sendall(req)
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        s.close()
+    except Exception as e:
+        emit("[HTTP_PROBE] %s %s failed: %s (%d bytes received)\n" % (method, path, e, len(data)))
+        if not data:
+            return
+    head, _, reply = data.partition(b"\r\n\r\n")
+    status = head.split(b"\n", 1)[0].strip().decode("latin-1", "replace") if head else "(no reply)"
+    emit("[HTTP_PROBE] %s %s -> %s (%d bytes)\n" % (method, path, status, len(data)))
+    text = reply.decode("utf-8", "replace")
+    for s_ in expect:
+        if s_ in text:
+            emit("[HTTP_PROBE] page contains: %s\n" % s_)
+    if tail is not None and text.rstrip().endswith(tail):
+        emit("[HTTP_PROBE] %s %s ends with: %s\n" % (method, path, tail))
+
+
+def _stream_until(cmd, after, until, timeout):
+    """Run cmd; return (lines, timed_out) once every `until` marker is seen after `after`.
+
+    `until` is [(string, count)]. Only lines following the first line that
+    contains `after` count toward it. Unlike run_test, the [EMU_*] capture
+    lines are KEPT: they carry exact instruction counts (EMU_INSNS, the
+    UART1 byte timestamps), so a resumed run whose timing state drifted shows
+    up as different numbers even when the firmware's own text is identical.
+    The process is killed once satisfied (the emulator never exits).
+    """
+    env = dict(os.environ)
+    env["EMU_REPORT"] = "1"
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            bufsize=1, encoding="utf-8", errors="ignore", env=env)
+    lines, lock = [], threading.Lock()
+    state = {"seen_after": False, "counts": {s: 0 for s, _ in until}}
+
+    def reader():
+        for line in proc.stdout:
+            with lock:
+                lines.append(line)
+                if state["seen_after"]:
+                    for s, _ in until:
+                        state["counts"][s] += line.count(s)
+                elif after in line:
+                    state["seen_after"] = True
+
+    th = threading.Thread(target=reader, daemon=True)
+    th.start()
+    start, timed_out = time.time(), False
+    while True:
+        with lock:
+            done = state["seen_after"] and all(state["counts"][s] >= n for s, n in until)
+        if done or proc.poll() is not None:
+            break
+        if time.time() - start > timeout:
+            timed_out = True
+            break
+        time.sleep(0.25)
+    if proc.poll() is None:
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    th.join(timeout=2.0)
+    with lock:
+        return list(lines), timed_out
+
+
+def run_snapshot_roundtrip(test_config):
+    """Snapshot save + resume must reproduce the original run exactly.
+
+    Run A boots and saves a snapshot at `snapshot_at` instructions, then keeps
+    going; run B starts from that snapshot. Device time is derived from the
+    instruction count, so the emulator is deterministic: after the snapshot
+    point both runs must print the same lines in the same order. Any state the
+    snapshot forgets - a peripheral shadow, a CPU bank, pending interrupts -
+    shows up as the two streams diverging, usually within a few lines.
+    """
+    import tempfile
     name = test_config["name"]
     binary = test_config["binary"]
-    args = test_config["args"]
+    timeout = test_config.get("timeout", 300)
+    until = _parse_expected(test_config["expected_strings"])
+    print("=====================================")
+    print(f"Running Test: {name}")
+    print(f"Binary: {binary}")
+    if not os.path.exists(binary):
+        print(f"FAIL: Binary not found: {binary}")
+        return _result(test_config, passed=False, output="Binary not found: %s" % binary)
+
+    snap = os.path.join(tempfile.gettempdir(), "bekensim_selftest_%d.snap" % os.getpid())
+    base = [sys.executable, MAIN_SCRIPT, binary] + test_config["args"]
+    start = time.time()
+    a_lines, a_to = _stream_until(base + ["--snapshot-save", snap, "--snapshot-at",
+                                          str(test_config["snapshot_at"])],
+                                  "[SNAPSHOT] saved", until, timeout)
+    b_lines, b_to = ([], False)
+    if os.path.exists(snap):
+        b_lines, b_to = _stream_until(base + ["--snapshot-load", snap],
+                                      "[SNAPSHOT] restored", until, timeout)
+    elapsed = time.time() - start
+    try:
+        os.remove(snap)
+    except OSError:
+        pass
+
+    def after(lines, marker):
+        for i, l in enumerate(lines):
+            if marker in l:
+                return lines[i + 1:]
+        return []
+
+    a_all, b_all = after(a_lines, "[SNAPSHOT] saved"), after(b_lines, "[SNAPSHOT] restored")
+    # Two comparisons. The firmware's own output must match exactly. The
+    # emulator's instruction counter must match closely but not exactly: it is
+    # an estimate made per translated block (bytes / 4), and where Unicorn cuts
+    # blocks depends on its translation-cache history, which no snapshot can
+    # carry - a resumed run starts with a cold cache and was measured one
+    # instruction behind after ~500k. A lost timer or tick phase moves the
+    # counts by thousands, so a tight tolerance still catches real state loss.
+    a_after = [l for l in a_all if not l.startswith("[EMU_")]
+    b_after = [l for l in b_all if not l.startswith("[EMU_")]
+
+    def insn_marks(lines):
+        out = []
+        for l in lines:
+            parts = l.split()
+            if l.startswith("[EMU_INSNS]") and len(parts) > 1 and parts[1].isdigit():
+                out.append(int(parts[1]))
+        return out
+
+    a_ins, b_ins = insn_marks(a_all), insn_marks(b_all)
+    n_ins = max(0, min(len(a_ins), len(b_ins)) - 1)
+    drift = max((abs(a_ins[i] - b_ins[i]) for i in range(n_ins)), default=None)
+    tolerance = test_config.get("insn_tolerance", 1000)
+    # The last line of each run may be cut off by the kill: compare whole lines only.
+    k = max(0, min(len(a_after), len(b_after)) - 1)
+    first_diff = next((i for i in range(k) if a_after[i] != b_after[i]), None)
+    min_lines = test_config.get("min_compared_lines", 10)
+
+    checks = []
+    ok = True
+    saved = any("[SNAPSHOT] saved" in l for l in a_lines)
+    restored = any("[SNAPSHOT] restored" in l for l in b_lines)
+    ok &= _record_check(checks, "run A saved a snapshot", saved,
+                        "saved" if saved else "no [SNAPSHOT] saved line")
+    ok &= _record_check(checks, "run B restored it", restored,
+                        "restored" if restored else "no [SNAPSHOT] restored line")
+    joined_b = "".join(b_after)
+    for s, n in until:
+        c = joined_b.count(s)
+        ok &= _record_check(checks, "resumed run reaches '%s'%s" % (s, " x%d" % n if n > 1 else ""),
+                            c >= n, "%dx" % c)
+    ok &= _record_check(checks, "at least %d lines compared after the snapshot point" % min_lines,
+                        k >= min_lines, "%d lines" % k)
+    ok &= _record_check(checks, "resumed firmware output identical to the original run",
+                        first_diff is None,
+                        "%d lines match" % k if first_diff is None else
+                        "line %d differs: %r vs %r" % (first_diff + 1, a_after[first_diff].rstrip(),
+                                                      b_after[first_diff].rstrip()))
+    ok &= _record_check(checks, "instruction counter within %d of the original run" % tolerance,
+                        drift is not None and drift <= tolerance,
+                        ("%d marks compared, max drift %d" % (n_ins, drift)) if drift is not None
+                        else "no [EMU_INSNS] marks to compare")
+    output = ("=== run A (saves at %s instructions) ===\n" % test_config["snapshot_at"] + "".join(a_lines)
+              + "\n=== run B (resumes from the snapshot) ===\n" + "".join(b_lines))
+    result = _result(test_config, passed=bool(ok), elapsed=elapsed, timed_out=a_to or b_to,
+                     output=output, checks=checks)
+    _add_derived_tags(result)
+    if not ok:
+        print("--- CAPTURED OUTPUT ---")
+        print(output)
+        print("-----------------------")
+        print(f"Test '{name}' FAILED.")
+        return result
+    print(f"Test '{name}' PASSED. ({elapsed:.0f}s)")
+    return result
+
+
+def run_test(test_config):
+    if test_config.get("kind") == "snapshot_roundtrip":
+        return run_snapshot_roundtrip(test_config)
+    name = test_config["name"]
+    binary = test_config["binary"]
+    # "{free_port}" in the args (and in an http_probe) becomes a port picked
+    # now, so a case that forwards a host port never collides with whatever
+    # else the machine is running.
+    port = _free_port() if any("{free_port}" in a for a in test_config["args"]) else None
+    args = [a.replace("{free_port}", str(port)) for a in test_config["args"]]
+    # http_probe: one request dict or a list of them, run in order once the
+    # first one's "after" marker shows up.
+    probes = test_config.get("http_probe")
+    if isinstance(probes, dict):
+        probes = [probes]
     timeout = test_config.get("timeout", 30)
     expected = test_config["expected_strings"]
 
@@ -2474,6 +3008,15 @@ def run_test(test_config):
     if not os.path.exists(binary):
         print(f"FAIL: Binary not found: {binary}")
         return _result(test_config, passed=False, output="Binary not found: %s" % binary)
+
+    # "{pcap}" in the args becomes a fresh temporary capture file, checked
+    # against the case's "pcap_expect" after the run and then deleted.
+    pcap_path = None
+    if any("{pcap}" in a for a in args):
+        import tempfile
+        fd, pcap_path = tempfile.mkstemp(prefix="bekensim_", suffix=".pcap")
+        os.close(fd)
+        args = [a.replace("{pcap}", pcap_path) for a in args]
 
     cmd = [sys.executable, MAIN_SCRIPT, binary] + args
     # EMU_REPORT makes the emulator periodically print its approximate
@@ -2520,14 +3063,25 @@ def run_test(test_config):
             if line.startswith("[EMU_UART1]"):
                 uart1_lines.append(line.strip())
                 continue
-            with lock:
-                lines.append(line)
-                for s_ in list(remaining):
-                    c = line.count(s_)
-                    if c:
-                        counts[s_] += c
-                        if counts[s_] >= required[s_]:
-                            remaining.discard(s_)
+            ingest(line)
+            if probes and not probe_started[0] and probes[0]["after"] in line:
+                probe_started[0] = True
+                threading.Thread(target=_http_probes, daemon=True,
+                                 args=(port, probes, ingest)).start()
+
+    def ingest(line):
+        # One place that records a line and counts it against the markers -
+        # shared by the emulator's output and the HTTP probe's report lines.
+        with lock:
+            lines.append(line)
+            for s_ in list(remaining):
+                c = line.count(s_)
+                if c:
+                    counts[s_] += c
+                    if counts[s_] >= required[s_]:
+                        remaining.discard(s_)
+
+    probe_started = [False]
 
     th = threading.Thread(target=reader, daemon=True)
     th.start()
@@ -2601,6 +3155,14 @@ def run_test(test_config):
         if not _record_check(checks, "absent: '%s'" % string, actual == 0,
                              "never printed" if actual == 0 else "printed %dx" % actual):
             all_passed = False
+
+    if pcap_path:
+        if not _check_pcap(pcap_path, test_config.get("pcap_expect") or [], checks):
+            all_passed = False
+        try:
+            os.remove(pcap_path)
+        except OSError:
+            pass
 
     periph_data = _periph(periph_lines, chip_of(test_config))
 
