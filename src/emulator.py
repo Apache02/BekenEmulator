@@ -215,8 +215,11 @@ class BekenEmulator:
         # stay reproducible. Tied to --wifi so non-network runs are unchanged.
         self.trng_state = None
         if wifi:
+            # net_log, not _print: these are [WIFI] lines like the peer's, and
+            # every real run passes --only-uart, which silences _print. Sent
+            # there they were invisible exactly when they mattered.
             self.wifimac = _wifimac.MacHw(SLOW_TICK_INSNS // (SLOW_TICK_MS * 1000),
-                                          log=self._print)
+                                          log=self.net_log)
             self.wifimac.mem = (lambda addr, size: self.mu.mem_read(addr, size),
                                 lambda addr, data: self.mu.mem_write(addr, bytes(data)))
             self.trng_state = 0x2545F491
@@ -455,7 +458,7 @@ class BekenEmulator:
         self.state.uart_at_line_start = True
 
     def attach_wifi_peer(self, role="auto", ssid=None, channel=1, peer_mac=None,
-                         forwards=(), net_out=False, pcap=None, http_gets=()):
+                         forwards=(), net_out=False, pcap=None, http_gets=(), mqtt_pubs=()):
         """Put a virtual station/access point and an IP network behind the MAC model.
 
         role "auto" lets the peer take the opposite role of whatever the
@@ -465,7 +468,9 @@ class BekenEmulator:
         device's own connections reach real hosts instead of a logging
         sinkhole; pcap is a file path for an 802.11 capture of the exchange;
         http_gets are paths requested from the device's port 80 once it is
-        reachable, each reply logged as a [NET] line.
+        reachable, each reply logged as a [NET] line; mqtt_pubs are (topic,
+        payload) messages the offline broker pushes to the device once it
+        subscribes to a matching filter.
         """
         if self.wifimac is None:
             raise ValueError("a Wi-Fi peer needs the MAC model: pass wifi=True / --wifi")
@@ -477,7 +482,8 @@ class BekenEmulator:
         mac = peer_mac or b"\x02\x00\x00\x00\x00\x01"
         net = _netstack.NetStack(mac, log=self.net_log, gateway=(role == "ap"),
                                  ip=_netstack.str2ip("192.168.1.1") if role == "ap" else None,
-                                 net_out=net_out, forwards=forwards, http_gets=http_gets)
+                                 net_out=net_out, forwards=forwards, http_gets=http_gets,
+                                 mqtt_pubs=mqtt_pubs)
         peer = _wifipeer.WifiPeer(
             mac, net, inject=lambda f: self.wifimac.inject(f, self.state.insn_count),
             log=self.net_log, role=role, ssid=ssid, channel=channel, pcap=pcap,

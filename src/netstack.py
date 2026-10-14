@@ -27,6 +27,7 @@ Time: the stack's own timers run on DEVICE time (the emulator's instruction
 count), like the firmware; host sockets are serviced from a helper thread
 that only moves bytes in and out of queues.
 """
+import hashlib
 import os
 import select
 import socket
@@ -189,6 +190,111 @@ def mqtt_connect_info(data):
     return "MQTT CONNECT (v%s, client id '%s', keepalive %ds%s)" % (
         {3: "3.1", 4: "3.1.1", 5: "5"}.get(level, level), cid, keepalive,
         (", with " + "/".join(extra)) if extra else "")
+
+
+# Tuya's LAN protocol. A Tuya device announces itself on these UDP ports every
+# few seconds once it has an address, so this broadcast is the first thing a
+# stock dump says about itself: its cloud gateway id and product key. Protocol
+# 3.1 sends the JSON in clear on 6666; 3.3 encrypts it with one well-known key
+# (the md5 below) that is the same in every Tuya device, so the announcement is
+# readable without knowing anything about this particular unit.
+TUYA_LAN_PORTS = (6666, 6667)
+TUYA_PREFIX = b"\x00\x00\x55\xaa"
+TUYA_SUFFIX = b"\x00\x00\xaa\x55"
+# Protocol 3.4/3.5 reframed the same announcement and encrypts it with AES-GCM
+# under the device's OWN key rather than the shared one, so its contents cannot
+# be read here. It is still worth naming rather than printing as random bytes.
+TUYA_PREFIX_35 = b"\x00\x00\x66\x99"
+TUYA_SUFFIX_35 = b"\x00\x00\x99\x66"
+TUYA_BROADCAST_KEY = hashlib.md5(b"yGAdlopoPVldABfn").digest()
+
+
+def tuya_lan_decode(data):
+    """One line describing a Tuya LAN discovery datagram, or None if it is not one.
+
+    For protocol 3.1 and 3.3 that line is the announcement's own JSON, which
+    names the device's cloud gateway id and product key. For 3.4/3.5 only the
+    framing can be read, so the line says so instead of inventing contents.
+
+    Framing: prefix, sequence, command, length, then the body and a trailing
+    CRC32 and suffix. The length counts the body plus those trailing 8 bytes.
+    A 4-byte return code precedes the body on some firmware, and the encrypted
+    form is AES-ECB with PKCS#7 padding.
+    """
+    if data.startswith(TUYA_PREFIX_35) and data.endswith(TUYA_SUFFIX_35) and len(data) >= 50:
+        # prefix(4) unknown(2) sequence(4) command(4) length(4), then the body
+        cmd, length = struct.unpack("!II", data[10:18])
+        if 18 + length + 4 != len(data):
+            return None
+        return ("Tuya LAN protocol 3.4/3.5 announcement, command 0x%02x, %d bytes, encrypted "
+                "with this device's own key (not the shared one), so its contents stay sealed"
+                % (cmd, length))
+    if len(data) < 24 or not data.startswith(TUYA_PREFIX) or not data.endswith(TUYA_SUFFIX):
+        return None
+    length = struct.unpack("!I", data[12:16])[0]
+    if length < 8 or 16 + length != len(data):
+        return None
+    body = data[16:16 + length - 8]
+    if body[:4] == b"\x00\x00\x00\x00" and len(body) > 4:
+        body = body[4:]                     # return code, present on some builds
+    if body[:1] == b"{":
+        try:
+            return body.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if len(body) < 16 or len(body) % 16:
+        return None
+    try:
+        from Crypto.Cipher import AES
+    except ImportError:
+        return None
+    try:
+        out = AES.new(TUYA_BROADCAST_KEY, AES.MODE_ECB).decrypt(body)
+    except Exception:
+        return None
+    # Tuya pads with PKCS#7, so valid padding is the evidence that this really
+    # is a Tuya datagram and the well-known key was the right one. Without it,
+    # a wrong key or a damaged packet would yield plausible-looking rubbish.
+    pad = out[-1] if out else 0
+    if not (1 <= pad <= 16) or out[-pad:] != bytes([pad]) * pad:
+        return None
+    out = out[:-pad]
+    if not out.startswith(b"{"):
+        return None
+    try:
+        return out.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def mqtt_varint(n):
+    """MQTT's 1-4 byte remaining-length encoding."""
+    out = bytearray()
+    while True:
+        b = n % 128
+        n //= 128
+        out.append(b | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
+def mqtt_publish_packet(topic, payload):
+    """A QoS 0 PUBLISH, which needs no acknowledgement from the device."""
+    body = struct.pack("!H", len(topic)) + topic + payload
+    return b"\x30" + mqtt_varint(len(body)) + body
+
+
+def mqtt_topic_matches(filt, topic):
+    """MQTT topic-filter matching, with the + (one level) and # (rest) wildcards."""
+    f, t = filt.split("/"), topic.split("/")
+    for i, part in enumerate(f):
+        if part == "#":
+            return True                     # '#' must be last and covers the rest
+        if i >= len(t):
+            return False
+        if part != "+" and part != t[i]:
+            return False
+    return len(f) == len(t)
 
 
 def describe_payload(data):
@@ -396,6 +502,7 @@ class TcpConn:
         self.rx_buf = b""               # capture: bytes not yet parsed by a responder
         self.proto = None               # capture: 'http' | 'mqtt' | 'raw' once recognised
         self.answered = False           # capture/http: reply sent
+        self.subscribed = []            # capture/mqtt: topic filters the device asked for
         self.fin_sent = False
         self.fin_rcvd = False
         self.close_after_flush = False
@@ -631,6 +738,8 @@ class TcpConn:
                     q += 3 + tlen
                 self.queue(bytes([0x90, 2 + len(granted)]) + pid + granted)
                 self.stack.log("[NET] MQTT SUBSCRIBE %s" % ", ".join(topics))
+                self.subscribed.extend(topics)
+                self._mqtt_deliver()
             elif ptype == 10:                   # UNSUBSCRIBE
                 self.queue(b"\xb0\x02" + body[:2])
             elif ptype == 12:                   # PINGREQ
@@ -638,6 +747,22 @@ class TcpConn:
             elif ptype == 14:                   # DISCONNECT
                 self.close_after_flush = True
                 return
+
+    def _mqtt_deliver(self):
+        """Send the device any --mqtt-publish message it has now subscribed to.
+
+        A real broker only forwards what a client asked for, so each message
+        waits for a matching SUBSCRIBE. That is also what makes this a test of
+        the device: the firmware chose those topic filters itself.
+        """
+        for item in list(self.stack.mqtt_pubs):
+            topic, payload = item
+            if not any(mqtt_topic_matches(f, topic) for f in self.subscribed):
+                continue
+            self.stack.mqtt_pubs.remove(item)
+            self.queue(mqtt_publish_packet(topic.encode("utf-8"), payload))
+            self.stack.log("[NET] MQTT -> device PUBLISH %s = %s"
+                           % (topic, payload.decode("utf-8", "replace")))
 
     def close_host(self):
         if self.sock is not None:
@@ -688,7 +813,7 @@ class TcpConn:
 # ------------------------------------------------------------------ the stack
 class NetStack:
     def __init__(self, mac, log=None, gateway=True, ip=None, netmask=b"\xff\xff\xff\x00",
-                 net_out=False, forwards=(), device_ip=None, http_gets=()):
+                 net_out=False, forwards=(), device_ip=None, http_gets=(), mqtt_pubs=()):
         self.mac = mac
         self.log = log or (lambda *a: None)
         self.gateway = gateway          # True: we are the router/DHCP server; False: DHCP client
@@ -736,6 +861,9 @@ class NetStack:
         self.http_gets = list(http_gets)  # paths to GET from the device's port 80
         self.http_replies = []
         self.mqtt_publishes = []        # (topic, payload) seen by the offline broker
+        # (topic, payload) the offline broker should push TO the device, each
+        # sent once the device subscribes to a filter that matches it.
+        self.mqtt_pubs = list(mqtt_pubs)
         self._http_next_us = 0
 
     # --------------------------------------------------------------- output
@@ -870,6 +998,11 @@ class NetStack:
             self._ntp(src, sport, dst, data)
             return
         if dst[0] >= 224 or dst == b"\xff\xff\xff\xff" or dst[3] == 255:
+            if dport in TUYA_LAN_PORTS:
+                info = tuya_lan_decode(data)
+                if info:
+                    self.log("[NET] Tuya LAN broadcast from %s:%d: %s" % (ip2str(src), sport, info))
+                    return
             text = "".join(chr(c) if 32 <= c < 127 else "." for c in data[:60])
             self.log("[NET] UDP broadcast %s:%d -> %s:%d %d bytes: %s"
                      % (ip2str(src), sport, ip2str(dst), dport, len(data), text))
@@ -1523,6 +1656,46 @@ def _run_selftests():
     hs.tick(31_600_000)
     check(segs(out7, 6400)[-1][2] & TCP_FIN, "DISCONNECT -> the broker closes the connection")
 
+    print("== offline MQTT broker: pushing a message TO the device ==")
+    check(mqtt_varint(5) == b"\x05" and mqtt_varint(300) == b"\xac\x02",
+          "remaining length encodes as one byte, and as two past 127")
+    pkt = mqtt_publish_packet(b"cmnd/obkSim/POWER", b"ON")
+    check(pkt == b"\x30\x15\x00\x11cmnd/obkSim/POWERON", "a QoS 0 PUBLISH is built topic-length, topic, payload")
+    check(mqtt_topic_matches("cmnd/obkSim/+", "cmnd/obkSim/POWER")
+          and mqtt_topic_matches("obkSim/#", "obkSim/1/set")
+          and mqtt_topic_matches("a/b", "a/b"),
+          "topic filters match: + for one level, # for the rest, and plain equality")
+    check(not mqtt_topic_matches("cmnd/obkSim/+", "cmnd/obkSim/1/POWER")
+          and not mqtt_topic_matches("cmnd/obkSim/+", "cmnd/other/POWER")
+          and not mqtt_topic_matches("a/b/c", "a/b"),
+          "+ does not span a level, a different level does not match, and a longer filter does not match")
+    logsP, outP = [], []
+    ps = NetStack(bytes.fromhex("020000000001"), log=logsP.append, gateway=True,
+                  mqtt_pubs=[("cmnd/obkSim/POWER", b"ON"), ("nobody/listens", b"x")])
+    ps.output = outP.append
+    ps.device_ip, ps.device_mac = str2ip("192.168.1.100"), dev_mac
+    ps.arp[ps.device_ip] = dev_mac
+    sinkP = str2ip("10.200.0.3")
+    pc, sq = open_capture(ps, outP, sinkP, 1883, 6500, isn=21000)
+    sq = dev_send(ps, pc, sinkP, 1883, 6500, sq, b"\x10" + bytes([len(connect)]) + connect)
+    ps.tick(1_000_000)
+    check(not any(b"cmnd/obkSim/POWER" in p for _, _, _, p, _, _ in segs(outP, 6500)),
+          "nothing is pushed to a device that has only connected")
+    sub2 = b"\x00\x01" + b"\x00\x0dcmnd/obkSim/+" + b"\x00"
+    sq = dev_send(ps, pc, sinkP, 1883, 6500, sq, b"\x82" + bytes([len(sub2)]) + sub2)
+    ps.tick(1_100_000)
+    pushed = b"".join(p for _, _, _, p, sp, _ in segs(outP, 6500) if sp == 1883)
+    check(mqtt_publish_packet(b"cmnd/obkSim/POWER", b"ON") in pushed,
+          "...and it is pushed once the device subscribes to a filter that matches it")
+    check(any("[NET] MQTT -> device PUBLISH cmnd/obkSim/POWER = ON" in l for l in logsP), "the push is logged")
+    check(ps.mqtt_pubs == [("nobody/listens", b"x")],
+          "a message nobody subscribed to is still waiting, not sent to the wrong topic")
+    n_before = len(segs(outP, 6500))
+    sq = dev_send(ps, pc, sinkP, 1883, 6500, sq, b"\x82" + bytes([len(sub2)]) + sub2)
+    ps.tick(1_200_000)
+    check(not any(b"cmnd/obkSim/POWER" in p for _, _, _, p, _, _ in segs(outP, 6500)[n_before:]),
+          "subscribing again does not send the same message twice")
+
     print("== offline UDP: broadcasts logged, other datagrams dropped ==")
     n_out = len(out7)
     hs.input(eth_frame(BCAST_MAC, dev_mac, ETH_IP, udp_packet(hs.device_ip, b"\xff\xff\xff\xff", 6666, 6667,
@@ -1534,6 +1707,71 @@ def _run_selftests():
     check(len(out7) == n_out and any("UDP 192.168.1.100:7000 -> 10.200.0.7:9999 4 bytes (offline, dropped)" in l
                                      for l in logs7),
           "a datagram to any other port is logged and dropped while offline")
+
+    print("== Tuya LAN discovery broadcast decoded ==")
+    def tuya_packet(payload, cmd=0x13, retcode=True):
+        body = (b"\x00\x00\x00\x00" if retcode else b"") + payload
+        return (TUYA_PREFIX + struct.pack("!III", 0, cmd, len(body) + 8)
+                + body + b"\x24\x2d\x2c\x95" + TUYA_SUFFIX)
+
+    # The real announcement a BK7231N 3-phase meter dump broadcast in this
+    # emulator once it joined the virtual AP, re-encrypted here from its
+    # decoded JSON so the test carries no captured bytes of unknown origin.
+    real = ('{"ip":"192.168.1.100","gwId":"bf0e0f689d000d56656gmp","active":2,"ablilty":0,'
+            '"encrypt":true,"productKey":"gqmmtjclqb7reg5p","version":"3.3"}')
+    # Pin the key itself. Without this the checks below would pass under ANY
+    # key, since they encrypt with the same constant they decrypt with.
+    check(TUYA_BROADCAST_KEY.hex() == "6c1ec8e2bb9bb59ab50b0daf649b410a",
+          "the shared broadcast key is the md5 every Tuya device uses")
+    try:
+        from Crypto.Cipher import AES
+        raw = real.encode()
+        pad = 16 - len(raw) % 16
+        enc = AES.new(TUYA_BROADCAST_KEY, AES.MODE_ECB).encrypt(raw + bytes([pad]) * pad)
+        check(tuya_lan_decode(tuya_packet(enc)) == real,
+              "an encrypted 3.3 announcement decodes to its JSON (gateway id, product key)")
+        check(tuya_lan_decode(tuya_packet(enc)[:-1]) is None, "a truncated one is not decoded")
+        check(tuya_lan_decode(tuya_packet(enc[:-16])) is None, "nor is one whose ciphertext was cut short")
+        bad = AES.new(hashlib.md5(b"wrongkey").digest(), AES.MODE_ECB).encrypt(raw + bytes([pad]) * pad)
+        check(tuya_lan_decode(tuya_packet(bad)) is None, "nor one encrypted with a different key")
+    except ImportError:
+        print("  [SKIP] no pycryptodome, encrypted form not checked")
+    plain = '{"ip":"192.168.1.50","gwId":"abc","version":"3.1"}'
+    check(tuya_lan_decode(tuya_packet(plain.encode(), retcode=False)) == plain,
+          "a 3.1 announcement is read straight out, it is not encrypted")
+    check(tuya_lan_decode(b"hello") is None and tuya_lan_decode(TUYA_PREFIX + b"\x00" * 30) is None,
+          "ordinary datagrams are not mistaken for Tuya ones")
+    good = tuya_packet(plain.encode(), retcode=False)
+    check(tuya_lan_decode(good[:-4] + b"\x00\x00\x00\x00") is None,
+          "a datagram of the right length but without the Tuya end marker is rejected")
+    check(tuya_lan_decode(good[:12] + struct.pack("!I", len(good)) + good[16:]) is None,
+          "so is one whose declared length disagrees with how many bytes arrived")
+    # A length SHORTER than what arrived is the dangerous direction: unchecked,
+    # the body is cut mid-JSON and still looks decodable, so half a message
+    # would be reported as the device's identity.
+    check(tuya_lan_decode(good[:12] + struct.pack("!I", 18) + good[16:]) is None,
+          "...including one that declares less than arrived, which would otherwise read as half a message")
+    # Protocol 3.4/3.5, as a BK7238 RGB controller dump broadcasts from its own
+    # pairing access point: same announcement, reframed, and sealed with a key
+    # only that device has. The shape is checked; the contents are not claimed.
+    sealed = (TUYA_PREFIX_35 + b"\x00\x00" + struct.pack("!III", 0, 0x11, 259)
+              + bytes(259) + TUYA_SUFFIX_35)
+    desc = tuya_lan_decode(sealed)
+    check(desc and "3.4/3.5" in desc and "command 0x11" in desc and "sealed" in desc,
+          "a 3.4/3.5 announcement is named by its framing, and its contents are not guessed at")
+    check(tuya_lan_decode(sealed[:-1]) is None
+          and tuya_lan_decode(sealed[:-5] + TUYA_SUFFIX_35) is None,
+          "...and a frame whose declared length does not match what arrived is rejected")
+    logsT, outT = [], []
+    ts2 = NetStack(bytes.fromhex("020000000001"), log=logsT.append, gateway=True)
+    ts2.output = outT.append
+    ts2.device_ip, ts2.device_mac = str2ip("192.168.1.100"), dev_mac
+    ts2.input(eth_frame(BCAST_MAC, dev_mac, ETH_IP,
+                        udp_packet(ts2.device_ip, b"\xff\xff\xff\xff", 63035, 6667,
+                                   tuya_packet(plain.encode(), retcode=False))))
+    check(any('[NET] Tuya LAN broadcast from 192.168.1.100:63035' in l and '"gwId":"abc"' in l
+              for l in logsT) and not outT,
+          "a device's announcement is reported with its identity, and nothing is sent back")
 
     print("== offline DNS: stable sinkhole names, AAAA without records ==")
     def dns_ask(stack, name, qtype=1, txid=0x4242, sport=5353):

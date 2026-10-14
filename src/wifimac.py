@@ -75,6 +75,16 @@ DOZE_CNTRL_1 = 0x044
 MAC_CNTRL_1 = 0x04C
 MAC_ERR_REC_CNTRL = 0x054
 RX_CNTRL = 0x060
+# RX_CNTRL accept bits (reg_mac_core.h). The firmware's monitor filter,
+# MM_RX_FILTER_MONITOR in mm.h, sets every bit but three; normal operation
+# never accepts both unicast meant for other stations and other BSSs' frames.
+ACCEPT_UNICAST = 0x00000040
+ACCEPT_OTHER_BSSID = 0x00000010
+RX_FILTER_MONITOR = 0xFFFFFFFF & ~(0x00000020 | 0x00000001 | 0x80000000)
+# MM_RX_FILTER_ACTIVE: what the same firmware uses the rest of the time.
+MM_RX_FILTER_ACTIVE = (0x00000004 | 0x00000008 | 0x00000080 | 0x00000400 | 0x00008000
+                       | 0x00010000 | 0x00020000 | 0x01000000 | 0x04000000 | 0x10000000
+                       | 0x20000000)
 BCN_CNTRL_1 = 0x064
 ENCR_KEY = (0x0AC, 0x0B0, 0x0B4, 0x0B8)
 ENCR_MAC_ADDR_LOW, ENCR_MAC_ADDR_HIGH = 0x0BC, 0x0C0
@@ -221,6 +231,7 @@ class MacHw:
         self.rx_last_rbd = 0                    # re-chains recycled ones behind them
         self.rx_queue = []                      # frames waiting for descriptors
         self.rx_dropped = 0
+        self.monitor = False                    # RX filter wide open (see RX_CNTRL in write())
         self.last_tbtt_idx = None
         self.on_tx = None                       # callback(frame_bytes, info_dict)
         self.stats = {"tx": 0, "rx": 0, "rx_nodesc": 0, "tx_bad": 0}
@@ -331,6 +342,18 @@ class MacHw:
                 if self.rx_queue:
                     self._rx_flush(insns)       # frames buffered while dozing
             self._update_lines()
+            return
+        if off == RX_CNTRL:
+            # Monitor (sniffer) reception: what a firmware switches to when
+            # it listens for pairing data sent to nobody in particular, such
+            # as Tuya's EZ mode. Logged on entry and exit only; getattr keeps
+            # snapshots saved before this field existed loadable.
+            monitor = (value & (ACCEPT_UNICAST | ACCEPT_OTHER_BSSID)) == (ACCEPT_UNICAST | ACCEPT_OTHER_BSSID)
+            if monitor != getattr(self, "monitor", False):
+                self.monitor = monitor
+                self.log("[WIFI] device RX filter 0x%08x: %s" % (
+                    value, "monitor mode, every frame on air accepted (sniffing, as in EZ pairing)"
+                    if monitor else "back to normal reception"))
             return
         if off == MAC_ERR_REC_CNTRL:
             self.regs[off] = value & ~0xFC      # FSM/FIFO reset bits complete at once
@@ -1010,6 +1033,29 @@ def _run_selftests():
     check(m.state == HW_ACTIVE and m.gen_raw & IMP_PRI_TBTT, "the MAC wakes itself to ACTIVE at the next TBTT")
     check(not m.rx_queue and struct.unpack(RHD_FMT, rd(RHD0, 68))[16] & RX_HD_DONE,
           "and the buffered frame is delivered on waking")
+
+    print("== RX filter: monitor (sniffer) mode reported ==")
+    said = []
+    m2 = MacHw(5, log=lambda s: said.append(s))
+    m2.mem = (rd, wr)
+    m2.write(CORE + RX_CNTRL, MM_RX_FILTER_ACTIVE, 0)
+    check(not m2.monitor and not said, "the firmware's normal RX filter is not monitor mode and says nothing")
+    m2.write(CORE + RX_CNTRL, RX_FILTER_MONITOR, 0)
+    check(m2.monitor and len(said) == 1 and "monitor mode" in said[0],
+          "the firmware's own monitor filter (MM_RX_FILTER_MONITOR) is reported once")
+    m2.write(CORE + RX_CNTRL, RX_FILTER_MONITOR, 0)
+    check(len(said) == 1, "staying in monitor mode is not reported again")
+    m2.write(CORE + RX_CNTRL, MM_RX_FILTER_ACTIVE, 0)
+    check(not m2.monitor and len(said) == 2 and "normal" in said[1], "and leaving it is reported once")
+    check(m2.read(CORE + RX_CNTRL, 0) is None and m2.regs[RX_CNTRL] == MM_RX_FILTER_ACTIVE,
+          "the register itself still reads back from memory, as before")
+    # Accepting other BSSs' frames alone is ordinary scanning, and accepting
+    # other stations' unicast alone is not sniffing either: only both at once
+    # means the firmware wants every frame on the channel.
+    m2.write(CORE + RX_CNTRL, MM_RX_FILTER_ACTIVE | ACCEPT_OTHER_BSSID, 0)
+    check(not m2.monitor and len(said) == 2, "accepting other BSSIDs alone (scanning) is not monitor mode")
+    m2.write(CORE + RX_CNTRL, MM_RX_FILTER_ACTIVE | ACCEPT_UNICAST, 0)
+    check(not m2.monitor and len(said) == 2, "accepting other stations' unicast alone is not monitor mode either")
 
     print("\nAll %d Wi-Fi MAC self-tests passed." % n)
     return n

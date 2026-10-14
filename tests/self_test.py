@@ -220,10 +220,16 @@ TEST_CASES = [
         # must be answered twice: a fresh connection, port and sequence each
         # time. "{pcap}" captures the air, and the capture is checked to hold
         # the same exchange in both directions.
+        # The other MQTT direction too: --mqtt-publish has the broker push a
+        # message to the device. It is held until the firmware subscribes to a
+        # filter matching it ("cmnd/obkSim/+", which OBK chose itself), and
+        # OBK then runs the command - so the "Info:CMD:" line below is the
+        # device being controlled over MQTT, not just receiving bytes.
         "name": "OpenBK7231T Wi-Fi station: outgoing NTP, HTTP GET and MQTT answered offline, pcap holds them",
         "binary": os.path.join(ROOT_DIR, "firmwares",
                                "OpenBK7231T_QIO_1.18.300_obkConfig_staOpen_BekenSim_netTraffic.bin"),
         "args": ["--only-uart", "-key", "TUYA", "--wifi-peer", "auto", "--wifi-ssid", "BekenSim",
+                 "--mqtt-publish", "cmnd/obkSim/echo=MqttPushReachedTheFirmware",
                  "--pcap", "{pcap}"],
         "timeout": 1200,
         "expected_strings": [
@@ -241,6 +247,8 @@ TEST_CASES = [
             "[NET] MQTT SUBSCRIBE cmnd/obkSim/+",
             "[NET] MQTT PUBLISH obkSim/connected = online",
             "Info:MQTT:mqtt_connection_cb: Successfully connected",
+            "[NET] MQTT -> device PUBLISH cmnd/obkSim/echo = MqttPushReachedTheFirmware",
+            "Info:CMD:MqttPushReachedTheFirmware",
         ],
         "pcap_expect": ["beacon", "authentication", "association request", "association response",
                         "data", "GET /hello?dev=obk", "BekenSimulator offline network",
@@ -1104,7 +1112,159 @@ TEST_CASES = [
             # Manufacturing-test SSID baked into the firmware (not a user network).
             "current product ssid name:tuya_mdev_test1",
             "scan_start_req_handler",
-        ]
+        ],
+        # The control half of the pair below: with no network on air at all,
+        # this firmware never enters production test. Only the run where the
+        # virtual AP answers its factory probe does.
+        "unexpected_strings": ["PROD FACTORY START"],
+    },
+    {
+        # The same Woox dump, with its own factory test network put on air.
+        # Stock Tuya firmware scans for "tuya_mdev_test1" at boot; the peer
+        # refuses it by default (answering it changes what the firmware does,
+        # which should be the test's choice, not a surprise). Offered with
+        # --wifi-ssid, the device finds it in the scan and switches into
+        # manufacturing test - light_prod.c "PROD FACTORY START!".
+        # It never actually joins: 26 probe requests, 26 responses, and no
+        # authentication. Seeing the network advertised is the whole trigger,
+        # which is why the pcap assertions below are probe traffic only.
+        # Paired with the case above, which is the same firmware for the same
+        # time with nothing on air and must NOT reach production test, this
+        # shows the firmware changing course because of what crossed the air.
+        "name": "Woox Tuya stock firmware: factory test network on air switches it to production test",
+        "binary": os.path.join(ROOT_DIR, "firmwares", "BK7231T_QIO_Woox_R5111_2023-14-10-23-46-06.bin"),
+        "args": ["--only-uart", "-key", "TUYA", "--wifi-peer", "auto",
+                 "--wifi-ssid", "tuya_mdev_test1", "--pcap", "{pcap}"],
+        "timeout": 900,
+        "expected_strings": [
+            "current product ssid name:tuya_mdev_test1",
+            "[WIFI] device acts as a station (an SSID was configured): peer takes the access point role",
+            "light_prod.c:1068] PROD FACTORY START!",
+            "First prod test!",
+        ],
+        "pcap_expect": ["beacon", "probe request", "probe response", "tuya_mdev_test1"],
+    },
+    {
+        # AP-mode pairing, the other way a Tuya device is set up: instead of
+        # joining a network it raises its own, which the phone app connects to
+        # in order to hand over the home Wi-Fi credentials. This dump does that
+        # unprompted, so the peer takes the station role, joins "SmartLife-AA4C"
+        # and is served DHCP BY THE DEVICE - the device is the router here
+        # (192.168.176.1), which is why the lease and the ping go the other way
+        # round compared with every other Wi-Fi case.
+        # It then announces itself in Tuya's LAN protocol. This firmware speaks
+        # the 3.4/3.5 framing, which is sealed with a key only that device has,
+        # so the announcement is identified but not read; the paired dump in the
+        # next case uses 3.3 and its contents ARE readable.
+        "name": "BK7238 Tuya RGB controller: raises its SmartLife pairing AP, serves DHCP, answers ping",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7238_Tuya_RGBController_TY-02-3CH_PWM_T1-3S_1.0.14.bin"),
+        "args": ["--only-uart", "-chip", "BK7238", "--ble-core", "--wifi-peer", "auto",
+                 "--pcap", "{pcap}"],
+        "timeout": 1200,
+        "expected_strings": [
+            "[WIFI] device acts as an access point (it sends beacons): peer takes the station role",
+            "[WIFI] found BSS 'SmartLife-AA4C' 00:33:7a:9d:aa:4d ch 6 (open)",
+            "[WIFI] associated with 'SmartLife-AA4C' (AID 1)",
+            "[NET] DHCP: we got 192.168.176.100/255.255.255.0 from the device (router 192.168.176.1)",
+            "[NET] ARP: device 192.168.176.1 is at 00:33:7a:9d:aa:4d",
+            "[NET] ping reply from 192.168.176.1 (seq 1)",
+            "Tuya LAN protocol 3.4/3.5 announcement, command 0x11",
+        ],
+        "pcap_expect": ["beacon", "authentication", "association request", "association response",
+                        "data", "SmartLife-AA4C"],
+    },
+    {
+        # A PAIRED stock Tuya dump: this one was captured after the owner set it
+        # up, so its flash still holds their network name. It probes for that
+        # name, the peer adopts it (that is what --wifi-peer auto does with the
+        # first SSID a device asks for), and the device joins and takes a lease.
+        # Then it does what it was built to do: announces itself on the LAN in
+        # Tuya protocol 3.3 - readable, because 3.3 uses one key shared by every
+        # Tuya device - and reaches for its cloud, first at a hardcoded address
+        # and then by name at m2.tuyaeu.com:8886, opening TLS to both.
+        # Nothing leaves this machine: offline is the default, so each
+        # connection is accepted locally and decoded. That is the whole point -
+        # a stock device's cloud traffic captured without letting it out, and
+        # without knowing anything about this firmware's internals.
+        # The announcement names the same product key that is passed on the
+        # command line here, which is independent confirmation that the
+        # decryption is right rather than plausible-looking rubbish.
+        "name": "BK7231N Tuya 3-phase meter (paired): joins its stored network and reaches for the Tuya cloud",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231N_Tuya_PC321_3PhaseMeter_TuyaMCU_2.0.2.bin"),
+        "args": ["--only-uart", "--xvr-selfclear", "--tuyamcu", "--tuyamcu-pid",
+                 "gqmmtjclqb7reg5p", "--tuyamcu-raw", "-key", "TUYA",
+                 "--wifi-peer", "auto", "--pcap", "{pcap}"],
+        "timeout": 1200,
+        "expected_strings": [
+            "[WIFI] device probes for 'HojnikB WiFi': adopting it as our SSID",
+            "[WIFI] station 4c:a9:19:14:71:50 associated to 'HojnikB WiFi' (AID 1)",
+            "[NET] DHCP: device 4c:a9:19:14:71:50 got 192.168.1.100",
+            # Its Tuya LAN announcement, decrypted: the device's cloud identity.
+            '[NET] Tuya LAN broadcast from 192.168.1.100',
+            '"gwId":"bf0e0f689d000d56656gmp"',
+            '"productKey":"gqmmtjclqb7reg5p"',
+            # The cloud attempts: one straight to an address, one resolved by name.
+            "-> 18.185.31.196:8886 (accepted for capture)",
+            "[NET] DNS m2.tuyaeu.com -> 10.200.",
+            "(m2.tuyaeu.com):8886 (accepted for capture)",
+            ("sends: TLS ClientHello", 2),
+        ],
+        "pcap_expect": ["beacon", "probe request", "authentication", "association request",
+                        "association response", "data", "HojnikB WiFi"],
+    },
+    {
+        # EZ mode (SmartConfig), the third way a Tuya device is paired, and the
+        # one that needs hardware support rather than ordinary frames: the
+        # device puts the receiver into monitor mode and reads the lengths of
+        # frames the phone sprays at a broadcast address, which carry the
+        # credentials. The firmware calls hal_machw_enter_monitor_mode and
+        # writes MM_RX_FILTER_MONITOR (mm.h) to the MAC's RX filter -
+        # 0x7fffffde, every accept bit but three - and the emulator reports
+        # that, so a dump sniffing the air can be told apart from one scanning.
+        # This dump then gives up on EZ mode, returns the filter to
+        # MM_RX_FILTER_ACTIVE (0x3503848c) and falls back to AP-mode pairing,
+        # so one run shows both pairing modes and the switch between them.
+        "name": "BK7231N Tuya thermostat: EZ-mode sniffing reported, then falls back to AP pairing",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231N_Tuya_BEOK_TOL47WIFI_Thermostat_TuyaMCU_TuyaOS_3.11.12.bin"),
+        "args": ["--only-uart", "--tuyamcu", "--tuyamcu-pid", "9cqoypoauuvhdjq4",
+                 "--tuyamcu-raw", "-key", "TUYA", "--wifi-peer", "auto"],
+        "timeout": 1800,
+        "expected_strings": [
+            "hal_machw_enter_monitor_mode",
+            "[WIFI] device RX filter 0x7fffffde: monitor mode, every frame on air accepted",
+            "[WIFI] device RX filter 0x3503848c: back to normal reception",
+            "ssid:SmartLife-FD43, key:, channel: 6",
+            "[WIFI] device changed role (it sends beacons)",
+            "[WIFI] found BSS 'SmartLife-FD43' 80:64:7c:ed:fd:42 ch 6 (open)",
+        ],
+    },
+    {
+        # A second paired dump, for one reason: it proves the LAN announcement
+        # is readable because the key is shared by every Tuya device, not
+        # because of anything particular to the meter above. Different device,
+        # different stored network, different gateway id - same key. Its
+        # announcement also carries the 3.4 fields, still in the 3.3 framing.
+        # The product key it announces is the one passed on the command line
+        # here, which is what rules out the decryption producing plausible
+        # rubbish that happens to parse.
+        "name": "BK7231N Tuya alarm (paired): a second device's cloud identity decodes with the same shared key",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231N_Tuya_A03CB3S_Alarm_TuyaMCU_2.1.17.bin"),
+        "args": ["--only-uart", "--xvr-selfclear", "--tuyamcu", "--tuyamcu-pid",
+                 "ztoh9ka787lzjkpy", "--tuyamcu-raw", "-key", "TUYA", "--wifi-peer", "auto"],
+        "timeout": 1200,
+        "expected_strings": [
+            "[WIFI] device probes for 'KN': adopting it as our SSID",
+            "[WIFI] station fc:3c:d7:3b:1a:d6 associated to 'KN' (AID 1)",
+            "[NET] DHCP: device fc:3c:d7:3b:1a:d6 got 192.168.1.100",
+            "[NET] Tuya LAN broadcast from 192.168.1.100",
+            '"gwId":"bf9935888c84222522cnd4"',
+            '"productKey":"ztoh9ka787lzjkpy"',
+            '"version":"3.4"',
+        ],
     },
     {
         # The BK7231N temp/humidity sensor exercises the same protected-key path
@@ -2299,8 +2459,11 @@ DESCRIPTIONS = {
         "Everything the device starts itself, answered without a real network: its NTP query gets "
         "the host clock, its repeating HTTP GET to a cloud-style name gets a 200 from the offline "
         "responder each time, and its MQTT client completes CONNECT, SUBSCRIBE and PUBLISH against "
-        "the offline broker until the firmware reports the session up. The 802.11 capture file "
-        "written alongside is parsed back and must hold the same exchange in both directions.",
+        "the offline broker until the firmware reports the session up. The broker then pushes a "
+        "command back to the device on a topic the firmware subscribed to itself, and the "
+        "firmware runs it - the device driven over MQTT, not merely listened to. The 802.11 "
+        "capture file written alongside is parsed back and must hold the same exchange in both "
+        "directions.",
     "OpenBK7238 Wi-Fi AP: virtual station joins, DHCP, ping, HTTP command runs":
         "The same emulated Wi-Fi path on BK7238 silicon, with the MAC model unchanged: join, DHCP "
         "from the device, ping and an HTTP command executed by the firmware.",
@@ -2317,7 +2480,39 @@ DESCRIPTIONS = {
     "Woox Tuya Original Firmware Boot":
         "Original Tuya (non-OpenBeken) light firmware. Verifies the fix that serves the un-striped "
         "protected-key region at 0x1ee000: instead of inventing a key from blank flash, the "
-        "firmware now retrieves the stored key.",
+        "firmware now retrieves the stored key. With nothing on air it must not reach production "
+        "test, which is the control for the case below.",
+    "Woox Tuya stock firmware: factory test network on air switches it to production test":
+        "Stock Tuya firmware, not OpenBeken, changing course because of what the emulator put on "
+        "air. Every Tuya device scans at boot for the factory test network baked into it; when the "
+        "virtual access point advertises that name, this one stops its normal start-up and enters "
+        "manufacturing test. It never joins the network - seeing it advertised is the whole "
+        "trigger. The same firmware with nothing on air does not do this, which is the case above.",
+    "BK7238 Tuya RGB controller: raises its SmartLife pairing AP, serves DHCP, answers ping":
+        "The pairing mode where the device makes its own network for a phone to join. This stock "
+        "dump raises it unprompted, so the emulator joins as a client, is given an address by the "
+        "device, and gets an answer to a ping. The device then announces itself in Tuya's LAN "
+        "protocol; this firmware's version of it is sealed with a key only that device holds, so "
+        "the announcement is identified by its framing and its contents are left alone.",
+    "BK7231N Tuya 3-phase meter (paired): joins its stored network and reaches for the Tuya cloud":
+        "A stock Tuya device captured after it had been set up, so its flash still holds the "
+        "owner's network name. It asks for that network, the emulator plays it, and the device "
+        "joins, takes an address, announces its own cloud identity on the LAN in a form every "
+        "Tuya device encrypts the same way, and opens TLS to its cloud twice - once at a fixed "
+        "address and once by name. Nothing leaves the machine: the connections are accepted and "
+        "decoded locally. The identity it announces matches the product key given on the command "
+        "line, which is what confirms the decryption rather than assuming it.",
+    "BK7231N Tuya thermostat: EZ-mode sniffing reported, then falls back to AP pairing":
+        "The pairing mode that needs real hardware behaviour: the device opens its receiver to "
+        "every frame on the channel and reads the credentials out of the pattern a phone sends. "
+        "The emulated MAC reports that the firmware did this, which is what tells a sniffing "
+        "device apart from a scanning one. The same run then shows it give up, close the receiver "
+        "back down and fall back to making its own pairing network.",
+    "BK7231N Tuya alarm (paired): a second device's cloud identity decodes with the same shared key":
+        "A different paired device with a different stored network and a different identity, "
+        "included to show the announcement is readable because every Tuya device encrypts it with "
+        "the same key, not because of anything special about the meter. What it announces matches "
+        "the product key passed on the command line, which rules out rubbish that merely parses.",
     "BK7231N Tuya TempHum Sensor Reads Protected Key":
         "The stock Tuya temp/humidity sensor that first exposed the protected-key bug. With blank "
         "flash it failed the AES magic check and dropped to mf_test; serving the dump's real bytes "
@@ -2561,6 +2756,10 @@ def tags_for(test_config):
         feat.append("MQTT")
     if "[NET] NTP" in exp:
         feat.append("NTP")
+    if "Tuya LAN" in exp:
+        feat.append("Tuya LAN")
+    if "TLS ClientHello" in exp:
+        feat.append("cloud capture")
     if test_config.get("pcap_expect"):
         feat.append("pcap")
     if test_config.get("kind") == "snapshot_roundtrip":

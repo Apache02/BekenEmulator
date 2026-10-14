@@ -59,6 +59,17 @@ def parse_forwards(specs):
     return out
 
 
+def parse_mqtt_pubs(specs):
+    """Parse --mqtt-publish 'TOPIC=PAYLOAD' items into [(topic, payload bytes)]."""
+    out = []
+    for spec in specs:
+        topic, sep, payload = spec.partition("=")
+        if not sep or not topic:
+            raise ValueError("bad --mqtt-publish %r (want TOPIC=PAYLOAD, e.g. cmnd/obk/POWER=ON)" % spec)
+        out.append((topic, payload.encode("utf-8")))
+    return out
+
+
 def parse_mac(text):
     parts = text.replace("-", ":").split(":")
     if len(parts) != 6:
@@ -165,6 +176,13 @@ def parse_args():
                              "\"GET PATH\" on port 80 and log the status line and body as a [NET] "
                              "line. Repeatable; requests go one after another. E.g. "
                              "--net-http-get \"/cm?cmnd=POWER%%20ON\" drives OpenBeken's command API.")
+    parser.add_argument("--mqtt-publish", dest="mqtt_pubs", action="append", default=[],
+                        metavar="TOPIC=PAYLOAD",
+                        help="Have the offline MQTT broker push this message to the device, once "
+                             "the device subscribes to a topic filter that matches it (+ and # "
+                             "wildcards honoured, as a real broker does). This is the way in: the "
+                             "firmware picked those filters itself, so e.g. --mqtt-publish "
+                             "\"cmnd/obkSim/POWER=ON\" drives OpenBeken over MQTT. Repeatable.")
     parser.add_argument("--pcap", dest="pcap", default=None, metavar="FILE",
                         help="Write every 802.11 frame crossing the peer to FILE (link type "
                              "IEEE 802.11, no FCS) for Wireshark.")
@@ -272,13 +290,15 @@ def main():
             tuyamcu_injects=parse_hex_blobs(args.tuyamcu_injects),
             xvr_selfclear=args.xvr_selfclear, ble_core=args.ble_core,
             wifi=(args.wifi or bool(args.wifi_peer) or bool(args.net_forwards) or bool(args.pcap)
-                  or bool(args.net_http_gets) or bool(args.wifi_ssid)))
-        if args.wifi_peer or args.net_forwards or args.pcap or args.wifi_ssid or args.net_http_gets:
+                  or bool(args.net_http_gets) or bool(args.wifi_ssid) or bool(args.mqtt_pubs)))
+        if (args.wifi_peer or args.net_forwards or args.pcap or args.wifi_ssid
+                or args.net_http_gets or args.mqtt_pubs):
             emu.attach_wifi_peer(role=args.wifi_peer or "auto", ssid=args.wifi_ssid,
                                  channel=args.wifi_channel, peer_mac=parse_mac(args.wifi_mac),
                                  forwards=parse_forwards(args.net_forwards),
                                  net_out=args.net_out, pcap=args.pcap,
-                                 http_gets=args.net_http_gets)
+                                 http_gets=args.net_http_gets,
+                                 mqtt_pubs=parse_mqtt_pubs(args.mqtt_pubs))
         if args.snapshot_save:
             if not args.snapshot_at:
                 raise ValueError("--snapshot-save needs --snapshot-at (an instruction count or a UART marker)")
