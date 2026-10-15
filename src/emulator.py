@@ -98,6 +98,58 @@ CHUNK_DEVICE_INSNS = FAST_TICK_INSNS
 CHUNK_SCALE_ARM = 1.0
 CHUNK_SCALE_THUMB = 0.42
 
+# Idle skipping (see _run_chunked). A settled OpenBeken spends ~85% of its
+# instructions in the RTOS idle task, polling its power-save hook with
+# interrupts open - on the chip that is waiting, here it was the bulk of the
+# emulation cost. Once the CPU has spent IDLE_STREAK whole chunks in the idle
+# task, the loop stops executing it and only advances the device clock, a
+# chunk at a time with all the periodic work, until an interrupt is taken.
+# At most IDLE_MAX_SKIP chunks go by without the idle loop running at all, so
+# anything it polls is still seen at least every ~10 ms of device time.
+# EMU_IDLE_SKIP=0 turns it off.
+IDLE_STREAK = 2
+IDLE_MAX_SKIP = 50
+# The idle loop is usually inside its interrupts-off window when a chunk ends;
+# it is walked out of it IDLE_STEP_INSNS instructions at a time, at most
+# IDLE_STEP_TRIES times, before a skip may start (see _idle_step_to_open).
+IDLE_STEP_INSNS = 8
+IDLE_STEP_TRIES = 64
+# How often to look for the idle task until it exists (device-clock units).
+IDLE_SCAN_INSNS = 10_000_000
+
+
+def _fast_reg_access(mu):
+    """(read, write) for 32-bit registers, bypassing the binding's per-call cost.
+
+    Uc.reg_read re-derives the register class and builds a ctypes object on
+    every call - ~10 us, 3x what the C call itself costs, and the chunk loop
+    and the interrupt entry make a few thousand of them per device-second.
+    Falls back to the binding if this Unicorn's internals differ.
+    """
+    try:
+        import ctypes
+        from unicorn.unicorn_py3.unicorn import uclib
+        handle = mu._uch
+        c_read, c_write = uclib.uc_reg_read, uclib.uc_reg_write
+        val = ctypes.c_uint32()
+        ref = ctypes.byref(val)
+        slow_read, slow_write = mu.reg_read, mu.reg_write
+
+        def read(reg):
+            if c_read(handle, reg, ref):
+                return slow_read(reg)
+            return val.value
+
+        def write(reg, value):
+            val.value = value & 0xFFFFFFFF
+            if c_write(handle, reg, ref):
+                slow_write(reg, value)
+
+        read(UC_ARM_REG_PC)             # prove the path works before trusting it
+        return read, write
+    except Exception:
+        return mu.reg_read, mu.reg_write
+
 # How long UART1 receive bytes are held before the guest may read them. OpenBeken
 # enables UART1 RX early (~140k insns) but only registers its console callback
 # about a million instructions later in CMD_Init_Delayed, and the ISR discards
@@ -141,6 +193,10 @@ class SimulatorState:
         # True while stdout sits at a line boundary. Report lines may only be
         # written then, so they never land inside a UART log line.
         self.uart_at_line_start = True
+        # The RTOS idle task's stack as (low, high), once found; see idle
+        # skipping in _run_chunked. Here, not on the emulator, so a snapshot
+        # carries it and a resumed run skips exactly as the original did.
+        self.idle_task = None
         # UART1 (the TuyaMCU serial link) byte log for the report's dedicated
         # UART1 tab: a list of (insn_count, 'T'|'R', byte). 'T' = the device
         # transmitted it (device -> MCU); 'R' = it was delivered to the device
@@ -376,6 +432,11 @@ class BekenEmulator:
         self._block_pacing = bool(os.environ.get("EMU_BLOCK_PACING"))
         self.chunk_device_insns = int(os.environ.get("EMU_CHUNK_DEVICE_INSNS")
                                       or CHUNK_DEVICE_INSNS)
+        # Idle skipping, on unless EMU_IDLE_SKIP=0 (see IDLE_STREAK). The
+        # counters say how much of a run was skipped, for measuring it.
+        self.idle_skip = os.environ.get("EMU_IDLE_SKIP", "1") != "0"
+        self.idle_chunks_skipped = 0
+        self.chunks_run = 0
         # Bumped whenever trigger_irq/trigger_fiq actually takes an exception,
         # i.e. moves PC out from under the chunk loop.
         self._exc_epoch = 0
@@ -416,6 +477,7 @@ class BekenEmulator:
         except UcError as e:
             print("Unicorn error:", e)
             sys.exit(1)
+        self._reg_read, self._reg_write = _fast_reg_access(self.mu)
             
     def _print(self, *args, **kwargs):
         if not self.only_uart:
@@ -623,16 +685,17 @@ class BekenEmulator:
         if self.state.icu_global_int_en == 0:
             return # Global interrupts disabled
             
-        cpsr = self.mu.reg_read(UC_ARM_REG_CPSR)
+        read, write = self._reg_read, self._reg_write
+        cpsr = read(UC_ARM_REG_CPSR)
         if (cpsr & 0x80) == 0:  # I bit is clear (IRQs enabled)
-            pc = self.mu.reg_read(UC_ARM_REG_PC)
+            pc = read(UC_ARM_REG_PC)
 
             # Switch to IRQ mode (0x12), disable IRQs (0x80), clear Thumb bit (0x20)
             new_cpsr = (cpsr & ~0x3F) | 0x92
-            self.mu.reg_write(UC_ARM_REG_CPSR, new_cpsr)
-            self.mu.reg_write(UC_ARM_REG_SPSR, cpsr)
-            self.mu.reg_write(UC_ARM_REG_LR, pc + 4)
-            self.mu.reg_write(UC_ARM_REG_PC, 0x00000018)
+            write(UC_ARM_REG_CPSR, new_cpsr)
+            write(UC_ARM_REG_SPSR, cpsr)
+            write(UC_ARM_REG_LR, pc + 4)
+            write(UC_ARM_REG_PC, 0x00000018)
             # Tells _run_chunked that PC/CPSR moved under it, so the next
             # chunk must start from the vector rather than where the guest
             # was. Cheaper than re-reading both registers every chunk.
@@ -649,15 +712,16 @@ class BekenEmulator:
         """
         if not (self.state.icu_global_int_en & 0x2):
             return
-        cpsr = self.mu.reg_read(UC_ARM_REG_CPSR)
+        read, write = self._reg_read, self._reg_write
+        cpsr = read(UC_ARM_REG_CPSR)
         if cpsr & 0x40:
             return
-        pc = self.mu.reg_read(UC_ARM_REG_PC)
+        pc = read(UC_ARM_REG_PC)
         new_cpsr = (cpsr & ~0x3F) | 0x11 | 0xC0
-        self.mu.reg_write(UC_ARM_REG_CPSR, new_cpsr)
-        self.mu.reg_write(UC_ARM_REG_SPSR, cpsr)
-        self.mu.reg_write(UC_ARM_REG_LR, pc + 4)
-        self.mu.reg_write(UC_ARM_REG_PC, 0x0000001C)
+        write(UC_ARM_REG_CPSR, new_cpsr)
+        write(UC_ARM_REG_SPSR, cpsr)
+        write(UC_ARM_REG_LR, pc + 4)
+        write(UC_ARM_REG_PC, 0x0000001C)
         self._exc_epoch += 1            # see trigger_irq
 
     def hook_intr(self, mu, intno, user_data):
@@ -842,19 +906,35 @@ class BekenEmulator:
             if self.wifimac is not None and self.wifimac.busy:
                 lines = self.wifimac.tick(state.insn_count)
                 state.pending_irqs = (state.pending_irqs & ~_wifimac.LINE_MASK) | lines
-            # UART1 interrupt: the firmware's TX path arms bit 0
-            # (TX_FIFO_NEED_WRITE_EN); the RX console arms bit 1
-            # (RX_FIFO_NEED_READ_EN) / bit 6 (RX_STOP_END_EN). Fire for TX
-            # always-ready, and for RX only while we actually have queued bytes
-            # to deliver - otherwise a spurious RX interrupt storm.
-            if state.icu_int_enable & (1 << 0):
-                rx_pending = self._rx_active() and (state.uart1_int_enable & 0x42)
-                if (state.uart1_int_enable & 0x01) or rx_pending:
-                    state.pending_irqs |= (1 << 0)
-                    self.trigger_irq()
-            if (state.uart2_int_enable & 0x01) and (state.icu_int_enable & (1 << 1)):
+            uart1_due, uart2_due = self._uart_irqs_due(state)
+            if uart1_due:
+                state.pending_irqs |= (1 << 0)
+                self.trigger_irq()
+            if uart2_due:
                 state.pending_irqs |= (1 << 1)
                 self.trigger_irq()
+
+    def _uart_irqs_due(self, state):
+        """(UART1, UART2): whether the fast tick raises each UART's interrupt.
+
+        UART1: the firmware's TX path arms bit 0 (TX_FIFO_NEED_WRITE_EN); the
+        RX console arms bit 1 (RX_FIFO_NEED_READ_EN) / bit 6 (RX_STOP_END_EN).
+        It fires for TX always-ready, and for RX only while there are queued
+        bytes to deliver - otherwise a spurious RX interrupt storm.
+        """
+        uart1 = bool(state.icu_int_enable & (1 << 0)) and bool(
+            (state.uart1_int_enable & 0x01)
+            or (self._rx_active() and (state.uart1_int_enable & 0x42)))
+        uart2 = bool(state.uart2_int_enable & 0x01) and bool(state.icu_int_enable & (1 << 1))
+        return uart1, uart2
+
+    def _fast_tick_idle(self, state):
+        """True when the fast tick would do nothing at all: no transmission in
+        flight in the Wi-Fi MAC and no UART interrupt due."""
+        if self.wifimac is not None and self.wifimac.busy:
+            return False
+        uart1_due, uart2_due = self._uart_irqs_due(state)
+        return not (uart1_due or uart2_due)
 
     def _report_ble_adv(self):
         """Print any advertising payload the controller has staged in EM.
@@ -1614,6 +1694,8 @@ class BekenEmulator:
             self.mu.mem_write(begin, zlib.decompress(data))
         self.mu.context_restore(snap["ctx"])
         self.state = snap["state"]
+        if not hasattr(self.state, "idle_task"):
+            self.state.idle_task = None     # a snapshot from before idle skipping
         self.flash_state = snap["flash_state"]
         if snap["physical_flash"] is not None:
             self.physical_flash = bytearray(snap["physical_flash"])
@@ -1699,20 +1781,31 @@ class BekenEmulator:
                                for scale in (CHUNK_SCALE_ARM, CHUNK_SCALE_THUMB))
                          for entry in (0, 1))
         emu_start = mu.emu_start
-        # Two reg_read calls, not reg_read_batch: the batch wrapper builds
-        # ctypes arrays and measured 2x slower than reading both directly.
-        reg_read = mu.reg_read
+        # Separate register reads, not reg_read_batch (whose wrapper builds
+        # ctypes arrays), and the direct C call rather than the binding's.
+        reg_read = self._reg_read
         pacing = self._pacing
         pc = start & ~1
         thumb = start & 1
+        # Idle skipping (IDLE_STREAK): how many chunks in a row have ended in
+        # the idle task, and which IDLE_SCAN_INSNS step of device time was
+        # last searched for it. The grid is absolute, not counted from this
+        # run's start, so a run resumed from a snapshot searches when the
+        # original did.
+        skip = self.idle_skip
+        grid = state.insn_count // IDLE_SCAN_INSNS
+        streak = 0
         while True:
             emu_start(pc | thumb, 0xFFFFFFFF, 0, chunk_for[thumb])
+            self.chunks_run += 1
             pc = reg_read(UC_ARM_REG_PC)
-            was_thumb, thumb = thumb, 1 if reg_read(UC_ARM_REG_CPSR) & 0x20 else 0
+            cpsr = reg_read(UC_ARM_REG_CPSR)
+            was_thumb, thumb = thumb, 1 if cpsr & 0x20 else 0
             state.insn_count += step_for[was_thumb][thumb]
             # Where execution is, for the GUI status bar in another thread.
             state.last_pc = pc
             epoch = self._exc_epoch
+            armed = self._snapshot_path is not None
             pacing(state)
             if self.stopping:
                 break
@@ -1721,8 +1814,149 @@ class BekenEmulator:
                 # the mode/Thumb bit changed under us.
                 pc = reg_read(UC_ARM_REG_PC)
                 thumb = 1 if reg_read(UC_ARM_REG_CPSR) & 0x20 else 0
+                streak = 0
+            elif skip and armed:
+                # Nothing is skipped or searched for while a snapshot is armed
+                # (that includes the chunk it was just taken after), so the run
+                # up to it is exactly a skip-off run and the skipping restarts
+                # from it the way a resumed run's does. A resume then reproduces
+                # the original byte for byte, which the harness checks.
+                streak = 0
+                grid = state.insn_count // IDLE_SCAN_INSNS
+            elif skip:
+                idle = state.idle_task
+                if idle is None:
+                    if state.insn_count // IDLE_SCAN_INSNS != grid:
+                        grid = state.insn_count // IDLE_SCAN_INSNS
+                        state.idle_task = self._find_idle_task()
+                # In the idle task, in task context (not an IRQ/FIQ handler),
+                # with IRQs on at the ICU, so the interrupt that ends the wait
+                # can be delivered once the CPU has them open.
+                elif ((cpsr & 0x1F) == 0x1F or (cpsr & 0x1F) == 0x13) and \
+                        state.icu_global_int_en & 1 and \
+                        idle[0] <= reg_read(UC_ARM_REG_SP) < idle[1]:
+                    streak += 1
+                    if streak >= IDLE_STREAK:
+                        streak = 0
+                        pc, thumb, ready = self._idle_step_to_open(pc, thumb, cpsr, idle)
+                        if ready:
+                            if self._skip_idle(state, step_for[thumb][thumb]):
+                                break       # stopped while skipping
+                            pc = reg_read(UC_ARM_REG_PC)
+                            thumb = 1 if reg_read(UC_ARM_REG_CPSR) & 0x20 else 0
+                else:
+                    streak = 0
             if pc == 0xFFFFFFFF:
                 break                   # ran into `until`: emulation is over
+
+    def _idle_step_to_open(self, pc, thumb, cpsr, idle):
+        """Walk the idle loop out of its critical section, a few instructions
+        at a time, so skipping starts with interrupts open.
+
+        Beken's idle hook spends most of each pass with IRQ and FIQ masked
+        (it disables both around its power-save check), so a chunk usually
+        ends inside that window; skipping from there would wait on an
+        interrupt the CPU cannot take. The instructions run here are put on
+        the device clock like any others. Returns (pc, thumb, ready): ready
+        is False if the CPU left the idle task or did not open in time.
+        """
+        read = self._reg_read
+        emu_start = self.mu.emu_start
+        real = [0, 0]                   # instructions run, by ARM / Thumb
+        ready = False
+        for _ in range(IDLE_STEP_TRIES):
+            if cpsr & 0xC0 == 0:
+                ready = True
+                break
+            emu_start(pc | thumb, 0xFFFFFFFF, 0, IDLE_STEP_INSNS)
+            real[thumb] += IDLE_STEP_INSNS
+            pc = read(UC_ARM_REG_PC)
+            cpsr = read(UC_ARM_REG_CPSR)
+            thumb = 1 if cpsr & 0x20 else 0
+            if not (((cpsr & 0x1F) == 0x1F or (cpsr & 0x1F) == 0x13)
+                    and idle[0] <= read(UC_ARM_REG_SP) < idle[1]):
+                break                   # left the idle task: nothing to skip
+        self.state.insn_count += int(real[0] * CHUNK_SCALE_ARM + real[1] * CHUNK_SCALE_THUMB)
+        self.state.last_pc = pc
+        return pc, thumb, ready
+
+    def _skip_idle(self, state, step):
+        """Advance device time without executing, while the CPU only idles.
+
+        Exactly what running the idle loop would do to everything outside the
+        CPU: the clock moves a chunk at a time and the periodic work runs at
+        its usual grain, so interrupts are raised at the same device times.
+        Ends when one is taken (PC is then the vector), after IDLE_MAX_SKIP
+        chunks so the idle loop still gets to run now and then, or on stop.
+        Returns True if the run was stopped.
+        """
+        pacing = self._pacing
+        epoch = self._exc_epoch
+        # _idle_step_to_open has just opened I and F, so an interrupt raised
+        # while the idle hook had them masked is deliverable now - on the chip
+        # it would be taken here. Do the periodic work once before the clock
+        # moves, or a pending timer tick would wait for the next one and the
+        # two merge, losing the guest RTOS a tick.
+        pacing(state)
+        if self.stopping:
+            return True
+        if self._exc_epoch != epoch:
+            return False
+        left = IDLE_MAX_SKIP
+        while left > 0:
+            # When the fast tick has nothing to do, nothing can happen before
+            # the next slow tick, so go straight there in one step rather than
+            # one chunk at a time. (No snapshot point can be crossed: skipping
+            # is off while one is armed.)
+            n = 1
+            if self._fast_tick_idle(state):
+                target = state.last_slow + SLOW_TICK_INSNS
+                # Queued UART1 bytes held back by uart1_rx_delay become due
+                # at that point; land on it so the fast tick sees them then.
+                if self.uart1_rx and state.insn_count < self.uart1_rx_delay:
+                    target = min(target, self.uart1_rx_delay)
+                n = min(left, max(1, -(-(target - state.insn_count) // step)))
+            state.insn_count += step * n
+            left -= n
+            self.idle_chunks_skipped += n
+            pacing(state)
+            if self.stopping:
+                return True
+            if self._exc_epoch != epoch:
+                break
+        return False
+
+    @property
+    def idle_task(self):
+        """The RTOS idle task's stack as (low, high) once found, else None."""
+        return self.state.idle_task
+
+    def _find_idle_task(self):
+        """The RTOS idle task's stack, as (low, high), or None if not there yet.
+
+        FreeRTOS (v8 to v10, Beken's SDKs) lays a task control block out as
+        pxTopOfStack, two list items whose owner fields (+0x10, +0x24) point
+        back at the block, uxPriority (+0x2c), pxStack (+0x30), then the name
+        (+0x34). A NUL-terminated "IDLE" - Beken spells it "idle" - where all
+        of that holds, at priority 0, is the idle task. Its stack runs from
+        pxStack up to the block, which the heap allocates right after it;
+        anything else and idle skipping simply stays off for this firmware.
+        """
+        ram = bytes(self.mu.mem_read(self.RAM_BASE, self.RAM_SIZE))
+        for name in (b"IDLE\x00", b"idle\x00"):
+            at = ram.find(name)
+            while at >= 0:
+                tcb_off = at - 0x34
+                if tcb_off >= 0 and tcb_off % 4 == 0:
+                    tcb = self.RAM_BASE + tcb_off
+                    own1 = struct.unpack_from("<I", ram, tcb_off + 0x10)[0]
+                    own2 = struct.unpack_from("<I", ram, tcb_off + 0x24)[0]
+                    prio, stack = struct.unpack_from("<II", ram, tcb_off + 0x2C)
+                    if (own1 == tcb and own2 == tcb and prio == 0
+                            and self.RAM_BASE <= stack < tcb and tcb - stack <= 0x4000):
+                        return (stack, tcb)
+                at = ram.find(name, at + 1)
+        return None
 
     def run(self):
         if getattr(self, "_resume_at", None) is not None:
