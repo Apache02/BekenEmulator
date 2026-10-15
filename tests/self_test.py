@@ -207,6 +207,40 @@ TEST_CASES = [
         ]
     },
     {
+        # A PROTECTED network, which until now the emulator could not offer:
+        # its access point was always open, so a device that had stored a
+        # WPA2 network could see ours in a scan and never join it.
+        # The image is configured (make_obk_config.py --ssid BekenSec --pass
+        # simulator123) for exactly the network the peer raises, and both ends
+        # hold the passphrase - the emulator from the command line, the
+        # firmware from its own flash. The four-way handshake is how each
+        # proves it, and nothing crosses the link until it finishes: the
+        # address, the clock and the outgoing request below all happen on the
+        # far side of it.
+        # Nothing here weakens anything. No key is recovered or guessed; this
+        # is the standard exchange between two parties that already share a
+        # secret, and a station whose passphrase does not match gets no
+        # further (src/wpa2.py covers that case).
+        "name": "OpenBK7231T Wi-Fi station: joins a WPA2-protected network and uses it",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "OpenBK7231T_QIO_1.18.300_obkConfig_staWPA2_BekenSec.bin"),
+        "args": ["--only-uart", "-key", "TUYA", "--wifi-peer", "auto",
+                 "--wifi-ssid", "BekenSec", "--wifi-pass", "simulator123"],
+        "timeout": 1200,
+        "expected_strings": [
+            "[WIFI] station c8:47:8c:00:00:00 associated to 'BekenSec' (AID 1)",
+            "[WIFI] station c8:47:8c:00:00:00 associated to a protected network; "
+            "starting the four-way handshake",
+            "[WIFI] station c8:47:8c:00:00:00 completed the four-way handshake; "
+            "the link is encrypted and open for traffic",
+            # The firmware agrees it is connected, then uses the link.
+            "WIFI_STA_CONNECTED",
+            "[NET] DHCP: device c8:47:8c:00:00:00 got 192.168.1.100",
+            "Info:NTP:Unix time:",
+            "sends: HTTP GET /wpa2?ok=1 HTTP/1.1 host api.bekensim.test",
+        ],
+    },
+    {
         # The device's own outgoing traffic, three protocols in one boot. The
         # image's OBK config (make_obk_config.py --ssid BekenSim --mqtt-host
         # mqtt.bekensim.test --mqtt-client obkSim) carries the startup command
@@ -2775,6 +2809,12 @@ DESCRIPTIONS = {
         "OpenBeken configured for an open network joins the virtual access point, gets its address "
         "from the virtual network, answers an HTTP command coming in, and its outgoing MQTT "
         "connection is resolved to a sinkhole and decoded instead of leaving the machine.",
+    "OpenBK7231T Wi-Fi station: joins a WPA2-protected network and uses it":
+        "The emulated access point could only ever be an open network, so a device that had "
+        "stored a protected one could see it and never join. Here it offers a protected network "
+        "and the device joins it properly: both ends already hold the passphrase, the four-way "
+        "handshake is how each proves that, and the link stays shut until it completes. The "
+        "address, the clock and the outgoing request all happen on the far side of it.",
     "OpenBK7231T Wi-Fi station: outgoing NTP, HTTP GET and MQTT answered offline, pcap holds them":
         "Everything the device starts itself, answered without a real network: its NTP query gets "
         "the host clock, its repeating HTTP GET to a cloud-style name gets a 200 from the offline "

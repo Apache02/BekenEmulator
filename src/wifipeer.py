@@ -30,6 +30,11 @@ material that the device has and this peer does not model.
 import struct
 import time
 
+try:
+    from . import wpa2
+except ImportError:        # run directly, not as a package
+    import wpa2
+
 # frame control subtypes (type in bits 2-3, subtype in bits 4-7)
 MGMT_ASSOC_REQ, MGMT_ASSOC_RESP, MGMT_PROBE_REQ, MGMT_PROBE_RESP = 0x0, 0x1, 0x4, 0x5
 MGMT_BEACON, MGMT_DISASSOC, MGMT_AUTH, MGMT_DEAUTH, MGMT_ACTION = 0x8, 0xA, 0xB, 0xC, 0xD
@@ -126,10 +131,15 @@ class WifiPeer:
     """The virtual counterpart on air. role: "auto" | "sta" | "ap"."""
 
     def __init__(self, mac, netstack, inject, log=None, role="auto", ssid=None, channel=1,
-                 pcap=None, now_us=None, bssid=None, latency_us=0):
+                 pcap=None, now_us=None, bssid=None, latency_us=0, passphrase=None):
         self.mac = mac
         self.net = netstack
-        self.inject = inject                     # callback(frame_bytes)
+        self.inject = inject                     # callback(frame_bytes, decr=None)
+        # When set, the access point this peer raises is WPA2-PSK rather than
+        # open: it advertises RSN, and a station must complete the four-way
+        # handshake before any of its traffic is carried (see src/wpa2.py).
+        self.passphrase = passphrase
+        self.auth = {}                           # station mac -> Authenticator
         self.log = log or (lambda *a: None)
         self.role = role
         self.active_role = None if role == "auto" else role
@@ -161,7 +171,7 @@ class WifiPeer:
         # dns_gethostbyname() returns, so a zero-latency reply resolved first
         # and the bookkeeping then overwrote the result - every retry, forever.
         self.latency_us = latency_us
-        self._outq = []                          # [(release_us, frame)]
+        self._outq = []                          # [(release_us, frame, decr)]
 
     # --------------------------------------------------------------- helpers
     def _seq(self):
@@ -169,24 +179,24 @@ class WifiPeer:
         self.seq = (self.seq + 1) & 0xFFF
         return s << 4
 
-    def _send(self, frame):
+    def _send(self, frame, decr=None):
         self.stats["tx"] += 1
         if self.latency_us:
-            self._outq.append((self.now_us() + self.latency_us, frame))
+            self._outq.append((self.now_us() + self.latency_us, frame, decr))
             return
-        self._deliver(frame)
+        self._deliver(frame, decr)
 
-    def _deliver(self, frame):
+    def _deliver(self, frame, decr=None):
         if self.pcap:
             self.pcap.write(frame, self.now_us())
-        self.inject(frame)
+        self.inject(frame, decr)
 
     def _release(self, now):
         if self._outq and self._outq[0][0] <= now:
-            due = [f for t, f in self._outq if t <= now]
-            self._outq = [(t, f) for t, f in self._outq if t > now]
-            for f in due:
-                self._deliver(f)
+            due = [(f, d) for t, f, d in self._outq if t <= now]
+            self._outq = [(t, f, d) for t, f, d in self._outq if t > now]
+            for f, d in due:
+                self._deliver(f, d)
 
     def _mgmt(self, subtype, da, sa, bssid, body):
         fc = (subtype << 4)
@@ -212,7 +222,8 @@ class WifiPeer:
         elif self.active_role == "ap":
             if not self.stations and not (dst[0] & 1):
                 return
-            self._send(self._data(dst, src, self.ap_bssid, payload, to_ds=False))
+            self._send(self._data(dst, src, self.ap_bssid, payload, to_ds=False),
+                       self._decr_for(dst))
 
     # ------------------------------------------------------ from the device
     def on_device_tx(self, frame, info=None):
@@ -364,12 +375,73 @@ class WifiPeer:
             self.sta_next_us = now
 
     # ------------------------------------------------------------- AP role
+    # ------------------------------------------------- protected network (WPA2)
+    def _eapol_to(self, sta, payload):
+        """Send one handshake message to a station, as an ordinary data frame.
+
+        These travel in the clear by definition: they are what establishes the
+        key, so they cannot themselves be protected.
+        """
+        body = LLC_SNAP + struct.pack("!H", wpa2.ETH_EAPOL) + payload
+        self._send(self._data(sta, self.mac, self.ap_bssid, body, to_ds=False))
+
+    def _start_handshake(self, sta):
+        """Open the four-way handshake with a station that has just associated."""
+        auth = wpa2.Authenticator(self.passphrase, self.ssid or "BekenSim",
+                                  self.ap_bssid, sta, log=self.log)
+        self.auth[sta] = auth
+        self.log("[WIFI] station %s associated to a protected network; starting the "
+                 "four-way handshake" % mac2str(sta))
+        self._eapol_to(sta, auth.start())
+
+    def _on_eapol(self, sta, payload):
+        """A handshake message from the station. True if it was consumed here."""
+        auth = self.auth.get(sta)
+        if auth is None:
+            return False
+        reply = auth.on_message(payload)
+        if reply is not None:
+            self._eapol_to(sta, reply)
+        if auth.done and sta in self.stations and not self.stations[sta].get("encrypted"):
+            self.stations[sta]["encrypted"] = True
+            self.log("[WIFI] station %s completed the four-way handshake; the link is "
+                     "encrypted and open for traffic" % mac2str(sta))
+            self.events.append(("encrypted", self.now_us()))
+            if self.net is not None:
+                self.net.link_up(device_mac=sta)
+        return True
+
+    def _decr_for(self, dst):
+        """What the receiving hardware should report about a frame we send.
+
+        On a protected link the device's MAC would have decrypted the frame
+        before the firmware ever saw it, so the status says CCMP succeeded;
+        a firmware that enforces its own key policy drops anything else.
+        """
+        if not self.passphrase:
+            return None
+        if dst[0] & 1:                            # group traffic
+            # Only once some station actually holds the group key - i.e. has
+            # finished its handshake - not merely because one has started.
+            enc = any(s.get("encrypted") for s in self.stations.values())
+            return wpa2.DECR_CCMP_SUCCESS if enc else None
+        st = self.stations.get(dst)
+        return wpa2.DECR_CCMP_SUCCESS if st and st.get("encrypted") else None
+
+    def _ap_caps(self):
+        """Capability field: ESS, plus the privacy bit when this network is protected."""
+        return 0x0421 | (wpa2.CAP_PRIVACY if self.passphrase else 0)
+
     def _ap_ies(self, probe=False):
         ssid = (self.ssid or "BekenSim").encode("utf-8")
         ies = ie(IE_SSID, ssid) + ie(IE_RATES, RATES_BG) + ie(IE_DS, bytes([self.channel]))
         if not probe:
             ies += ie(IE_TIM, bytes([0, 1, 0, 0]))
         ies += ie(IE_ERP, b"\x00") + ie(IE_EXT_RATES, EXT_RATES_BG)
+        if self.passphrase:
+            # Without this a device that stored a protected network sees ours
+            # as a different, open one and will not even try to join.
+            ies += ie(IE_RSN, wpa2.RSN_IE_BODY)
         return ies
 
     def _ap_tsf(self, now):
@@ -378,7 +450,7 @@ class WifiPeer:
         return now - self.tsf_start
 
     def _ap_beacon(self, now):
-        body = struct.pack("<QHH", self._ap_tsf(now), BEACON_INTERVAL_TU, 0x0421) + self._ap_ies()
+        body = struct.pack("<QHH", self._ap_tsf(now), BEACON_INTERVAL_TU, self._ap_caps()) + self._ap_ies()
         self._send(self._mgmt(MGMT_BEACON, BCAST, self.ap_bssid, self.ap_bssid, body))
 
     def _ap_mgmt(self, subtype, da, sa, bssid, body):
@@ -404,7 +476,7 @@ class WifiPeer:
                     self.log("[WIFI] device probes for '%s': adopting it as our SSID" % want)
                 if want != self.ssid:
                     return
-            resp = struct.pack("<QHH", self._ap_tsf(now), BEACON_INTERVAL_TU, 0x0421) + self._ap_ies(probe=True)
+            resp = struct.pack("<QHH", self._ap_tsf(now), BEACON_INTERVAL_TU, self._ap_caps()) + self._ap_ies(probe=True)
             self._send(self._mgmt(MGMT_PROBE_RESP, sa, self.ap_bssid, self.ap_bssid, resp))
             return
         if da != self.ap_bssid and da != self.mac:
@@ -428,18 +500,27 @@ class WifiPeer:
             want = ie_get(ies, IE_SSID)
             rsn = ie_get(ies, IE_RSN)
             status = 0
-            if rsn is not None:
+            if self.passphrase:
+                # A protected network: the station must ask for one, and the
+                # link stays shut until it proves it holds the passphrase.
+                if rsn is None:
+                    self.log("[WIFI] station %s asks to join '%s' unprotected, but this "
+                             "network is protected" % (mac2str(sa), self.ssid))
+                    status = 40
+            elif rsn is not None:
                 self.log("[WIFI] station %s offers RSN (a cipher) in its association; this open BSS cannot take it" % mac2str(sa))
                 status = 40
             st["aid"] = self.next_aid
             self.next_aid += 1
             st["state"] = "ASSOC" if status == 0 else "AUTH"
-            resp = struct.pack("<HHH", 0x0421, status, 0xC000 | st["aid"]) + ie(IE_RATES, RATES_BG) + ie(IE_EXT_RATES, EXT_RATES_BG)
+            resp = struct.pack("<HHH", self._ap_caps(), status, 0xC000 | st["aid"]) + ie(IE_RATES, RATES_BG) + ie(IE_EXT_RATES, EXT_RATES_BG)
             self._send(self._mgmt(MGMT_ASSOC_RESP, sa, self.ap_bssid, self.ap_bssid, resp))
             if status == 0:
                 self.log("[WIFI] station %s associated to '%s' (AID %d)" % (mac2str(sa), self.ssid, st["aid"]))
                 self.events.append(("assoc", now))
-                if self.net is not None:
+                if self.passphrase:
+                    self._start_handshake(sa)
+                elif self.net is not None:
                     self.net.link_up(device_mac=sa)
         elif subtype in (MGMT_DEAUTH, MGMT_DISASSOC):
             if sa in self.stations:
@@ -486,6 +567,14 @@ class WifiPeer:
         if body[:6] != LLC_SNAP:
             return
         etype = body[6:8]
+        # Handshake traffic is ours to answer, and must never be handed to the
+        # IP stack: it is how the link gets its key, not traffic on the link.
+        # So it stops here whether or not we had an Authenticator for the
+        # sender - an EAPOL frame is never IP traffic to forward.
+        if (self.active_role == "ap" and self.passphrase
+                and struct.unpack("!H", etype)[0] == wpa2.ETH_EAPOL):
+            self._on_eapol(sa, body[8:])
+            return
         eth = da + sa + etype + body[8:]
         if self.net is not None:
             self.net.input(eth)
@@ -529,7 +618,7 @@ def _run_selftests():
     clock = [0]
     sent = []
     net = FakeNet()
-    p = WifiPeer(str2mac("02:00:00:00:00:01"), net, sent.append, log=lambda *a: None, now_us=lambda: clock[0])
+    p = WifiPeer(str2mac("02:00:00:00:00:01"), net, lambda f, d=None, _s=sent: _s.append(f), log=lambda *a: None, now_us=lambda: clock[0])
     dev = str2mac("c8:47:8c:00:00:01")
 
     print("== STA role: device beacons an open AP ==")
@@ -556,20 +645,20 @@ def _run_selftests():
     print("== AP role: device probes and joins ==")
     sent2 = []
     net2 = FakeNet()
-    q = WifiPeer(str2mac("02:00:00:00:00:02"), net2, sent2.append, log=lambda *a: None, now_us=lambda: clock[0])
+    q = WifiPeer(str2mac("02:00:00:00:00:02"), net2, lambda f, d=None, _s=sent2: _s.append(f), log=lambda *a: None, now_us=lambda: clock[0])
     probe = q._mgmt(MGMT_PROBE_REQ, BCAST, dev, BCAST, ie(IE_SSID, b"HomeNet") + ie(IE_RATES, RATES_BG))
     q.on_device_tx(probe)
     check(q.active_role == "ap" and q.ssid == "HomeNet", "probe request -> peer becomes an AP and adopts the SSID")
     sent3 = []
-    t = WifiPeer(str2mac("02:00:00:00:00:03"), FakeNet(), sent3.append, log=lambda *a: None, now_us=lambda: clock[0])
+    t = WifiPeer(str2mac("02:00:00:00:00:03"), FakeNet(), lambda f, d=None, _s=sent3: _s.append(f), log=lambda *a: None, now_us=lambda: clock[0])
     t.on_device_tx(t._mgmt(MGMT_PROBE_REQ, BCAST, dev, BCAST, ie(IE_SSID, b"tuya_mdev_test1") + ie(IE_RATES, RATES_BG)))
     check(t.ssid is None and not sent3, "Tuya factory-test SSID is not adopted or answered by default")
-    t2 = WifiPeer(str2mac("02:00:00:00:00:04"), FakeNet(), sent3.append, log=lambda *a: None, now_us=lambda: clock[0],
+    t2 = WifiPeer(str2mac("02:00:00:00:00:04"), FakeNet(), lambda f, d=None, _s=sent3: _s.append(f), log=lambda *a: None, now_us=lambda: clock[0],
                   role="ap", ssid="tuya_mdev_test1")
     t2.on_device_tx(t2._mgmt(MGMT_PROBE_REQ, BCAST, dev, BCAST, ie(IE_SSID, b"tuya_mdev_test1") + ie(IE_RATES, RATES_BG)))
     check(sent3 and fc_fields(sent3[-1])[1] == MGMT_PROBE_RESP, "...but answered when given explicitly as --wifi-ssid")
     sent4 = []
-    r = WifiPeer(str2mac("02:00:00:00:00:05"), FakeNet(), sent4.append, log=lambda *a: None, now_us=lambda: clock[0])
+    r = WifiPeer(str2mac("02:00:00:00:00:05"), FakeNet(), lambda f, d=None, _s=sent4: _s.append(f), log=lambda *a: None, now_us=lambda: clock[0])
     r.on_device_tx(r._mgmt(MGMT_PROBE_REQ, BCAST, dev, BCAST, ie(IE_SSID, b"tuya_mdev_test1") + ie(IE_RATES, RATES_BG)))
     check(r.active_role == "ap", "auto: a boot-time probe makes the peer an AP first")
     r.on_device_tx(r._mgmt(MGMT_BEACON, BCAST, dev, dev, struct.pack("<QHH", 0, 100, 0x0421)
@@ -597,7 +686,7 @@ def _run_selftests():
     print("== latency: frames reach the device after a delay ==")
     clk = [0]
     got = []
-    lp = WifiPeer(str2mac("02:00:00:00:00:06"), FakeNet(), got.append, log=lambda *a: None,
+    lp = WifiPeer(str2mac("02:00:00:00:00:06"), FakeNet(), lambda f, d=None, _s=got: _s.append(f), log=lambda *a: None,
                   now_us=lambda: clk[0], role="ap", ssid="Lat", latency_us=3000)
     lp.on_device_tx(lp._mgmt(MGMT_PROBE_REQ, BCAST, dev, BCAST, ie(IE_SSID, b"Lat") + ie(IE_RATES, RATES_BG)))
     check(not got, "probe response held back at first")
@@ -616,7 +705,7 @@ def _run_selftests():
     try:
         clk2 = [1_500_000]
         got2 = []
-        cp = WifiPeer(str2mac("02:00:00:00:00:07"), FakeNet(), got2.append, log=lambda *a: None,
+        cp = WifiPeer(str2mac("02:00:00:00:00:07"), FakeNet(), lambda f, d=None, _s=got2: _s.append(f), log=lambda *a: None,
                       now_us=lambda: clk2[0], role="ap", ssid="Cap", pcap=cap, latency_us=3000)
         probe2 = cp._mgmt(MGMT_PROBE_REQ, BCAST, dev, BCAST, ie(IE_SSID, b"Cap") + ie(IE_RATES, RATES_BG))
         cp.on_device_tx(probe2)

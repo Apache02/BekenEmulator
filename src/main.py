@@ -154,6 +154,13 @@ def parse_args():
                         help="SSID the peer beacons as an access point, or the one it joins as a "
                              "station. In the AP role without this, the first SSID the device "
                              "probes for is adopted.")
+    parser.add_argument("--wifi-pass", dest="wifi_pass", default=None, metavar="PASSPHRASE",
+                        help="Make the peer's access point WPA2-PSK protected with this "
+                             "passphrase instead of open. A paired device that stored a "
+                             "protected network will not join an open one of the same name, so "
+                             "this is what lets it on. The device must hold the same passphrase: "
+                             "the four-way handshake is how each side proves that, and the link "
+                             "carries no traffic until it completes.")
     parser.add_argument("--wifi-channel", dest="wifi_channel", type=int, default=1, metavar="N",
                         help="Channel the peer's access point announces (default 1).")
     parser.add_argument("--wifi-mac", dest="wifi_mac", default="02:00:00:00:00:01", metavar="MAC",
@@ -295,11 +302,13 @@ def main():
             tuyamcu_injects=parse_hex_blobs(args.tuyamcu_injects),
             xvr_selfclear=args.xvr_selfclear, ble_core=args.ble_core,
             wifi=(args.wifi or bool(args.wifi_peer) or bool(args.net_forwards) or bool(args.pcap)
-                  or bool(args.net_http_gets) or bool(args.wifi_ssid) or bool(args.mqtt_pubs)))
+                  or bool(args.net_http_gets) or bool(args.wifi_ssid) or bool(args.mqtt_pubs)
+                  or bool(args.wifi_pass)))
         if (args.wifi_peer or args.net_forwards or args.pcap or args.wifi_ssid
-                or args.net_http_gets or args.mqtt_pubs):
+                or args.net_http_gets or args.mqtt_pubs or args.wifi_pass):
             emu.attach_wifi_peer(role=args.wifi_peer or "auto", ssid=args.wifi_ssid,
                                  channel=args.wifi_channel, peer_mac=parse_mac(args.wifi_mac),
+                                 passphrase=args.wifi_pass,
                                  forwards=parse_forwards(args.net_forwards),
                                  net_out=args.net_out, pcap=args.pcap,
                                  http_gets=args.net_http_gets,

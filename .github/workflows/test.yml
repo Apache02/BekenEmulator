@@ -49,6 +49,9 @@ jobs:
     - name: Virtual 802.11 peer self-tests (no firmware)
       run: python src/wifipeer.py
 
+    - name: WPA2 (protected network) self-tests (no firmware)
+      run: python src/wpa2.py
+
     # The UI needs a display to build its widgets. xvfb gives it one; if it is
     # unavailable the self-tests report a skip rather than failing the build.
     - name: Simulator UI self-tests (no firmware)

@@ -531,7 +531,8 @@ class BekenEmulator:
         self.state.uart_at_line_start = True
 
     def attach_wifi_peer(self, role="auto", ssid=None, channel=1, peer_mac=None,
-                         forwards=(), net_out=False, pcap=None, http_gets=(), mqtt_pubs=()):
+                         forwards=(), net_out=False, pcap=None, http_gets=(), mqtt_pubs=(),
+                         passphrase=None):
         """Put a virtual station/access point and an IP network behind the MAC model.
 
         role "auto" lets the peer take the opposite role of whatever the
@@ -562,10 +563,14 @@ class BekenEmulator:
         net.on_frame = lambda d, f, us: (self.net_frame_sink(d, f, us)
                                          if self.net_frame_sink is not None else None)
         peer = _wifipeer.WifiPeer(
-            mac, net, inject=lambda f: self.wifimac.inject(f, self.state.insn_count),
+            mac, net,
+            # decr: what the device's MAC reports about decryption, set on a
+            # protected link so the firmware sees a frame its hardware decrypted.
+            inject=lambda f, decr=None: self.wifimac.inject(
+                f, self.state.insn_count, decr=decr),
             log=self.net_log, role=role, ssid=ssid, channel=channel, pcap=pcap,
             now_us=lambda: self.wifimac.now_us(self.state.insn_count),
-            latency_us=self.NET_LATENCY_US)
+            latency_us=self.NET_LATENCY_US, passphrase=passphrase)
         self.wifimac.on_tx = peer.on_device_tx
         self.wifi_peer = peer
         return peer
@@ -1604,7 +1609,8 @@ class BekenEmulator:
             if peer is not None:
                 # a peer attached before the load binds to the restored MAC
                 self.wifimac.on_tx = peer.on_device_tx
-                peer.inject = lambda f: self.wifimac.inject(f, self.state.insn_count)
+                peer.inject = lambda f, decr=None: self.wifimac.inject(
+                    f, self.state.insn_count, decr=decr)
                 peer.now_us = lambda: self.wifimac.now_us(self.state.insn_count)
         # The run starts where the snapshot was taken: a block boundary.
         pc = self.mu.reg_read(UC_ARM_REG_PC)
