@@ -1237,6 +1237,40 @@ TEST_CASES = [
                         "association response", "data", "HojnikB WiFi"],
     },
     {
+        # The bulb above, on air. It was written off as crashing in early
+        # init; past the RF-calibration stall it turns out to be a PAIRED dump
+        # that joins the network name still in its flash and reaches for the
+        # Tuya cloud - the second device in the suite to do so, after the
+        # 3-phase meter.
+        # That matters beyond one more device: it is independent confirmation
+        # of how Tuya secures the cloud link. A different device, a different
+        # SDK and a longer cipher list, and still every real suite it offers
+        # is a pre-shared-key one with no server name - no certificate
+        # anywhere. Its TLS library then stops at exactly the same place for
+        # exactly the same reason (mbedTLS -0x7600, "the own private key or
+        # pre-shared key is not set, but needed"), because an un-activated
+        # dump has no key to present.
+        "name": "BK7231N Tuya bulb (paired): joins its stored network and reaches the Tuya cloud",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231N_Tuya_Feconn_MR16_RGBCT_5ch_PWM_1000Hz_1.3.21.bin"),
+        "args": ["--only-uart", "-key", "TUYA", "--xvr-selfclear", "--wifi-peer", "auto"],
+        "timeout": 1200,
+        "expected_strings": [
+            "[WIFI] device probes for 'randomssid': adopting it as our SSID",
+            "[WIFI] station cc:8c:bf:4d:51:56 associated to 'randomssid' (AID 1)",
+            "[NET] DHCP: device cc:8c:bf:4d:51:56 got 192.168.1.100",
+            # Its cloud attempts, and what the handshake gives up in clear.
+            ":443 (accepted for capture)",
+            "client hello: version 1.2, 8 cipher suites",
+            "TLS_PSK_WITH_AES_128_CCM",
+            "no server name",
+            "answered with TLS_PSK_WITH_AES_256_CBC_SHA, waiting for the key identity",
+            # Same verdict as the meter: nothing to present.
+            "mbedtls_ssl_handshake returned 7600 -30208",
+            "resolve mqtt host Fail:m2.tuyaeu.com",
+        ],
+    },
+    {
         # EZ mode (SmartConfig), the third way a Tuya device is paired, and the
         # one that needs hardware support rather than ordinary frames: the
         # device puts the receiver into monitor mode and reads the lengths of
@@ -1295,15 +1329,27 @@ TEST_CASES = [
         # are literally AES-128-ECB-decrypt(0xFF x16) under the firmware's
         # hardcoded key "qwertyuiopasdfgh"), then dropped to mf_test with
         # "db init fails". Serving the dump's real bytes lets it decrypt its key.
-        "name": "BK7231N Tuya TempHum Sensor Reads Protected Key",
+        # It then used to stop dead a few lines later, which was put down to
+        # its being an unpaired dump parked in manufacturing test. That was
+        # wrong: it was spinning on the RF-calibration register at 0x9000f8,
+        # whose bit 31 the firmware sets and waits for the hardware to clear.
+        # With --xvr-selfclear it runs on - still in mf_test, but now actually
+        # driving its TuyaMCU link, which is what the last two markers show.
+        # The frame is Tuya's product-info query: 55 aa, version 00, command
+        # 01, zero length, checksum 00.
+        "name": "BK7231N Tuya TempHum Sensor Reads Protected Key and drives its TuyaMCU link",
         "binary": os.path.join(ROOT_DIR, "firmwares",
                                "BK7231N_Tuya_TempHum_LCD_Sensor_TuyaMCU_2025-26-9.bin"),
-        "args": ["--only-uart", "--uart1-hex", "-key", "TUYA"],
+        "args": ["--only-uart", "--uart1-hex", "-key", "TUYA", "--xvr-selfclear"],
         "timeout": 300,
         "expected_strings": [
             "key_addr: 0x1ee000",
             "get key:",
-            "0x6b 0x24 0x0 0x73 0xf4 0x11 0x45 0xed 0x40 0xf1 0x9 0x9f 0x16 0xd3 0xb5 0xc0"
+            "0x6b 0x24 0x0 0x73 0xf4 0x11 0x45 0xed 0x40 0xf1 0x9 0x9f 0x16 0xd3 0xb5 0xc0",
+            # Past the stall: the running app's periodic work, and real
+            # TuyaMCU bytes on UART1 (it sent 170 of these in one run).
+            "uart_wait_timeout_tm_cb",
+            ("[UART1/MCU] 55 aa 00 01 00 00 00", 3),
         ]
     },
     {
@@ -1316,7 +1362,11 @@ TEST_CASES = [
         "name": "BK7231N Tuya Plug (SDK 2.3.3) Boots and Reads Protected Key",
         "binary": os.path.join(ROOT_DIR, "firmwares",
                                "BK7231N_Tuya_Plug_TSL-PS-F4U-01-W_1.1.17.bin"),
-        "args": ["--only-uart", "--uart1-hex", "-key", "TUYA"],
+        # --xvr-selfclear: like the two above, this dump stopped at the
+        # RF-calibration spin at 0x9000f8 shortly after the key read. Past it
+        # the radio comes up and the firmware starts scanning, which the last
+        # marker shows.
+        "args": ["--only-uart", "--uart1-hex", "-key", "TUYA", "--xvr-selfclear"],
         "timeout": 300,
         "expected_strings": [
             "< TUYA IOT SDK V:2.3.3 BS:40.00_PT:2.2_LAN:3.4_CAD:1.0.5_CD:1.0.0 >",
@@ -1329,7 +1379,8 @@ TEST_CASES = [
             # were not served).
             "key_addr: 0x1ee000",
             "get key:",
-            "0xe7 0x10 0xac 0x15 0x88 0x2b 0x38 0x50 0xb2 0x9a 0xd 0xfa 0x35 0xbe 0x99 0x37"
+            "0xe7 0x10 0xac 0x15 0x88 0x2b 0x38 0x50 0xb2 0x9a 0xd 0xfa 0x35 0xbe 0x99 0x37",
+            "scan_start_req_handler",
         ]
     },
     {
@@ -1342,10 +1393,16 @@ TEST_CASES = [
         # SDK treats the device as unprovisioned and parks in mf_test. Only a
         # post-pair dump would boot on and drive the RN8209C over UART1. The
         # check is that it boots this far and reads the key.
-        "name": "BK7231N Tuya zmai90 RN8209C Energy Meter Boots",
+        # --xvr-selfclear for the same reason as the temp/humidity sensor
+        # above: without it this dump stopped at the RF-calibration spin a few
+        # lines past the key read (45 lines of log against 614 with it). The
+        # markers below are from the far side of that stall - the device
+        # identity it reports to its cloud stack, and the Wi-Fi status
+        # callback that only the running app reaches.
+        "name": "BK7231N Tuya zmai90 RN8209C Energy Meter Boots into its app",
         "binary": os.path.join(ROOT_DIR, "firmwares",
                                "BK7231N_Tuya_zmai90_RN8209C_EnergyMeter.bin"),
-        "args": ["--only-uart", "--uart1-hex", "-key", "TUYA"],
+        "args": ["--only-uart", "--uart1-hex", "-key", "TUYA", "--xvr-selfclear"],
         "timeout": 300,
         "expected_strings": [
             "< TUYA IOT SDK V:2.3.1 BS:40.00_PT:2.2_LAN:3.3_CAD:1.0.3_CD:1.0.0 >",
@@ -1353,7 +1410,9 @@ TEST_CASES = [
             "init protected data length 460",
             "key_addr: 0x1ee000",
             "get key:",
-            "0x80 0xd9 0xca 0xc2 0x32 0xb4 0x9c 0x30 0x6e 0x8b 0xc2 0x3d 0xf4 0x4c 0x39 0x7c"
+            "0x80 0xd9 0xca 0xc2 0x32 0xb4 0x9c 0x30 0x6e 0x8b 0xc2 0x3d 0xf4 0x4c 0x39 0x7c",
+            "upd product_id type:0 nqbs1onwskmmmaac",
+            "wf_nw_status_cb,wifi_status:0",
         ]
     },
     {
@@ -2189,16 +2248,29 @@ TEST_CASES = [
         #
         # A GU5.3 spotlight on IOT SDK 2.3.3 - the oldest N-family light SDK
         # in the suite next to the TuyaOS 3.3.x trio.
-        "name": "BK7231N Tuya Feconn MR16 RGBCT Bulb (pwm_new ch3) boots",
+        #
+        # It used to stop just past "ble remote ok" - 69 lines of log - which
+        # looked like a crash in early init. It was the RF-calibration spin at
+        # 0x9000f8: the firmware sets bit 31 and waits for the hardware to
+        # clear it. With --xvr-selfclear it reaches its running application
+        # (599 lines), brings the radio up and starts scanning. It is in fact
+        # a PAIRED dump: given a virtual peer it joins the network stored in
+        # its flash and reaches for the Tuya cloud, which the case below this
+        # one covers.
+        "name": "BK7231N Tuya Feconn MR16 RGBCT Bulb (pwm_new ch3) boots into its app",
         "binary": os.path.join(ROOT_DIR, "firmwares",
                                "BK7231N_Tuya_Feconn_MR16_RGBCT_5ch_PWM_1000Hz_1.3.21.bin"),
-        "args": ["--only-uart", "-key", "TUYA"],
+        "args": ["--only-uart", "-key", "TUYA", "--xvr-selfclear"],
         "timeout": 300,
         "expected_strings": [
             "< TUYA IOT SDK V:2.3.3 BS:40.00_PT:2.2_LAN:3.4_CAD:1.0.5_CD:1.0.0 >",
             "oem_bk7231n_light_ty:1.3.21",
             # Paired dump: skips manufacturing test at boot.
             "have actived over 15 min, not enter mf_init",
+            # Past the RF-calibration stall: the radio is up and the running
+            # app is retrying its connection.
+            "wpa_supplicant_req_scan",
+            "gw is long time(60) disconnect(stat:5), reconnect!!",
         ],
         "expected_pins": {6: 0x48, 7: 0x48, 9: 0x48, 24: 0x48, 26: 0x48},
         # All five declared channels at 26 MHz / 1000 = 0x6590; ch2 (P8) is
@@ -2592,7 +2664,13 @@ DESCRIPTIONS = {
         "the upper half of the channel map, where every bulb clusters on P6/P7/P8. 1000 Hz, "
         "matching its stored pwmhz. Its oem build (strip_ty 1.0.5, Apr 2020) is the oldest light "
         "firmware in the suite.",
-    "BK7231N Tuya Feconn MR16 RGBCT Bulb (pwm_new ch3) boots":
+    "BK7231N Tuya bulb (paired): joins its stored network and reaches the Tuya cloud":
+        "The bulb above once the emulator stops it stalling: it turns out to be a paired device "
+        "that joins the network name still in its flash and calls its cloud. It is the second "
+        "device here to confirm how Tuya secures that link, with a different SDK and a longer "
+        "cipher list but still no certificate and no server name, and it stops at the same point "
+        "for the same reason, having no key of its own to present.",
+    "BK7231N Tuya Feconn MR16 RGBCT Bulb (pwm_new ch3) boots into its app":
         "Completes N-family channel coverage: its cool channel sits on P9 = pwm_new ch3, the one "
         "channel the other three N lights leave idle. Group 1's CTRL enables only sub-channel 1 "
         "here, so it also proves the decoder honours per-sub enable bits. IOT SDK 2.3.3 - the "
@@ -2758,7 +2836,7 @@ DESCRIPTIONS = {
         "included to show the announcement is readable because every Tuya device encrypts it with "
         "the same key, not because of anything special about the meter. What it announces matches "
         "the product key passed on the command line, which rules out rubbish that merely parses.",
-    "BK7231N Tuya TempHum Sensor Reads Protected Key":
+    "BK7231N Tuya TempHum Sensor Reads Protected Key and drives its TuyaMCU link":
         "The stock Tuya temp/humidity sensor that first exposed the protected-key bug. With blank "
         "flash it failed the AES magic check and dropped to mf_test; serving the dump's real bytes "
         "lets it decrypt its key (get key).",
@@ -2873,7 +2951,7 @@ DESCRIPTIONS = {
         "the same 55 AA 00 00 00 00 FF frame OpenBeken emits. Also guards the physical "
         "flash-addressing model: both KV copies (current 0x1ed000, mirror 0x1cf000) must read "
         "valid with matching counts.",
-    "BK7231N Tuya zmai90 RN8209C Energy Meter Boots":
+    "BK7231N Tuya zmai90 RN8209C Energy Meter Boots into its app":
         "A stock Tuya energy meter (zmai90, RN8209C metering chip). A pre-pair (unactivated) dump: "
         "it reads its protected key but then parks in the mf_test thread, so it never polls the "
         "meter over UART1. Proves the boot + key read; the empty UART1 is the dump's provisioning "
