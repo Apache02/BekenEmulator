@@ -962,16 +962,32 @@ class TcpConn:
                 continue
             ident = tls_psk_identity(rec)
             if ident is not None:
-                text = ident.decode("utf-8", "replace")
+                if ident and all(32 <= b < 127 for b in ident):
+                    text = ident.decode("ascii")
+                else:
+                    text = "%d bytes (%s)" % (len(ident), ident.hex())
                 self.stack.log("[NET] TLS %s pre-shared key identity: %s"
                                % (self.log_prefix, text))
                 self.stack.tls_identities.append((self.log_prefix, ident))
                 continue
+            if rec[0] == 0x14:
+                # ChangeCipherSpec: everything the device sends after this is
+                # encrypted, including the Finished - which is itself a type
+                # 0x16 record, so it must NOT be fed back to the identity
+                # parser. Dropping to "raw" stops this responder being called
+                # again for the connection; the rest is captured, never read.
+                self.proto = "raw"
+                self.stack.log("[NET] TLS %s switched to encryption (ChangeCipherSpec); "
+                               "everything after this needs the device's own secret to read"
+                               % self.log_prefix)
+                return
             if rec[0] == 0x15:
+                self.proto = "raw"
                 self.stack.log("[NET] TLS %s alert, the device gave up on the handshake"
                                % self.log_prefix)
                 return
             if rec[0] == 0x17:
+                self.proto = "raw"
                 self.stack.log("[NET] TLS %s is encrypted from here on (%d bytes), which needs "
                                "the device's own secret to read" % (self.log_prefix, len(rec) - 5))
                 return
@@ -2134,6 +2150,27 @@ def _run_selftests():
     ts3.tick(1_200_000)
     check(any("encrypted from here on" in l for l in logsT2[n_logs:]),
           "once it switches to encryption, the stack says so rather than pretending to read it")
+
+    # After the device changes to encryption, its Finished is itself a type
+    # 0x16 record - the same type as the ClientKeyExchange - so if its ciphertext
+    # happened to look like one, it must still NOT be read as a second identity.
+    ce, sqc = open_capture(ts3, outT2, cloud, 8886, 6900, isn=41000)
+    sqc = dev_send(ts3, ce, cloud, 8886, 6900, sqc, real_hello)
+    ts3.tick(2_000_000)
+    before = len(ts3.tls_identities)
+    cke_rec = b"\x16\x03\x03" + struct.pack("!H", len(cke)) + cke
+    ccs_rec = b"\x14\x03\x03\x00\x01\x01"
+    # The real key exchange, the ChangeCipherSpec, then a record shaped exactly
+    # like another identity - standing in for an encrypted Finished that happens
+    # to collide with the ClientKeyExchange shape. All in one flight.
+    dev_send(ts3, ce, cloud, 8886, 6900, sqc, cke_rec + ccs_rec + cke_rec)
+    ts3.tick(2_100_000)
+    check(len(ts3.tls_identities) == before + 1,
+          "the identity is read once from the real key exchange; a matching record after "
+          "the ChangeCipherSpec is not read as a second one")
+    check(any("switched to encryption (ChangeCipherSpec)" in l for l in logsT2),
+          "the switch to encryption is reported instead of parsing past it")
+
     # A client offering only certificate suites gets no ServerHello: there is
     # nothing to learn, and answering would be inventing a certificate.
     logsT3, outT3 = [], []
