@@ -536,6 +536,9 @@ class HostIO:
         def work():
             try:
                 s = socket.create_connection((ip, port), timeout=10)
+                if self._stop:          # shut down while this was connecting
+                    s.close()
+                    return
                 s.setblocking(False)
                 conn.sock = s
                 with self.lock:
@@ -645,6 +648,30 @@ class HostIO:
             sock.close()
         except Exception:
             pass
+
+    def shutdown(self):
+        """Stop the thread and close every host socket, the listeners included.
+
+        A process that runs the emulator more than once (the GUI) needs this:
+        a listener left open keeps its port, so the next run's forward cannot
+        bind it and the old one goes on accepting connections nobody serves.
+        The thread stops first, so select() never sees a closed socket.
+        """
+        self._stop = True
+        if self.thread is not threading.current_thread():
+            self.thread.join(1.0)
+        with self.lock:
+            socks = list(self.listeners) + list(self.socks) + list(self.udp_socks)
+            socks += [c for c, _ in self.accepted]
+            self.listeners.clear()
+            self.socks.clear()
+            self.udp_socks.clear()
+            self.accepted.clear()
+        for s in socks:
+            try:
+                s.close()
+            except Exception:
+                pass
 
 
 # --------------------------------------------------------------------- TCP
@@ -1142,6 +1169,10 @@ class NetStack:
         # sent once the device subscribes to a filter that matches it.
         self.mqtt_pubs = list(mqtt_pubs)
         self._http_next_us = 0
+
+    def close(self):
+        """Release the host side: forward listeners, relayed sockets, the thread."""
+        self.io.shutdown()
 
     # --------------------------------------------------------------- output
     def send_eth(self, dst_mac, ethertype, payload):
@@ -2438,6 +2469,14 @@ def _run_selftests():
     check(got == page, "the whole page reaches the browser even though data and FIN came in one segment")
     check(got == page and not browser.recv(1), "then the browser sees the connection closed")
     browser.close()
+    # A process that runs more than once (the GUI) must get its port back.
+    fw.close()
+    check(not fw.io.thread.is_alive(), "close() stops the stack's host thread")
+    logs7 = []
+    again = NetStack(bytes.fromhex("020000000003"), log=logs7.append, gateway=False, forwards=[(fport, 80)])
+    check(any("forwarding 127.0.0.1:%d -> device:80" % fport in l for l in logs7),
+          "after close() the same port can be forwarded again by the next run")
+    again.close()
 
     print("== --net-out: device TCP relayed through a host socket (to 127.0.0.1 only) ==")
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

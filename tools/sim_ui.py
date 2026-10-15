@@ -28,6 +28,7 @@ Threading: Tk owns the main thread and every widget. The emulation runs on a
 worker thread and only ever touches a lock-guarded output buffer, so no Tk call
 is ever made from it. The UI polls that buffer on a timer.
 """
+import json
 import os
 import sys
 import re
@@ -45,8 +46,9 @@ sys.path.insert(0, ROOT_DIR)
 
 from src import netstack
 from src.crypto import KNOWN_KEYS, parse_key
-from src.emulator import CHIP_FAMILIES, CONSOLE_RX_HOLDOFF_INSNS, SLOW_TICK_INSNS, SLOW_TICK_MS
-from src.main import build_emulator, parse_hex_blobs
+from src.emulator import CHIP_FAMILIES, SLOW_TICK_INSNS, SLOW_TICK_MS
+from src.main import (WIFI_ROLES, build_emulator, check_tuyamcu_pid, check_wifi_pass,
+                      parse_forwards, parse_hex_blobs, parse_http_gets, parse_mqtt_pubs)
 # One decoder for the GPIO/PWM registers, shared with the self-test report -
 # so the pane below and the report's tables can never disagree.
 from src import periph
@@ -64,11 +66,6 @@ MAX_LINES = 4000        # per pane; older lines are dropped so a long run is bou
 # than a copy of its numbers. Used only to label the status bar - it is an
 # estimate, like insn_count itself.
 GUEST_SECOND_INSNS = SLOW_TICK_INSNS * (1000 // SLOW_TICK_MS)
-
-# The emulator holds queued RX bytes for exactly this long, so anything typed
-# earlier is delivered rather than lost - the indicator only says when the
-# firmware actually starts listening.
-CONSOLE_READY_INSNS = CONSOLE_RX_HOLDOFF_INSNS
 
 LINE_ENDINGS = {"CR+LF": b"\r\n", "LF": b"\n", "CR": b"\r", "(none)": b""}
 
@@ -120,9 +117,32 @@ NET_TITLE = "network - virtual Wi-Fi and IP bridge"
 # the window's memory at a few tens of MB on a very long run; older frames are
 # dropped and the window says how many.
 MAX_FRAMES = 20000
-NET_IDLE_HINT = ("Nothing on air yet. Tick \"Wi-Fi peer\" above before Run to attach the "
-                 "virtual radio and the IP bridge; this pane then shows every frame and "
-                 "connection, and what the device sent inside them.")
+# How to switch the bridge on, said by both the network pane and the
+# captured-traffic window while they are empty.
+WIFI_HOWTO = "Tick \"Wi-Fi peer\" on the Config tab before Run"
+NET_IDLE_HINT = ("Nothing on air yet. %s to attach the virtual radio and the IP bridge; this "
+                 "pane then shows every frame and connection, and what the device sent "
+                 "inside them." % WIFI_HOWTO)
+
+# Where the Config tab's choices are kept between launches. A per-user
+# convenience only: a missing or unreadable file just means the defaults.
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".bekensim_ui.json")
+
+# Every Config-tab option and its default. The defaults match the command
+# line's, so an untouched Config tab runs exactly what `main.py <image>` does.
+OPTION_DEFAULTS = {
+    "boot": False, "xvr_selfclear": False, "blecore": False,
+    "tuyamcu": False, "tuyamcu_pid": "", "tuyamcu_raw": False,
+    "wifi": False, "wifi_role": "auto", "wifi_ssid": "", "wifi_pass": "",
+    "fwd_local": "8080", "fwd_device": "80",
+    "pcap": False, "pcap_path": "",
+    "http_gets": "", "mqtt_pubs": "",
+}
+# The two options typed one-per-line in a small text box rather than an entry.
+TEXT_OPTIONS = ("http_gets", "mqtt_pubs")
+# Never written to the settings file: it may well be a real network's
+# passphrase, since that is the one a paired device has stored.
+UNSAVED_OPTIONS = ("wifi_pass",)
 
 
 # -chip collapses the whole BK7231 T/U/N/M/Q family onto one identity, so the
@@ -135,9 +155,18 @@ def guess_chip(path):
     return CLI_FAMILY.get(periph.chip_from_name(path), "BK7231")
 
 
+def _same_file(a, b):
+    """Whether two spellings name one file. On Windows the slashes, the case
+    and a relative path can all differ for the same dump."""
+    def norm(p):
+        return os.path.normcase(os.path.abspath(p))
+    return norm(a) == norm(b)
+
+
 class SimulatorUI:
-    def __init__(self, root, initial_image=None):
+    def __init__(self, root, initial_image=None, settings_path=CONFIG_PATH):
         self.root = root
+        self.settings_path = settings_path    # None: neither read nor write one
         root.title("BekenSimulator")
         root.minsize(1280, 620)
 
@@ -176,8 +205,24 @@ class SimulatorUI:
 
         self.history = []
         self.history_pos = None
+        self._pending_run = False     # a dropped image waits for the current run to stop
+        self._stop_requested = False
+        self.drop_enabled = False
+        self._drop_note = ""
 
-        self._build(initial_image or DEFAULT_IMAGE)
+        # Last session's choices. An image named on the command line (or
+        # dropped on the launcher) wins over the remembered one.
+        settings = self._load_settings()
+        saved = settings.get("image")
+        if not (isinstance(saved, str) and saved and os.path.isfile(saved)):
+            saved = None
+        start = initial_image or saved or DEFAULT_IMAGE
+        self._build(start)
+        # The remembered chip and key belong to the remembered image, so they
+        # only come back along with it - however the same file is spelled.
+        self._apply_settings(settings, same_image=(saved is not None and _same_file(start, saved)))
+        self.drop_enabled = self._enable_drop()
+        self._options_changed()
         self.root.after(POLL_MS, self._poll)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -202,18 +247,17 @@ class SimulatorUI:
         ttk.Combobox(cfg, textvariable=self.var_key, values=["(none)"] + sorted(KNOWN_KEYS),
                      state="readonly", width=9).pack(side="left", padx=(3, 10))
 
-        self.var_boot = tk.BooleanVar(value=False)
-        ttk.Checkbutton(cfg, text="boot ROM", variable=self.var_boot).pack(side="left")
-        self.var_tuyamcu = tk.BooleanVar(value=False)
-        ttk.Checkbutton(cfg, text="TuyaMCU peer", variable=self.var_tuyamcu).pack(side="left", padx=(8, 0))
-        self.var_blecore = tk.BooleanVar(value=False)
-        ttk.Checkbutton(cfg, text="BLE core", variable=self.var_blecore).pack(side="left", padx=(8, 0))
-        # Wi-Fi MAC model + virtual AP/station + IP network (src/wifimac.py,
-        # wifipeer.py, netstack.py). The device's port 80 is forwarded to
-        # 127.0.0.1:8080, so a browser reaches the firmware's own web panel.
-        self.var_wifi = tk.BooleanVar(value=False)
-        ttk.Checkbutton(cfg, text="Wi-Fi peer (127.0.0.1:8080 -> :80)",
-                        variable=self.var_wifi).pack(side="left", padx=(8, 0))
+        # Every other choice lives on the Config tab. The variables are made
+        # here, before any widget, so the summary line can follow them.
+        self.opt = {}
+        for name, default in OPTION_DEFAULTS.items():
+            if name in TEXT_OPTIONS:
+                continue                     # multi-line boxes, made on the Config tab
+            var = (tk.BooleanVar(value=default) if isinstance(default, bool)
+                   else tk.StringVar(value=default))
+            var.trace_add("write", lambda *_a: self._options_changed())
+            self.opt[name] = var
+        self.opt_text = {}
 
         run = ttk.Frame(self.root)
         run.pack(fill="x", padx=6)
@@ -227,6 +271,13 @@ class SimulatorUI:
         self.btn_stop.pack(side="left")
         ttk.Button(run, text="Clear", command=self._clear, width=10).pack(side="left", padx=(12, 0))
         ttk.Button(run, text="Save log...", command=self._save, width=10).pack(side="left", padx=4)
+        # What the next Run will use, so the choices made on the Config tab
+        # stay visible while watching the Run tab.
+        self.var_summary = tk.StringVar(value="")
+        # width=1: the row's fill sizes it, not its text, so typing in an
+        # option field does not make the whole window grow.
+        ttk.Label(run, textvariable=self.var_summary, anchor="w", width=1).pack(
+            side="left", fill="x", expand=True, padx=(12, 0))
 
         self.var_state = tk.StringVar(value="idle - pick an image and press Run")
         state = ttk.Label(self.root, textvariable=self.var_state, anchor="w",
@@ -237,15 +288,24 @@ class SimulatorUI:
         # a full-width strip under them, in a draggable split. Its lines are
         # long (a decoded Tuya announcement is a whole JSON object), so width
         # matters more to it than height.
-        split = ttk.PanedWindow(self.root, orient="vertical")
-        split.pack(fill="both", expand=True, padx=6)
+        # Two tabs: Run holds everything that shows a run; Config holds every
+        # choice that shapes the next one.
+        self.tabs = ttk.Notebook(self.root)
+        self.tabs.pack(fill="both", expand=True, padx=6)
+        self.run_tab = ttk.Frame(self.tabs)
+        self.config_tab = ttk.Frame(self.tabs, padding=8)
+        self.tabs.add(self.run_tab, text="Run")
+        self.tabs.add(self.config_tab, text="Config")
+
+        split = ttk.PanedWindow(self.run_tab, orient="vertical")
+        split.pack(fill="both", expand=True)
 
         panes = ttk.PanedWindow(split, orient="horizontal")
 
         left = ttk.LabelFrame(panes, text="UART1 - MCU link / command console", padding=4)
         self.txt1 = self._console(left, mono)
         opts = ttk.Frame(left)
-        opts.pack(fill="x", pady=(4, 0))
+        opts.pack(side="bottom", fill="x", pady=(4, 0), before=self.txt1.master)
         self.var_hex = tk.BooleanVar(value=False)
         ttk.Checkbutton(opts, text="show as hex", variable=self.var_hex).pack(side="left")
         ttk.Button(opts, text="Copy", width=7,
@@ -274,17 +334,20 @@ class SimulatorUI:
         self.tree.tag_configure("out", foreground="#0b6b3a")       # driven output
         self.tree.tag_configure("func", foreground="#14448f")      # peripheral owns the pad
 
+        # Packed bottom-up ahead of the table, like the rows under the logs,
+        # so a short window squeezes the table and not these.
         self.var_pwm = tk.StringVar(value="no PWM channels decoded yet")
-        ttk.Label(peri, textvariable=self.var_pwm, anchor="w",
-                  wraplength=300, justify="left").pack(fill="x", pady=(4, 0))
         self.var_all_pins = tk.BooleanVar(value=False)
         ttk.Checkbutton(peri, text="show untouched pins", variable=self.var_all_pins,
-                        command=self._refresh_periph).pack(anchor="w")
+                        command=self._refresh_periph).pack(side="bottom", anchor="w", before=pf)
+        ttk.Label(peri, textvariable=self.var_pwm, anchor="w",
+                  wraplength=300, justify="left").pack(side="bottom", fill="x", pady=(4, 0),
+                                                       before=pf)
 
         right = ttk.LabelFrame(panes, text="UART2 - firmware debug log", padding=4)
         self.txt2 = self._console(right, mono)
         ropts = ttk.Frame(right)
-        ropts.pack(fill="x", pady=(4, 0))
+        ropts.pack(side="bottom", fill="x", pady=(4, 0), before=self.txt2.master)
         self.var_hide_tick = tk.BooleanVar(value=False)
         ttk.Checkbutton(ropts, text="suppress %s" % QUICKTICK,
                         variable=self.var_hide_tick).pack(side="left")
@@ -307,8 +370,10 @@ class SimulatorUI:
         self.txt_net.tag_configure("wifi", foreground="#8ab4f8")    # 802.11 link
         self.txt_net.tag_configure("net", foreground="#7fd6a0")     # IP and above
         self.txt_net.tag_configure("payload", foreground="#e8c06a")  # decoded contents
+        # Each control row under a log is packed ahead of the log itself, so a
+        # short window squeezes the text rather than hiding the controls.
         nopts = ttk.Frame(self.net_frame)
-        nopts.pack(fill="x", pady=(4, 0))
+        nopts.pack(side="bottom", fill="x", pady=(4, 0), before=self.txt_net.master)
         self.var_net_ip_only = tk.BooleanVar(value=False)
         ttk.Checkbutton(nopts, text="IP traffic only (hide Wi-Fi link)",
                         variable=self.var_net_ip_only).pack(side="left")
@@ -323,8 +388,10 @@ class SimulatorUI:
         self._append(self.txt_net, NET_IDLE_HINT + "\n", "note")
         self._net_hint_shown = True
 
-        send = ttk.LabelFrame(self.root, text="send to UART1", padding=6)
-        send.pack(fill="x", padx=6, pady=(4, 6))
+        send = ttk.LabelFrame(self.run_tab, text="send to UART1", padding=6)
+        # Packed ahead of the panes so a short window squeezes the logs, not
+        # the one place commands are typed.
+        send.pack(side="bottom", fill="x", pady=(4, 6), before=split)
 
         typed = ttk.Frame(send)
         typed.pack(fill="x")
@@ -356,6 +423,367 @@ class SimulatorUI:
                              command=lambda c=cmd: self._send_command(c))
             btn.grid(row=row, column=col + 1, sticky="w", padx=(0, 4), pady=(0, 2))
             self.quick_buttons.append(btn)
+
+        self._ui_ready = False
+        self._build_config(self.config_tab, mono)
+        self._ui_ready = True
+        self._options_changed()
+
+    # ------------------------------------------------------------ Config tab
+    def _build_config(self, tab, mono):
+        """Every option the command line has for a run, grouped, each with a
+        one-line note on what it is for."""
+        tab.columnconfigure(0, weight=1)
+        tab.columnconfigure(1, weight=1)
+        self.opt_widgets = {}          # option name -> widgets that depend on another option
+
+        def group(col, title):
+            box = ttk.LabelFrame(tab, text=title, padding=8)
+            box.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 6, 0))
+            box.columnconfigure(2, weight=1)
+            return box
+
+        def note(box, row, text):
+            ttk.Label(box, text=text, foreground="#5b6472", wraplength=300,
+                      justify="left").grid(row=row, column=2, sticky="w", padx=(10, 0), pady=3)
+
+        def check(box, row, name, text, help_):
+            w = ttk.Checkbutton(box, text=text, variable=self.opt[name])
+            w.grid(row=row, column=0, columnspan=2, sticky="w", pady=3)
+            note(box, row, help_)
+            return w
+
+        def entry(box, row, name, text, help_, width=20):
+            ttk.Label(box, text=text).grid(row=row, column=0, sticky="w", padx=(18, 6), pady=3)
+            w = ttk.Entry(box, textvariable=self.opt[name], width=width)
+            w.grid(row=row, column=1, sticky="w", pady=3)
+            note(box, row, help_)
+            return w
+
+        dev = group(0, "Device")
+        check(dev, 0, "boot", "boot ROM",
+              "Start in the bootloader at 0x0 instead of jumping into the app.")
+        check(dev, 1, "xvr_selfclear", "RF calibration self-clear",
+              "Clear the radio calibration bit at 0x9000f8. Many stock dumps stall "
+              "early without it.")
+        check(dev, 2, "blecore", "BLE core",
+              "Model the Bluetooth controller, for dumps whose Bluetooth starts at boot.")
+        check(dev, 3, "tuyamcu", "TuyaMCU peer",
+              "Answer the TuyaMCU serial protocol on UART1, as the device's MCU would.")
+        pid = entry(dev, 4, "tuyamcu_pid", "product ID",
+                    "The 16-character id the MCU reports; stock firmware checks it "
+                    "against its own. Empty uses a built-in one.")
+        raw = ttk.Checkbutton(dev, text="raw product info", variable=self.opt["tuyamcu_raw"])
+        raw.grid(row=5, column=0, columnspan=2, sticky="w", padx=(18, 0), pady=3)
+        note(dev, 5, "Send product info in the raw 16-byte form newer TuyaOS needs, not JSON.")
+        self.opt_widgets["tuyamcu"] = [pid, raw]
+
+        net = group(1, "Network (offline: nothing leaves this machine)")
+        check(net, 0, "wifi", "Wi-Fi peer",
+              "Attach a virtual radio peer and an offline IP network: DHCP, DNS, and "
+              "local answers to HTTP, MQTT and TLS.")
+        ttk.Label(net, text="role").grid(row=1, column=0, sticky="w", padx=(18, 6), pady=3)
+        role = ttk.Combobox(net, textvariable=self.opt["wifi_role"], values=list(WIFI_ROLES),
+                            state="readonly", width=8)
+        role.grid(row=1, column=1, sticky="w", pady=3)
+        note(net, 1, "auto takes the opposite role to whatever the device turns out to be.")
+        ssid = entry(net, 2, "wifi_ssid", "network name",
+                     "Empty adopts whichever network the device asks for.")
+        pw = entry(net, 3, "wifi_pass", "passphrase",
+                   "Makes the access point WPA2 protected. A paired device only joins with "
+                   "the passphrase it stored. Not saved between launches.")
+        pw.configure(show="*")
+        ttk.Label(net, text="forward").grid(row=4, column=0, sticky="w", padx=(18, 6), pady=3)
+        fwd = ttk.Frame(net)
+        fwd.grid(row=4, column=1, sticky="w", pady=3)
+        ttk.Label(fwd, text="127.0.0.1:").pack(side="left")
+        f_local = ttk.Entry(fwd, textvariable=self.opt["fwd_local"], width=6)
+        f_local.pack(side="left")
+        ttk.Label(fwd, text=" to device:").pack(side="left")
+        f_dev = ttk.Entry(fwd, textvariable=self.opt["fwd_device"], width=5)
+        f_dev.pack(side="left")
+        note(net, 4, "A local port forwarded to a device port, e.g. its web panel. Clear both "
+                     "to turn it off.")
+        pcap = ttk.Checkbutton(net, text="radio capture", variable=self.opt["pcap"])
+        pcap.grid(row=5, column=0, sticky="w", padx=(18, 0), pady=3)
+        pfile = ttk.Frame(net)
+        pfile.grid(row=5, column=1, sticky="w", pady=3)
+        p_entry = ttk.Entry(pfile, textvariable=self.opt["pcap_path"], width=14)
+        p_entry.pack(side="left")
+        p_browse = ttk.Button(pfile, text="...", width=3, command=self._browse_pcap)
+        p_browse.pack(side="left", padx=(2, 0))
+        note(net, 5, "Save every 802.11 frame to a pcap file for Wireshark. The IP-level "
+                     "capture is in the network pane's Details window.")
+
+        def lines_box(row, name, label, help_):
+            ttk.Label(net, text=label).grid(row=row, column=0, sticky="nw", padx=(18, 6), pady=3)
+            box = tk.Text(net, height=3, width=28, font=mono, undo=True)
+            box.grid(row=row, column=1, sticky="w", pady=3)
+            note(net, row, help_)
+            self.opt_text[name] = box
+            # Text has no variable to trace; <<Modified>> fires once per change
+            # of its flag, so the flag is reset each time to hear the next one.
+            box.bind("<<Modified>>", lambda _e, b=box: (b.edit_modified(False),
+                                                        self._options_changed()))
+            return box
+
+        gets = lines_box(6, "http_gets", "HTTP GET",
+                         "One path per line, requested from the device's port 80 once it "
+                         "is reachable. E.g. /cm?cmnd=POWER%20ON")
+        pubs = lines_box(7, "mqtt_pubs", "MQTT messages",
+                         "One TOPIC=PAYLOAD per line, pushed to the device once it "
+                         "subscribes to a matching topic.")
+        self.opt_widgets["wifi"] = [role, ssid, pw, f_local, f_dev, pcap, p_entry, p_browse,
+                                    gets, pubs]
+        self.opt_widgets["pcap"] = [p_entry, p_browse]
+
+        foot = ttk.Frame(tab)
+        foot.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Button(foot, text="Reset to defaults", command=self._reset_options).pack(side="left")
+        self.var_cfg_note = tk.StringVar(value="")
+        ttk.Label(foot, textvariable=self.var_cfg_note, foreground="#5b6472").pack(
+            side="left", padx=(12, 0))
+
+    def _options_changed(self):
+        """Keep dependent fields and the summary line in step with the options."""
+        if not getattr(self, "_ui_ready", False):
+            return
+        wifi = self.opt["wifi"].get()
+        for name, widgets in self.opt_widgets.items():
+            on = self.opt[name].get()
+            if name == "pcap":
+                on = on and wifi            # a capture needs the radio peer at all
+            for w in widgets:
+                state = "normal" if on else "disabled"
+                if isinstance(w, ttk.Combobox):
+                    state = "readonly" if on else "disabled"
+                w.configure(state=state)
+                if isinstance(w, tk.Text):
+                    # ttk widgets grey out when disabled; a tk.Text does not,
+                    # so it is given the look by hand. configure(opt)[3] is the
+                    # option's default, which keeps this right on any platform.
+                    w.configure(
+                        background=(w.configure("background")[3] if on
+                                    else ttk.Style().lookup("TFrame", "background")),
+                        foreground=w.configure("foreground")[3] if on else "gray50")
+        self.var_summary.set(self._summary_text())
+        self.var_cfg_note.set("Choices are remembered between launches. " + self._drop_note)
+
+    def _summary_text(self):
+        """One line naming what the next Run will use beyond the defaults."""
+        o = self._option_values()
+        parts = []
+        if o["boot"]:
+            parts.append("boot ROM")
+        if o["xvr_selfclear"]:
+            parts.append("RF-cal self-clear")
+        if o["blecore"]:
+            parts.append("BLE core")
+        if o["tuyamcu"]:
+            extra = [x for x in (o["tuyamcu_pid"].strip(), "raw" if o["tuyamcu_raw"] else "") if x]
+            parts.append("TuyaMCU" + (" (%s)" % ", ".join(extra) if extra else ""))
+        if o["wifi"]:
+            extra = [o["wifi_role"]]
+            if o["wifi_ssid"].strip():
+                extra.append("'%s'" % o["wifi_ssid"])
+            # Named either way: the passphrase is not remembered, so after a
+            # relaunch this is where "open" shows instead of "WPA2".
+            extra.append("WPA2" if o["wifi_pass"] else "open")
+            if o["fwd_local"].strip() and o["fwd_device"].strip():
+                extra.append(":%s to :%s" % (o["fwd_local"].strip(), o["fwd_device"].strip()))
+            if o["pcap"]:
+                extra.append("capturing")
+            for name, label in (("http_gets", "HTTP GET"), ("mqtt_pubs", "MQTT")):
+                count = sum(1 for line in o[name].splitlines() if line.strip())
+                if count:
+                    extra.append("%d %s" % (count, label))
+            parts.append("Wi-Fi peer (%s)" % ", ".join(extra))
+        return "options: " + (", ".join(parts) if parts else "none (Config tab)")
+
+    def _collect_cfg(self):
+        """Every option as plain values for the worker thread, checked first.
+
+        Raises ValueError with a message fit for a dialog, so a typo is caught
+        before anything is loaded rather than surfacing as a failed run. The
+        rules themselves are the command line's (src/main.py), so both front
+        ends accept exactly the same values.
+        """
+        o = self._option_values()
+
+        def field(label, check, value):
+            # The shared checks name the command-line flag; the dialog leads
+            # with the field's name on this tab.
+            try:
+                return check(value)
+            except ValueError as e:
+                raise ValueError("%s: %s" % (label, e))
+
+        def lines(name):
+            return [line.strip() for line in o[name].splitlines() if line.strip()]
+
+        tuyamcu = o["tuyamcu"]
+        cfg = {"chip": self.var_chip.get(), "key": self.var_key.get(),
+               "boot": o["boot"], "xvr_selfclear": o["xvr_selfclear"],
+               "blecore": o["blecore"], "tuyamcu": tuyamcu,
+               "tuyamcu_pid": (field("Product ID", check_tuyamcu_pid,
+                                     o["tuyamcu_pid"].strip() or None) if tuyamcu else None),
+               "tuyamcu_raw": o["tuyamcu_raw"] if tuyamcu else False,
+               "wifi": o["wifi"]}
+        if not o["wifi"]:
+            return cfg
+        # Both ports empty turns the forward off; anything else must parse
+        # the way the command line's LPORT:DPORT does.
+        lp, dp = o["fwd_local"].strip(), o["fwd_device"].strip()
+        forwards = (field("Port forward", parse_forwards, ["%s:%s" % (lp, dp)])
+                    if lp or dp else [])
+        pcap = None
+        if o["pcap"]:
+            pcap = o["pcap_path"].strip()
+            if not pcap:
+                raise ValueError("Radio capture is ticked but no file is set.")
+            if not os.path.isdir(os.path.dirname(os.path.abspath(pcap))):
+                raise ValueError("Radio capture: the folder for %s does not exist." % pcap)
+        cfg.update({"wifi_role": o["wifi_role"],
+                    # Neither is stripped: an SSID is matched exactly and salts
+                    # the WPA2 key, and spaces are part of a passphrase.
+                    "wifi_ssid": o["wifi_ssid"] if o["wifi_ssid"].strip() else None,
+                    "wifi_pass": field("Passphrase", check_wifi_pass, o["wifi_pass"] or None),
+                    "forwards": forwards, "pcap": pcap,
+                    "http_gets": field("HTTP GET", parse_http_gets, lines("http_gets")),
+                    "mqtt_pubs": field("MQTT messages", parse_mqtt_pubs, lines("mqtt_pubs"))})
+        return cfg
+
+    def _browse_pcap(self):
+        path = filedialog.asksaveasfilename(defaultextension=".pcap",
+                                            filetypes=[("pcap", "*.pcap"), ("All", "*.*")])
+        if path:
+            self.opt["pcap_path"].set(path)
+
+    def _set_text_option(self, name, value):
+        """Replace a multi-line option's text. A disabled Text ignores edits,
+        so it is opened for the change and put back as it was."""
+        box = self.opt_text[name]
+        state = box.cget("state")
+        box.configure(state="normal")
+        box.delete("1.0", "end")
+        box.insert("1.0", value)
+        box.edit_reset()          # a load is not an edit Ctrl+Z should take back
+        box.configure(state=state)
+
+    def _option_values(self):
+        """Every option's current value, the text boxes included."""
+        o = {name: var.get() for name, var in self.opt.items()}
+        o.update((name, box.get("1.0", "end-1c")) for name, box in self.opt_text.items())
+        return o
+
+    def _set_option(self, name, value):
+        if name in TEXT_OPTIONS:
+            self._set_text_option(name, value)
+        else:
+            self.opt[name].set(value)
+
+    def _reset_options(self):
+        for name, default in OPTION_DEFAULTS.items():
+            self._set_option(name, default)
+
+    # ------------------------------------------------------- saved settings
+    def _load_settings(self):
+        if not self.settings_path:
+            return {}
+        try:
+            with open(self.settings_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _apply_settings(self, data, same_image=True):
+        """Restore saved choices; anything missing or of the wrong type keeps
+        its default rather than breaking the window."""
+        for name, default in OPTION_DEFAULTS.items():
+            value = data.get(name)
+            if name in UNSAVED_OPTIONS or not isinstance(value, type(default)):
+                continue
+            if name == "wifi_role" and value not in WIFI_ROLES:
+                continue
+            self._set_option(name, value)
+        if same_image:
+            # Checked as str first: a list or dict here would make the
+            # membership tests raise, and the window would never open.
+            chip, key = data.get("chip"), data.get("key")
+            if isinstance(chip, str) and chip in CHIP_FAMILIES:
+                self.var_chip.set(chip)
+            if isinstance(key, str) and (key in KNOWN_KEYS or key == "(none)"):
+                self.var_key.set(key)
+
+    def _settings_data(self):
+        image = self.var_image.get().strip()
+        # Absolute, so it still resolves when the GUI starts from elsewhere.
+        data = {"image": os.path.abspath(image) if image else "",
+                "chip": self.var_chip.get(), "key": self.var_key.get()}
+        data.update((name, value) for name, value in self._option_values().items()
+                    if name not in UNSAVED_OPTIONS)
+        return data
+
+    def _save_settings(self):
+        if not self.settings_path:
+            return
+        # Written aside and swapped in, so a failed write leaves the previous
+        # settings rather than a truncated file that loads as defaults.
+        tmp = self.settings_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._settings_data(), f, indent=1)
+            os.replace(tmp, self.settings_path)
+        except OSError:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass                 # a convenience; never worth an error dialog
+
+    # ---------------------------------------------------------- drag and drop
+    def _enable_drop(self):
+        """Accept files dropped on the window. Needs the optional tkinterdnd2
+        package and a root made by its TkinterDnD.Tk (see main()); without
+        them the window simply does not take drops, and the Config tab says
+        why."""
+        try:
+            from tkinterdnd2 import DND_FILES
+        except ImportError:
+            self._drop_note = "Install tkinterdnd2 (pip) to drop .bin files on the window."
+            return False
+        try:
+            self.root.drop_target_register(DND_FILES)
+            self.root.dnd_bind("<<Drop>>", self._on_drop)
+        except Exception:
+            self._drop_note = ("tkinterdnd2 is installed but its tkdnd library did not load, "
+                               "so files cannot be dropped on the window.")
+            return False
+        self._drop_note = "Drop a .bin file on the window to load and run it."
+        return True
+
+    def _on_drop(self, event):
+        paths = [p for p in self.root.tk.splitlist(event.data) if os.path.isfile(p)]
+        if not paths:
+            self.var_state.set("that drop held no file to load")
+            return getattr(event, "action", None)
+        self._load_image(paths[0], run=True)
+        return getattr(event, "action", None)
+
+    def _load_image(self, path, run=False):
+        """Point the window at an image and, if asked, run it - stopping a run
+        in progress first, so a drop always means 'run this one now'."""
+        self.var_image.set(path)
+        self.var_chip.set(guess_chip(path))
+        self.tabs.select(self.run_tab)
+        if not run:
+            return
+        if self.thread is not None and self.thread.is_alive():
+            self._pending_run = True
+            self._on_stop()
+            self.var_state.set("stopping the current run to start %s ..." % os.path.basename(path))
+        else:
+            self._on_run()
 
     def _console(self, parent, mono, height=18):
         frame = ttk.Frame(parent)
@@ -516,8 +944,8 @@ class SimulatorUI:
         if self._frames_dropped:
             note += " (the earliest %d were dropped)" % self._frames_dropped
         if not total:
-            note = ("Nothing captured yet. Tick \"Wi-Fi peer\" before Run; every frame the "
-                    "bridge carries then appears here with its bytes.")
+            note = ("Nothing captured yet. %s; every frame the bridge carries then appears "
+                    "here with its bytes." % WIFI_HOWTO)
         self.var_frame_count.set(note)
         if not shown:
             return
@@ -728,8 +1156,7 @@ class SimulatorUI:
             initialdir=FIRMWARE_DIR if os.path.isdir(FIRMWARE_DIR) else ROOT_DIR,
             filetypes=[("Flash dumps", "*.bin"), ("All files", "*.*")])
         if path:
-            self.var_image.set(path)
-            self.var_chip.set(guess_chip(path))
+            self._load_image(path)
 
     # --------------------------------------------------------------- run/stop
     def _sink(self, port, byte):
@@ -770,6 +1197,15 @@ class SimulatorUI:
         if not path or not os.path.isfile(path):
             messagebox.showerror("BekenSimulator", "Pick a flash dump first.")
             return
+        # Read every Tk variable HERE, on the main thread. Tkinter is not
+        # thread-safe, so the worker gets plain values, never widgets.
+        try:
+            cfg = self._collect_cfg()
+        except ValueError as e:
+            self.tabs.select(self.config_tab)
+            messagebox.showerror("BekenSimulator", str(e))
+            return
+        self._save_settings()
 
         self._clear()
         self._periph_key = None
@@ -779,23 +1215,26 @@ class SimulatorUI:
         self._last_rate_at = None
         self.finished = self.error = None
         self.emu = None
+        self._stop_requested = False
+        self._pending_run = False         # whatever was waiting to run, this is it
+        # Bytes the previous worker queued after the last drain belong to the
+        # run that just ended, not to this one. Nothing writes here now: the
+        # old thread is dead (checked above) and the new one has not started.
+        with self._out_lock:
+            for buf in self._out.values():
+                buf.clear()
         self.started_at = time.time()
 
         self.btn_run.config(state="disabled")
         self.btn_stop.config(state="normal")
         self.btn_pause.config(state="normal", text="Pause")
         self.var_state.set("loading %s ..." % os.path.basename(path))
-
-        # Read every Tk variable HERE, on the main thread. Tkinter is not
-        # thread-safe, so the worker gets plain values, never widgets.
-        cfg = {"chip": self.var_chip.get(), "key": self.var_key.get(),
-               "boot": self.var_boot.get(), "tuyamcu": self.var_tuyamcu.get(),
-               "blecore": self.var_blecore.get(), "wifi": self.var_wifi.get()}
         self.thread = threading.Thread(target=self._worker, args=(path, cfg), daemon=True)
         self.thread.start()
 
     def _worker(self, path, cfg):
         """Load, set up and run the emulator. Never touches Tk - see cfg."""
+        emu = None
         try:
             key = None if cfg["key"] == "(none)" else parse_key(cfg["key"])
             emu = build_emulator(
@@ -808,6 +1247,9 @@ class SimulatorUI:
                 # hex tagging is left off and everything arrives via the sink.
                 uart1_hex=False,
                 tuyamcu=cfg["tuyamcu"],
+                tuyamcu_pid=cfg["tuyamcu_pid"],
+                tuyamcu_raw=cfg["tuyamcu_raw"],
+                xvr_selfclear=cfg["xvr_selfclear"],
                 ble_core=cfg["blecore"],
                 wifi=cfg["wifi"],
                 uart_sink=self._sink,
@@ -819,13 +1261,33 @@ class SimulatorUI:
             emu.net_sink = self._net_sink
             emu.net_frame_sink = self._frame_sink
             if cfg["wifi"]:
-                emu.attach_wifi_peer(role="auto", forwards=[(8080, 80)])
+                # net_out is never set: the GUI's network stays offline, and
+                # what the device tries to reach is logged, not reached.
+                emu.attach_wifi_peer(role=cfg["wifi_role"], ssid=cfg["wifi_ssid"],
+                                     passphrase=cfg["wifi_pass"], forwards=cfg["forwards"],
+                                     pcap=cfg["pcap"], http_gets=cfg["http_gets"],
+                                     mqtt_pubs=cfg["mqtt_pubs"])
             emu.setup()
             self.emu = emu
+            # A Stop pressed while loading found no emulator to stop; honour
+            # it now. (stop() before run() is fine: run() keeps the flag.)
+            if self._stop_requested:
+                emu.stop()
             emu.run()
-            self.finished = "emulation finished"
-        except Exception as e:            # bad key, unreadable image, Unicorn error
+            # run() catches what ends it early (a firmware fault, a Python
+            # error in a peripheral) and only prints it, to a console the GUI
+            # may not have; it keeps the reason for front ends like this one.
+            if emu.run_error:
+                self.error = emu.run_error
+            else:
+                self.finished = "emulation finished"
+        except Exception as e:            # bad key, unreadable image, a setup error
             self.error = "%s: %s" % (type(e).__name__, e)
+        finally:
+            # The next run in this window needs the forward port back, and a
+            # capture file should be complete once the run is over.
+            if emu is not None:
+                emu.close_network()
 
     def _on_pause(self):
         if self.emu is None:
@@ -838,25 +1300,35 @@ class SimulatorUI:
             self.btn_pause.config(text="Resume")
 
     def _on_stop(self):
+        self._stop_requested = True
         if self.emu is not None:
             self.emu.stop()
         self.btn_stop.config(state="disabled")
         self.btn_pause.config(state="disabled", text="Pause")
 
     def _on_close(self):
+        self._save_settings()
         if self.emu is not None:
             self.emu.stop()
         self.root.destroy()
 
     # ------------------------------------------------------------------ send
-    def _console_ready(self):
+    def _running(self):
+        """An emulator exists and its thread is still going. self.emu stays
+        set after a run ends, so it alone does not mean anything is running."""
         return (self.emu is not None and self.thread is not None
-                and self.thread.is_alive()
-                and self.emu.state.insn_count >= CONSOLE_READY_INSNS)
+                and self.thread.is_alive())
+
+    def _console_ready(self):
+        # The emulator holds queued RX bytes for its own uart1_rx_delay (none
+        # with a TuyaMCU peer, which only answers what the firmware sent), so
+        # anything typed earlier is delivered rather than lost; this only says
+        # when the firmware starts listening.
+        return self._running() and self.emu.state.insn_count >= self.emu.uart1_rx_delay
 
     def _send_bytes(self, payload):
         """Put raw bytes on UART1 and show them in the pane."""
-        if self.emu is None:
+        if not self._running():
             return
         self.emu.feed_uart1(payload)
         # The firmware does not echo, so show the line locally - otherwise the
@@ -880,7 +1352,9 @@ class SimulatorUI:
         self.history_pos = None
 
     def _on_send(self):
-        if self.emu is None:
+        # Enter reaches here even with the Send button disabled, so a finished
+        # run must be refused here too, before the text is echoed as sent.
+        if not self._running():
             return
         text = self.var_input.get()
         if not text and self.var_mode.get() == "HEX":
@@ -986,7 +1460,9 @@ class SimulatorUI:
     def _update_state(self):
         alive = self.thread is not None and self.thread.is_alive()
 
-        if self.error:
+        # Wait for the thread to be gone, as for a clean finish: _finish may
+        # start a dropped image's run, which refuses while a thread is alive.
+        if self.error and not alive:
             self.var_state.set("ERROR  %s" % self.error)
             self._append(self.txt2, "\n[!] %s\n" % self.error, "note")
             self.error = None
@@ -1046,6 +1522,9 @@ class SimulatorUI:
         self.btn_stop.config(state="disabled")
         self.btn_pause.config(state="disabled", text="Pause")
         self._set_send_enabled(False)
+        if self._pending_run:           # an image was dropped while this run ended
+            self._pending_run = False
+            self._on_run()
 
 
 # ---------------------------------------------------------------------------
@@ -1069,7 +1548,9 @@ def _run_selftests():
         print("  [SKIP] no display available: %s" % e)
         return 0
     root.withdraw()
-    ui = SimulatorUI(root)
+    # No settings file: the tests must not depend on, or overwrite, the
+    # choices the person running them saved.
+    ui = SimulatorUI(root, settings_path=None)
 
     def pane():
         return ui.txt_net.get("1.0", "end-1c")
@@ -1240,6 +1721,386 @@ def _run_selftests():
           "Clear empties the captured frames as well as the pane")
     ui._detail_win.destroy()
 
+    # --- Config tab -------------------------------------------------------
+    ui._reset_options()
+    cfg = ui._collect_cfg()
+    check(cfg["wifi"] is False and cfg["tuyamcu"] is False and cfg["boot"] is False
+          and cfg["xvr_selfclear"] is False and cfg["blecore"] is False
+          and cfg["tuyamcu_pid"] is None and cfg["tuyamcu_raw"] is False
+          and "forwards" not in cfg,
+          "an untouched Config tab asks for nothing beyond a plain run")
+    check(str(ui.opt_text["http_gets"].cget("state")) == "disabled"
+          and str(ui.opt_widgets["tuyamcu"][0].cget("state")) == "disabled",
+          "fields that depend on an unticked option are disabled")
+    check(ui.var_summary.get() == "options: none (Config tab)",
+          "the summary line says when no option is set")
+
+    ui.opt["wifi"].set(True)
+    cfg = ui._collect_cfg()
+    check(cfg["wifi_role"] == "auto" and cfg["forwards"] == [(8080, 80)]
+          and cfg["wifi_ssid"] is None and cfg["wifi_pass"] is None and cfg["pcap"] is None
+          and cfg["http_gets"] == [] and cfg["mqtt_pubs"] == [],
+          "Wi-Fi peer alone gives what the old checkbox did: auto role, 8080 to 80")
+    check(str(ui.opt_text["http_gets"].cget("state")) == "normal"
+          and str(ui.opt_widgets["pcap"][0].cget("state")) == "disabled",
+          "ticking Wi-Fi opens its fields, but the capture file waits for its own tick")
+
+    ui._set_text_option("mqtt_pubs", "cmnd/obk/POWER=ON\n\n  stat/obk/x=a=b  \n")
+    ui._set_text_option("http_gets", "/cm?cmnd=POWER%20ON\n \n/index\n")
+    cfg = ui._collect_cfg()
+    check(cfg["mqtt_pubs"] == [("cmnd/obk/POWER", b"ON"), ("stat/obk/x", b"a=b")],
+          "MQTT lines parse as TOPIC=PAYLOAD; blank lines are skipped, '=' stays in a payload")
+    check(cfg["http_gets"] == ["/cm?cmnd=POWER%20ON", "/index"],
+          "HTTP GET paths are one per line, blank lines skipped")
+
+    def rejects(fragment, label):
+        try:
+            ui._collect_cfg()
+        except ValueError as e:
+            check(fragment in str(e), label)
+        else:
+            check(False, label)
+
+    ui._set_text_option("mqtt_pubs", "no-equals-sign")
+    rejects("TOPIC=PAYLOAD", "an MQTT line without '=' is refused before the run starts")
+    ui._set_text_option("mqtt_pubs", "")
+    ui._set_text_option("http_gets", "/café\n/żółw")
+    rejects("percent-encode", "an HTTP path a request line cannot carry is refused, not "
+                              "left to end the run")
+    ui._set_text_option("http_gets", "/cm?cmnd=POWER%20ON\n \n/index\n")
+    ui.opt["fwd_local"].set("80x")
+    rejects("port", "a port forward that is not a number is refused")
+    for lp, dp in (("0", "80"), ("70000", "80"), ("8080", "")):
+        ui.opt["fwd_local"].set(lp)
+        ui.opt["fwd_device"].set(dp)
+        rejects("ports 1-65535", "a port forward of %r to %r is refused" % (lp, dp))
+    ui.opt["fwd_local"].set("")
+    ui.opt["fwd_device"].set("")
+    check(ui._collect_cfg()["forwards"] == [], "clearing both forward ports turns the forward off")
+    ui.opt["wifi_pass"].set("short")
+    rejects("8 to 63", "a WPA2 passphrase under 8 characters is refused")
+    ui.opt["wifi_pass"].set("x" * 64)
+    rejects("8 to 63", "a WPA2 passphrase over 63 characters is refused")
+    ui.opt["wifi_pass"].set(" pass word ")
+    check(ui._collect_cfg()["wifi_pass"] == " pass word ",
+          "a passphrase keeps its spaces: they are part of the key")
+    ui.opt["wifi_ssid"].set(" Home Net ")
+    check(ui._collect_cfg()["wifi_ssid"] == " Home Net ",
+          "a network name keeps its spaces: it is matched exactly and salts the WPA2 key")
+    ui.opt["wifi_ssid"].set("   ")
+    check(ui._collect_cfg()["wifi_ssid"] is None,
+          "a network name of only spaces means 'adopt the one the device asks for'")
+    ui.opt["pcap"].set(True)
+    rejects("no file", "radio capture without a file is refused")
+    check(str(ui.opt_widgets["pcap"][0].cget("state")) == "normal",
+          "ticking radio capture opens its file field")
+    ui.opt["pcap_path"].set(os.path.join(tempfile.gettempdir(), "no_such_dir_bks", "x.pcap"))
+    rejects("does not exist", "a capture file in a folder that does not exist is refused")
+    ui.opt["pcap_path"].set("")
+    ui.opt["wifi"].set(False)
+    check(str(ui.opt_widgets["pcap"][0].cget("state")) == "disabled",
+          "the capture file field closes again with the Wi-Fi peer")
+    box = ui.opt_text["http_gets"]
+    check(str(box.cget("background")) != str(box.configure("background")[3]),
+          "a disabled text box is drawn greyed, not as an editable white box")
+    ui.opt["wifi"].set(True)
+    check(str(box.cget("background")) == str(box.configure("background")[3]),
+          "...and drawn normally again once enabled")
+    ui.opt["tuyamcu"].set(True)
+    ui.opt["tuyamcu_pid"].set("żółw")
+    rejects("ASCII", "a product ID that is not ASCII is refused, not left to end the run")
+    ui.opt["tuyamcu_pid"].set("")
+    ui.opt["tuyamcu"].set(False)
+
+    ui.opt["tuyamcu"].set(True)
+    ui.opt["tuyamcu_pid"].set("  abcdefghijklmnop ")
+    ui.opt["tuyamcu_raw"].set(True)
+    ui.opt["pcap"].set(False)
+    ui.opt["wifi_ssid"].set("HomeNet")
+    summary = ui.var_summary.get()
+    check("TuyaMCU (abcdefghijklmnop, raw)" in summary and "'HomeNet'" in summary
+          and "Wi-Fi peer (auto" in summary, "the summary line follows the choices")
+    check("WPA2" in summary and "2 HTTP GET" in summary,
+          "it names WPA2 when a passphrase is set, and counts the HTTP requests")
+    ui.opt["wifi_pass"].set("")
+    check("open" in ui.var_summary.get() and "WPA2" not in ui.var_summary.get(),
+          "...and says 'open' without one, which is what a relaunch leaves")
+    ui._set_text_option("mqtt_pubs", "a/b=1")
+    root.update()                        # <<Modified>> is queued, as when typing
+    check("1 MQTT" in ui.var_summary.get(),
+          "typing in a text box updates the summary too, though it has no variable")
+    ui._set_text_option("mqtt_pubs", "")
+    ui.opt["wifi_pass"].set(" pass word ")
+    cfg = ui._collect_cfg()
+    check(cfg["tuyamcu_pid"] == "abcdefghijklmnop" and cfg["tuyamcu_raw"] is True,
+          "the TuyaMCU product ID is trimmed and passed on with the raw flag")
+
+    # The worker hands every option to the same calls the command line makes.
+    calls = {}
+
+    class FakeEmu:
+        def __init__(self):
+            self.run_error = calls.get("run_error")
+
+        def attach_wifi_peer(self, **kw):
+            calls["peer"] = kw
+            if calls.get("attach_fails"):
+                raise OSError("cannot open the capture")
+
+        def setup(self):
+            calls["order"] = ["setup"]
+
+        def stop(self):
+            calls["order"].append("stop")
+
+        def run(self):
+            calls["order"].append("run")
+
+        def close_network(self):
+            calls["closed"] = calls.get("closed", 0) + 1
+
+    def fake_build(path, **kw):
+        calls["build"] = kw
+        return FakeEmu()
+
+    fd, img = tempfile.mkstemp(suffix=".bin")
+    os.close(fd)
+    real_build = globals()["build_emulator"]
+    globals()["build_emulator"] = fake_build
+    try:
+        ui.opt["xvr_selfclear"].set(True)
+        ui.opt["wifi_role"].set("ap")
+        ui.opt["fwd_local"].set("9090")
+        ui.opt["fwd_device"].set("80")
+        ui.opt["wifi_pass"].set("password1")
+        ui.opt["pcap"].set(True)
+        ui.opt["pcap_path"].set("cap.pcap")
+        ui._set_text_option("mqtt_pubs", "cmnd/obk/POWER=OFF")
+        cfg = ui._collect_cfg()
+        ui._stop_requested = False
+        ui._worker("image.bin", cfg)
+        b, p = calls["build"], calls["peer"]
+        check(b["xvr_selfclear"] is True and b["tuyamcu_pid"] == "abcdefghijklmnop"
+              and b["tuyamcu_raw"] is True and b["wifi"] is True and b["only_uart"] is True,
+              "the worker passes the device options to build_emulator")
+        check(p == {"role": "ap", "ssid": "HomeNet", "passphrase": "password1",
+                    "forwards": [(9090, 80)], "pcap": "cap.pcap", "http_gets": ["/cm?cmnd=POWER%20ON",
+                    "/index"], "mqtt_pubs": [("cmnd/obk/POWER", b"OFF")]},
+              "the worker passes the network options, the chosen role included, and no net_out")
+        check(calls["order"] == ["setup", "run"] and ui.finished == "emulation finished",
+              "a run nobody stopped goes straight from setup to run")
+        check(calls["closed"] == 1, "the run's network is released when it ends, freeing the port")
+
+        ui.emu = None
+        ui._on_stop()
+        check(ui._stop_requested is True, "Stop with nothing loaded yet is remembered")
+        ui._worker("image.bin", cfg)
+        check(calls["order"] == ["setup", "stop", "run"],
+              "a Stop pressed while the image was loading reaches the emulator before it runs")
+
+        ui.var_image.set(img)
+        ui._pending_run = True
+        ui._on_run()
+        ui.thread.join(5)
+        check(calls["order"] == ["setup", "run"] and ui._stop_requested is False,
+              "Run clears a Stop left over from the previous run")
+        check(ui._pending_run is False, "...and uses up a dropped image that was waiting")
+
+        ui.finished = ui.error = None
+        calls["run_error"] = "UC_ERR_FETCH_UNMAPPED at pc 0x00000000"
+        ui._worker("image.bin", cfg)
+        check(ui.error == calls["run_error"] and ui.finished is None,
+              "a run that ended on an error is reported as one, not as a normal finish")
+        calls["run_error"] = None
+        ui.error = None
+        calls["attach_fails"] = True
+        closed = calls["closed"]
+        ui._worker("image.bin", cfg)
+        check("OSError" in (ui.error or "") and calls["closed"] == closed + 1,
+              "a peer that fails to start still has its network released")
+        calls["attach_fails"] = False
+    finally:
+        globals()["build_emulator"] = real_build
+        ui.emu = None
+        ui.thread = None
+        ui.finished = ui.error = None
+        ui._stop_requested = ui._pending_run = False
+        os.remove(img)
+
+    # Enter in the send box runs _on_send whatever the button says, so the run
+    # being over has to be checked there.
+    class Feed:
+        fed = []
+
+        def feed_uart1(self, data):
+            self.fed.append(data)
+
+    ui.emu = Feed()
+    history = len(ui.history)
+    ui.var_input.set("help")
+    ui._on_send()
+    check(Feed.fed == [] and len(ui.history) == history and ui.var_input.get() == "help",
+          "after a run has ended, Enter sends nothing and echoes nothing")
+    ui.emu = None
+    ui.var_input.set("")
+
+    # Console readiness follows the running emulator's own RX hold-off, which
+    # build_emulator drops to 0 when a TuyaMCU peer is on.
+    from types import SimpleNamespace
+
+    class Alive:                         # a worker thread that is still going
+        def is_alive(self):
+            return True
+
+    ui.thread = Alive()
+    ui.emu = SimpleNamespace(uart1_rx_delay=0, state=SimpleNamespace(insn_count=10))
+    check(ui._console_ready(), "with no RX hold-off (TuyaMCU) the console is ready at once")
+    ui.emu = SimpleNamespace(uart1_rx_delay=2_000_000, state=SimpleNamespace(insn_count=10))
+    check(not ui._console_ready(), "...and with OpenBeken's hold-off it waits for it")
+    ui.emu = ui.thread = None
+
+    # Saved settings round-trip through a file, minus the passphrase. The
+    # images are made here, so nothing depends on what firmwares/ holds.
+    def window(**kw):
+        win = tk.Toplevel(root)
+        win.withdraw()
+        return win, SimulatorUI(win, **kw)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spath = os.path.join(tmpdir, "ui.json")
+        dump, other = os.path.join(tmpdir, "dump.bin"), os.path.join(tmpdir, "other.bin")
+        for path in (dump, other):
+            with open(path, "wb") as f:
+                f.write(bytes(16))
+        ui.settings_path = spath
+        try:
+            ui.var_image.set(dump)
+            ui.var_chip.set("BK7238")
+            ui.var_key.set("(none)")
+            ui._save_settings()
+            with open(spath, encoding="utf-8") as f:
+                saved = json.load(f)
+            check("wifi_pass" not in saved and saved["wifi_ssid"] == "HomeNet"
+                  and saved["mqtt_pubs"] == "cmnd/obk/POWER=OFF",
+                  "settings are saved without the Wi-Fi passphrase")
+            check(not os.path.exists(spath + ".tmp") and os.path.isabs(saved["image"]),
+                  "the file is swapped in whole, and the image is saved as an absolute path")
+
+            win2, ui2 = window(settings_path=spath)
+            check(ui2.opt["wifi"].get() is True and ui2.opt["wifi_ssid"].get() == "HomeNet"
+                  and ui2.opt["fwd_local"].get() == "9090" and ui2.opt["wifi_pass"].get() == ""
+                  and ui2.opt["wifi_role"].get() == "ap"
+                  and ui2.opt_text["mqtt_pubs"].get("1.0", "end-1c") == "cmnd/obk/POWER=OFF",
+                  "a new window restores the saved choices, role and text boxes included")
+            check(_same_file(ui2.var_image.get(), dump) and ui2.var_chip.get() == "BK7238"
+                  and ui2.var_key.get() == "(none)",
+                  "...and reopens the saved image with its saved chip and key")
+            try:
+                ui2.opt_text["mqtt_pubs"].edit_undo()
+            except tk.TclError:
+                pass                    # nothing to undo: what the check wants
+            check(ui2.opt_text["mqtt_pubs"].get("1.0", "end-1c") == "cmnd/obk/POWER=OFF",
+                  "Ctrl+Z cannot take a restored text box back to empty")
+            win2.destroy()
+
+            win2, ui2 = window(initial_image=dump.replace("\\", "/").upper(), settings_path=spath)
+            check(ui2.var_chip.get() == "BK7238" and ui2.var_key.get() == "(none)",
+                  "the same image spelled differently still gets its chip and key back")
+            win2.destroy()
+            win2, ui2 = window(initial_image=other, settings_path=spath)
+            check(ui2.var_image.get() == other and ui2.var_chip.get() == guess_chip(other)
+                  and ui2.var_key.get() == "TUYA",
+                  "the saved chip and key stay with the saved image, not one named at launch")
+            win2.destroy()
+
+            with open(spath, "w", encoding="utf-8") as f:
+                f.write('{"wifi": "yes", "wifi_role": "mesh", "fwd_local": 8080, "boot": true')
+            win3, ui3 = window(settings_path=spath)
+            check(ui3.opt["wifi"].get() is False and ui3.opt["boot"].get() is False,
+                  "a corrupt settings file means defaults, not a crash")
+            with open(spath, "w", encoding="utf-8") as f:
+                json.dump({"wifi": "yes", "wifi_role": "mesh", "fwd_local": 8080, "boot": True}, f)
+            ui3._apply_settings(ui3._load_settings())
+            check(ui3.opt["wifi"].get() is False and ui3.opt["wifi_role"].get() == "auto"
+                  and ui3.opt["fwd_local"].get() == "8080" and ui3.opt["boot"].get() is True,
+                  "saved values of the wrong type or out of range are ignored one by one")
+            ui3._apply_settings({"wifi_role": "sta", "wifi_pass": "password1"})
+            check(ui3.opt["wifi_role"].get() == "sta" and ui3.opt["wifi_pass"].get() == "",
+                  "a valid saved role is restored; a passphrase in the file never is")
+            with open(spath, "w", encoding="utf-8") as f:
+                f.write("[]")
+            check(ui3._load_settings() == {},
+                  "a settings file that is valid JSON but not an object means defaults")
+            win3.destroy()
+            with open(spath, "w", encoding="utf-8") as f:
+                json.dump({"image": dump, "chip": ["BK7231"], "key": {"x": 1}}, f)
+            win3, ui3 = window(settings_path=spath)
+            check(ui3.var_chip.get() == guess_chip(dump) and ui3.var_key.get() == "TUYA",
+                  "a chip or key of the wrong type is ignored instead of stopping the window")
+            win3.destroy()
+        finally:
+            ui.settings_path = None
+    ui._save_settings()                  # no settings file: must neither write nor raise
+
+    ui._reset_options()
+    check(ui.opt_text["mqtt_pubs"].get("1.0", "end-1c") == ""
+          and ui.opt["wifi"].get() is False and ui.opt["wifi_pass"].get() == "",
+          "Reset to defaults clears every option, disabled text boxes too")
+
+    # Dropping a file: during a run it stops that run and waits for it to end,
+    # then starts; while idle it starts at once.
+    started = []
+    real_run = ui._on_run
+    ui._on_run = lambda: started.append(ui.var_image.get())
+    fd, dropped = tempfile.mkstemp(suffix=".bin")
+    os.close(fd)
+    try:
+        ui.tabs.select(ui.config_tab)
+        ui.thread = Alive()
+        ui._on_drop(SimpleNamespace(data="{%s}" % dropped, action="copy"))
+        check(ui.var_image.get() == dropped and ui._pending_run is True
+              and ui._stop_requested is True and started == [],
+              "a file dropped during a run stops that run and waits for it to end")
+        check(ui.tabs.select() == str(ui.run_tab), "...showing the Run tab")
+        ui._pending_run = ui._stop_requested = False
+        ui._on_drop(SimpleNamespace(data="{%s}" % os.path.join(tmpdir, "gone.bin"),
+                                    action="copy"))
+        check(ui._pending_run is False and ui._stop_requested is False and started == [],
+              "a drop holding no file is ignored")
+        ui.thread = None
+        ui._on_drop(SimpleNamespace(data="{%s}" % dropped, action="copy"))
+        check(started == [dropped], "a file dropped while idle runs at once")
+
+        started.clear()
+        ui._pending_run = True
+        ui._finish()
+        check(len(started) == 1 and ui._pending_run is False,
+              "a waiting dropped image starts as soon as the run before it has ended")
+        ui._finish()
+        check(len(started) == 1, "and only once")
+    finally:
+        ui._on_run = real_run
+        ui.thread = None
+        ui._pending_run = ui._stop_requested = False
+        os.remove(dropped)
+
+    # An error is handled only once the worker has gone: _finish may start a
+    # dropped image, which Run refuses while a thread is alive.
+    finishes = []
+    real_finish = ui._finish
+    ui._finish = lambda: finishes.append(True)
+    try:
+        ui.thread, ui.error = Alive(), "boom"
+        ui._update_state()
+        check(finishes == [] and ui.error == "boom",
+              "a worker error waits for its thread to exit before the run is finished")
+        ui.thread = None
+        ui._update_state()
+        check(finishes == [True] and ui.error is None, "...and is reported once it has")
+    finally:
+        ui._finish = real_finish
+        ui.thread = ui.error = None
+
     root.destroy()
     print("\nAll %d simulator UI self-tests passed." % n)
     return n
@@ -1250,7 +2111,19 @@ def main():
         _run_selftests()
         return
     initial = sys.argv[1] if len(sys.argv) > 1 else None
-    root = tk.Tk()
+    # Dropping files on the window needs a root made by tkinterdnd2 (pip
+    # install tkinterdnd2); without it everything else works the same.
+    try:
+        from tkinterdnd2 import TkinterDnD
+        root = TkinterDnD.Tk()
+    except Exception:
+        # TkinterDnD.Tk() makes its Tk before loading tkdnd, so a failed load
+        # leaves that Tk behind as the default root, owning every variable the
+        # window creates. Drop it before making the plain one.
+        stray = getattr(tk, "_default_root", None)
+        if stray is not None:
+            stray.destroy()
+        root = tk.Tk()
     SimulatorUI(root, initial)
     root.mainloop()
 

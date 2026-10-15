@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from src.crypto import extract_and_decrypt, strip_crcs, parse_key, KNOWN_KEYS
 from src.emulator import BekenEmulator, CHIP_FAMILIES, CONSOLE_RX_HOLDOFF_INSNS
 from src import tuyamcu
+from src.wifipeer import WIFI_ROLES
 
 # Data-point type names accepted by --tuyamcu-dp, mapped to the wire type codes.
 DP_TYPE_NAMES = {
@@ -53,8 +54,9 @@ def parse_forwards(specs):
     out = []
     for spec in specs:
         parts = spec.split(":")
-        if len(parts) != 2 or not all(p.isdigit() for p in parts):
-            raise ValueError("bad --net-forward %r (want LPORT:DPORT, e.g. 8080:80)" % spec)
+        if len(parts) != 2 or not all(p.isdigit() and 0 < int(p) < 65536 for p in parts):
+            raise ValueError("bad --net-forward %r (want LPORT:DPORT, ports 1-65535, e.g. 8080:80)"
+                             % spec)
         out.append((int(parts[0]), int(parts[1])))
     return out
 
@@ -68,6 +70,35 @@ def parse_mqtt_pubs(specs):
             raise ValueError("bad --mqtt-publish %r (want TOPIC=PAYLOAD, e.g. cmnd/obk/POWER=ON)" % spec)
         out.append((topic, payload.encode("utf-8")))
     return out
+
+
+# The checks below are shared by the command line and the GUI, so the two
+# accept exactly the same values. Each raises ValueError naming the flag.
+def parse_http_gets(paths):
+    """Check --net-http-get paths: the request line is sent as Latin-1, so a
+    path holding anything else has to be percent-encoded first."""
+    for path in paths:
+        try:
+            path.encode("latin-1")
+        except UnicodeEncodeError:
+            raise ValueError("bad --net-http-get %r (percent-encode characters outside "
+                             "Latin-1, e.g. %%20 for a space)" % path)
+    return list(paths)
+
+
+def check_wifi_pass(passphrase):
+    """Check --wifi-pass: WPA2-PSK takes an 8 to 63 character passphrase."""
+    if passphrase is not None and not 8 <= len(passphrase) <= 63:
+        raise ValueError("bad --wifi-pass (a WPA2 passphrase is 8 to 63 characters; this one "
+                         "is %d)" % len(passphrase))
+    return passphrase
+
+
+def check_tuyamcu_pid(pid):
+    """Check --tuyamcu-pid: the MCU sends it as ASCII on the wire."""
+    if pid and not pid.isascii():
+        raise ValueError("bad --tuyamcu-pid %r (a Tuya product id is plain ASCII)" % pid)
+    return pid
 
 
 def parse_mac(text):
@@ -143,13 +174,15 @@ def parse_args():
                              "six MAC FIQ lines) so the firmware's own Wi-Fi stack can "
                              "actually move frames. Pair with --wifi-peer to put a virtual "
                              "access point / station and an IP network on the other side.")
-    parser.add_argument("--wifi-peer", dest="wifi_peer", default=None, choices=["auto", "sta", "ap"],
+    parser.add_argument("--wifi-peer", dest="wifi_peer", default=None, choices=list(WIFI_ROLES),
                         metavar="ROLE",
                         help="Attach a virtual 802.11 peer plus a user-mode IP network to the MAC "
                              "model (implies --wifi). ROLE auto: take the opposite role of what "
                              "the device does (it beacons -> we join it as a station; it probes "
                              "or authenticates -> we are the access point it connects to). "
-                             "sta/ap force one. Open (no cipher) networks only.")
+                             "sta/ap force one. As an access point the peer is open unless "
+                             "--wifi-pass makes it WPA2-PSK; as a station it joins open "
+                             "networks only.")
     parser.add_argument("--wifi-ssid", dest="wifi_ssid", default=None, metavar="SSID",
                         help="SSID the peer beacons as an access point, or the one it joins as a "
                              "station. In the AP role without this, the first SSID the device "
@@ -265,6 +298,7 @@ def build_emulator(dump_path, key=None, chip="BK7231", with_boot=False, only_uar
     # the firmware is already listening and no hold-off is needed.
     if uart1_rx_delay is None:
         uart1_rx_delay = 0 if tuyamcu else CONSOLE_RX_HOLDOFF_INSNS
+    check_tuyamcu_pid(tuyamcu_pid)
 
     return BekenEmulator(raw_flash=flash_data, bootloader=bootloader, app=app,
                          with_boot=with_boot, only_uart=only_uart,
@@ -288,6 +322,12 @@ def main():
             text += "\r\n"
         uart1_rx = text.encode("latin-1", "replace")
 
+    # Any network option means a peer, and a peer means the MAC model. Listed
+    # once: --net-out and --pcap-ip given alone used to be silently ignored.
+    want_peer = bool(args.wifi_peer or args.net_forwards or args.pcap or args.wifi_ssid
+                     or args.net_http_gets or args.mqtt_pubs or args.wifi_pass
+                     or args.net_out or args.pcap_ip)
+
     try:
         # Everything that turns a command-line string into emulator input, so a
         # bad argument of ANY kind gets the same one-line message rather than a
@@ -301,17 +341,14 @@ def main():
             tuyamcu_dps=parse_dp_specs(args.tuyamcu_dps),
             tuyamcu_injects=parse_hex_blobs(args.tuyamcu_injects),
             xvr_selfclear=args.xvr_selfclear, ble_core=args.ble_core,
-            wifi=(args.wifi or bool(args.wifi_peer) or bool(args.net_forwards) or bool(args.pcap)
-                  or bool(args.net_http_gets) or bool(args.wifi_ssid) or bool(args.mqtt_pubs)
-                  or bool(args.wifi_pass)))
-        if (args.wifi_peer or args.net_forwards or args.pcap or args.wifi_ssid
-                or args.net_http_gets or args.mqtt_pubs or args.wifi_pass):
+            wifi=args.wifi or want_peer)
+        if want_peer:
             emu.attach_wifi_peer(role=args.wifi_peer or "auto", ssid=args.wifi_ssid,
                                  channel=args.wifi_channel, peer_mac=parse_mac(args.wifi_mac),
-                                 passphrase=args.wifi_pass,
+                                 passphrase=check_wifi_pass(args.wifi_pass),
                                  forwards=parse_forwards(args.net_forwards),
                                  net_out=args.net_out, pcap=args.pcap,
-                                 http_gets=args.net_http_gets,
+                                 http_gets=parse_http_gets(args.net_http_gets),
                                  mqtt_pubs=parse_mqtt_pubs(args.mqtt_pubs))
         if args.pcap_ip:
             from src import netstack as _netstack

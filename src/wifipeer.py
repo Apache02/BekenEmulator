@@ -23,9 +23,10 @@ association requests mean it is a station. Either can be forced.
 Every frame crossing the peer can be written to a pcap file (link type 105,
 IEEE 802.11 without FCS) so the exchange opens in Wireshark.
 
-Only open-system / no-cipher BSSs are handled. The firmware stacks still
-negotiate everything else themselves; a protected BSS would need the key
-material that the device has and this peer does not model.
+As an access point the peer is open, or WPA2-PSK when given a passphrase:
+it then advertises RSN and runs the four-way handshake (src/wpa2.py) before
+carrying any traffic. As a station it joins open BSSs only; a protected AP
+on the device would need key material this peer does not model.
 """
 import struct
 import time
@@ -127,8 +128,14 @@ class Pcap:
             pass
 
 
+# The roles a peer can take. auto: the opposite of whatever the device turns
+# out to be. The command line's --wifi-peer choices and the GUI's role list
+# both come from here.
+WIFI_ROLES = ("auto", "sta", "ap")
+
+
 class WifiPeer:
-    """The virtual counterpart on air. role: "auto" | "sta" | "ap"."""
+    """The virtual counterpart on air. role: one of WIFI_ROLES."""
 
     def __init__(self, mac, netstack, inject, log=None, role="auto", ssid=None, channel=1,
                  pcap=None, now_us=None, bssid=None, latency_us=0, passphrase=None):
@@ -145,7 +152,8 @@ class WifiPeer:
         self.active_role = None if role == "auto" else role
         self.ssid = ssid                         # AP role: what we beacon; STA role: what we join (None = first seen)
         self.channel = channel
-        self.pcap = Pcap(pcap) if isinstance(pcap, str) else pcap
+        self._own_pcap = isinstance(pcap, str)      # opened here, so closed here
+        self.pcap = Pcap(pcap) if self._own_pcap else pcap
         self.now_us = now_us or (lambda: 0)
         self.seq = 0
         self.ap_bssid = bssid or mac             # AP role: our BSSID
@@ -226,6 +234,13 @@ class WifiPeer:
                        self._decr_for(dst))
 
     # ------------------------------------------------------ from the device
+    def close(self):
+        """Release the host side: the network stack's sockets and a capture
+        file this peer opened itself."""
+        self.net.close()
+        if self._own_pcap and self.pcap is not None:
+            self.pcap.close()
+
     def on_device_tx(self, frame, info=None):
         self.stats["rx"] += 1
         if self.pcap:
@@ -614,6 +629,7 @@ def _run_selftests():
         def input(self, eth): self.frames.append(eth)
         def link_up(self, device_mac=None): self.up = device_mac
         def tick(self, now): pass
+        def close(self): self.closed = True
 
     clock = [0]
     sent = []
@@ -711,9 +727,16 @@ def _run_selftests():
         cp.on_device_tx(probe2)
         clk2[0] = 1_503_000
         cp.tick()
-        cp.pcap.close()
+        cp.close()
+        check(cp.net.closed and cp.pcap.f.closed,
+              "close() releases the network's host side and the capture file the peer opened")
         with open(cap, "rb") as fh:
             raw = fh.read()
+        shared = Pcap(cap)
+        sp = WifiPeer(str2mac("02:00:00:00:00:08"), FakeNet(), lambda f, d=None: None, pcap=shared)
+        sp.close()
+        check(not shared.f.closed, "...but leaves a capture it was handed to whoever opened it")
+        shared.close()
     finally:
         os.remove(cap)
     magic, vmaj, vmin, _, _, snap, link = struct.unpack("<IHHiIII", raw[:24])

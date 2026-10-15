@@ -101,8 +101,9 @@ CHUNK_SCALE_THUMB = 0.42
 # How long UART1 receive bytes are held before the guest may read them. OpenBeken
 # enables UART1 RX early (~140k insns) but only registers its console callback
 # about a million instructions later in CMD_Init_Delayed, and the ISR discards
-# what it reads until then - so bytes handed over sooner are simply lost. Both
-# the CLI default and the GUI's "console ready" indicator come from here.
+# what it reads until then - so bytes handed over sooner are simply lost. This is
+# the default; build_emulator drops it to 0 with a TuyaMCU peer, and the GUI's
+# "console ready" indicator reads the running emulator's own uart1_rx_delay.
 CONSOLE_RX_HOLDOFF_INSNS = 2_000_000
 
 class SimulatorState:
@@ -239,6 +240,10 @@ class BekenEmulator:
         # and a peer (src/wifipeer.py) can be attached to talk 802.11 to it.
         self.wifimac = None
         self.wifi_peer = None
+        # Why run() ended early, as text, when it was an error rather than a
+        # stop or the end of the program. run() only prints it; a front end
+        # with its own error display reads it from here.
+        self.run_error = None
         # Hardware TRNG (TRNG_DATA, irda.h - same address on every family).
         # None = plain memory, i.e. the same value on every read. The network
         # needs real randomness: LwIP's LWIP_RAND() is bk_rand() -> TRNG, and
@@ -562,18 +567,36 @@ class BekenEmulator:
         # the peer, and the snapshot path rebuilds this stack.
         net.on_frame = lambda d, f, us: (self.net_frame_sink(d, f, us)
                                          if self.net_frame_sink is not None else None)
-        peer = _wifipeer.WifiPeer(
-            mac, net,
-            # decr: what the device's MAC reports about decryption, set on a
-            # protected link so the firmware sees a frame its hardware decrypted.
-            inject=lambda f, decr=None: self.wifimac.inject(
-                f, self.state.insn_count, decr=decr),
-            log=self.net_log, role=role, ssid=ssid, channel=channel, pcap=pcap,
-            now_us=lambda: self.wifimac.now_us(self.state.insn_count),
-            latency_us=self.NET_LATENCY_US, passphrase=passphrase)
+        try:
+            peer = _wifipeer.WifiPeer(
+                mac, net,
+                # decr: what the device's MAC reports about decryption, set on a
+                # protected link so the firmware sees a frame its hardware decrypted.
+                inject=lambda f, decr=None: self.wifimac.inject(
+                    f, self.state.insn_count, decr=decr),
+                log=self.net_log, role=role, ssid=ssid, channel=channel, pcap=pcap,
+                now_us=lambda: self.wifimac.now_us(self.state.insn_count),
+                latency_us=self.NET_LATENCY_US, passphrase=passphrase)
+        except BaseException:
+            # The stack has already bound its forward ports; a peer that
+            # failed to start (an unwritable pcap path) must not keep them.
+            net.close()
+            raise
         self.wifimac.on_tx = peer.on_device_tx
         self.wifi_peer = peer
         return peer
+
+    def close_network(self):
+        """Release what attach_wifi_peer opened on the host: the forward
+        listeners, relayed sockets and the capture file.
+
+        The command line exits instead. A front end that runs again in the
+        same process (the GUI) calls this after run(), or the next run's
+        forward finds its port still taken.
+        """
+        peer, self.wifi_peer = self.wifi_peer, None
+        if peer is not None:
+            peer.close()
 
     def _uart_write(self, data):
         """Emit UART bytes verbatim.
@@ -682,6 +705,12 @@ class BekenEmulator:
         # thread, which is why it is captured here rather than via reg_read -
         # Unicorn is not safe to query while it is running.
         state.last_pc = address
+        if self.stopping:
+            # The chunked loop checks this between chunks; here it is the only
+            # check, and it also catches a stop() made before emu_start, which
+            # Unicorn itself would ignore.
+            mu.emu_stop()
+            return
         self._pacing(state)
 
     def _pacing(self, state):
@@ -844,16 +873,16 @@ class BekenEmulator:
         if not found:
             return
         base = self.blecore.em_base()
-        buf = sys.__stdout__.buffer
         for offset, payload, fields in found:
             if payload in self._ble_adv_seen:
                 continue
             self._ble_adv_seen.add(payload)
-            buf.write(b"\n[BLE_ADV] EM 0x%08x +0x%04x (%d bytes): %s\n"
-                      % (base, offset, len(payload), payload.hex(" ").encode("ascii")))
+            # net_log, so a GUI shows these in its network pane like the
+            # other capture lines rather than on the console behind it.
+            self.net_log("[BLE_ADV] EM 0x%08x +0x%04x (%d bytes): %s"
+                         % (base, offset, len(payload), payload.hex(" ")))
             for line in _blecore.BleCore.describe_ad(fields):
-                buf.write(b"[BLE_ADV]   %s\n" % line.rstrip().encode("ascii", "replace"))
-            buf.flush()
+                self.net_log("[BLE_ADV]   %s" % line.rstrip())
 
     def _gdma_channel(self, address):
         """Channel number if address is a GDMA CONF register, else None."""
@@ -1725,10 +1754,12 @@ class BekenEmulator:
         except UcError as e:
             pc = self.mu.reg_read(UC_ARM_REG_PC)
             cpsr = self.mu.reg_read(UC_ARM_REG_CPSR)
+            self.run_error = "%s at pc 0x%08x" % (e, pc)
             print(f"\n[!] Emulation finished with error: {e}. PC: 0x{pc:08x}, CPSR: 0x{cpsr:08x}")
         except Exception as e:
             pc = self.mu.reg_read(UC_ARM_REG_PC)
             cpsr = self.mu.reg_read(UC_ARM_REG_CPSR)
+            self.run_error = "%s: %s (pc 0x%08x)" % (type(e).__name__, e, pc)
             print(f"\n[!] Emulation finished with python error: {e}. PC: 0x{pc:08x}, CPSR: 0x{cpsr:08x}")
         except KeyboardInterrupt:
             print("\nEmulation stopped by user.")
