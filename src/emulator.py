@@ -174,6 +174,7 @@ class FlashState:
         self.data = b'\xff\xff\xff\xff'
         self.read_idx = 0   # word index within the current 32-byte flash page read
         self.write_buf = []  # words staged via REG_FLASH_DATA_SW_FLASH for a page program
+        self.pw_buf = bytearray()  # bytes staged via REG_FLASH_PW_CONF (0x803024) for a 256-byte page program
 
 class BekenEmulator:
     # Hardware base addresses
@@ -442,6 +443,17 @@ class BekenEmulator:
                 # Real NOR flash can only turn 1 bits into 0; an erase is what
                 # restores them. Modelling that keeps program-without-erase
                 # behaving as the firmware expects rather than silently working.
+                buf[pos] &= byte
+
+    def _flash_program_page(self, addr, data):
+        """256-byte page program (BK7238 REG_FLASH_PW_CONF at 0x00803024)."""
+        if not data:
+            return
+        buf = self._flash_backing()
+        base = addr & ~0xFF
+        for i, byte in enumerate(data[:256]):
+            pos = base + i
+            if pos < len(buf):
                 buf[pos] &= byte
 
     def _flash_erase(self, addr, size):
@@ -1019,6 +1031,21 @@ class BekenEmulator:
             mu.mem_write(address, struct.pack("<I", value))
             return
 
+        # REG_FLASH_PW_CONF (BK7238 256-byte page-write FIFO). For writes >= 256
+        # bytes, BK7238's flash_page_write() writes 0x80000000 here to clear the
+        # FIFO, pushes 256 individual bytes (one per word write), then triggers
+        # FLASH_OPCODE_PP at 0x00803000 once per 256-byte page instead of every
+        # 32 bytes. Without this, 4K sector writes only programmed the first 32
+        # bytes of each 256-byte page and failed read-back verification.
+        if address == 0x00803024:
+            if value & 0x80000000:
+                self.flash_state.pw_buf.clear()
+            else:
+                self.flash_state.pw_buf.append(value & 0xFF)
+                del self.flash_state.pw_buf[:-256]
+            mu.mem_write(address, struct.pack("<I", value))
+            return
+
         if address == 0x00803000:
             self.flash_state.addr = value & 0x00FFFFFF
             self.flash_state.read_idx = 0   # new page read starts at word 0
@@ -1033,8 +1060,12 @@ class BekenEmulator:
                                      % (self.flash_state.addr, op_type, value))
                 sys.__stderr__.flush()
 
-            if op_type == 12:        # FLASH_OPCODE_PP - program one 32-byte page
-                self._flash_program(self.flash_state.addr, self.flash_state.write_buf)
+            if op_type == 12:        # FLASH_OPCODE_PP - program one 256B or 32B page
+                if self.flash_state.pw_buf:
+                    self._flash_program_page(self.flash_state.addr, self.flash_state.pw_buf)
+                    self.flash_state.pw_buf.clear()
+                else:
+                    self._flash_program(self.flash_state.addr, self.flash_state.write_buf)
             elif op_type == 13:      # FLASH_OPCODE_SE - erase one 4K sector
                 self._flash_erase(self.flash_state.addr, 0x1000)
             elif op_type in (14, 15):  # FLASH_OPCODE_BE1 / BE2 - block erase

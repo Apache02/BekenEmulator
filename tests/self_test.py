@@ -2282,6 +2282,200 @@ TEST_CASES = [
         # pwmhz:1000; c_pin 6 -> ch0, w_pin 8 -> ch2 per its config.
         "expected_pins": {6: 0x48, 8: 0x48},
         "expected_pwm": {0: (0x6590, 0x0000), 2: (0x6590, 0x0000)}
+    },
+    {
+        # First stock BK7238 light that actually configures and drives hardware
+        # PWM (the TY-02-3CH RGB controller above never hands a pad to PWM
+        # during boot). Three things make this Onforu BDB100WF-3 100W CCT
+        # floodlight (TuyaOS 3.11.24, T1-U-HL 1.0.43, plaintext) worth having:
+        #
+        # 1. BK7238 uses the same pwm_new block at 0x802B00 as BK7231N/M (added
+        #    to PWM_NEW_CHIPS in src/periph.py). Its decrypted Tuya config
+        #    declares w_pin:6 (PWM0, group 0 sub 0), c_pin:26 (PWM5, group 2
+        #    sub 1) and pwmhz:1000. Both channels get period 0x6590 = 26000 =
+        #    26 MHz / 1000, and PWM0 is driven with TWO non-zero edge toggles
+        #    (T1 = 0x171B = 5915, T2 = 0x4E75 = 20085) - a phase-shifted CW
+        #    pulse that stays high for 20085 - 5915 = 14170 (0x375A, 54.5%)
+        #    ticks. Every other stock pwm_new dump here sits at 0% duty, and the
+        #    OpenBeken synthetic cases only set T1, so this is the first real
+        #    firmware exercising two-edge toggle replay in pwm_new_channels().
+        #
+        # 2. Guards BK7238's 256-byte flash page-write FIFO at 0x00803024
+        #    (REG_FLASH_PW_CONF). Where BK7231N's flash_write_data stages 32-byte
+        #    pages (8 words) via 0x00803004, BK7238's flash_page_write resets the
+        #    FIFO with 0x80000000 at 0x00803024, pushes 256 individual bytes to
+        #    0x00803024, and triggers FLASH_OPCODE_PP (12) at 0x00803000 once per
+        #    256-byte page. Before 0x00803024 was modelled, every 4K sector write
+        #    (uf_flash_file saving light_data at 0x1e5000/0x1e7000 and
+        #    simple_flash writing 0x1e4000) left bytes +0x20..+0xFF of each page
+        #    erased, logging 11x "uf_open light_data err 4" and rebooting on
+        #    "Err write addr:0x001e4000 size:4096".
+        #
+        # 3. First test asserting [BLE_ADV] exchange-memory extraction on the
+        #    BLE 5.2 core (BK7238): TuyaOS 3.x advertises service UUID 0xFD50
+        #    carrying the device's 16-byte key (keytfesxxsqewnqy), located via
+        #    the runtime EM base register at 0x90019C rather than a fixed address.
+        "name": "BK7238 Tuya Onforu 100W CCT Floodlight (pwm_new 2-toggle CW, 256B flash page write) boots",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7238_Tuya_Onforu_BDB100WF3_Floodlight_CW_PWM_1000Hz_1.0.43.bin"),
+        "args": ["--only-uart", "-chip", "BK7238", "--ble-core"],
+        "timeout": 420,
+        "tags": ["BLE", "BLE core", "FIQ"],
+        "expected_strings": [
+            "device_id=0x21128000",
+            "< TuyaOS V:3.11.24 BS:40.00_PT:2.3_LAN:3.5_CAD:1.0.5_CD:1.0.0 >",
+            "name:oem_t1_light_ty:1.0.43",
+            "key_addr: 0x1f5000",
+            "0x4d 0x5d 0xbf 0x3 0x35 0x65 0x17 0x4c 0x91 0x38 0x56 0x78 0x19 0x4 0xf 0x58",
+            "have actived over 15 min, not enter mf_init",
+            "mf_init succ",
+            "wifi soc init. pid:keytfesxxsqewnqy firmwarekey:keytfesxxsqewnqy ver:1.0.43",
+            "ssid:SmartLife-2074, key:, channel: 6",
+            # BLE 5.2 exchange-memory advertisement: TuyaOS 3.x UUID 0xFD50 + key.
+            "uuid=0xFD50",
+            "keytfesxxsqewnqy  uuid=0xFD50",
+            "ble adv updated",
+            "tfm_timing_storage.c:168] storage sucess",
+        ],
+        "unexpected_strings": [
+            "uf_open light_data err",
+            "Err write addr",
+            "bk_reboot",
+        ],
+        "expected_pins": {6: 0x48, 26: 0x48},
+        # Period 0x6590 = 26000 = 26 MHz / 1000 (pwmhz:1000); PWM0 high ticks
+        # 0x375A = 14170 (T2 0x4E75 - T1 0x171B = 54.5% duty), PWM5 = 0%.
+        "expected_pwm": {0: (0x6590, 0x375A), 5: (0x6590, 0x0000)},
+    },
+    {
+        # First BK7238 TuyaMCU firmware in the suite (and a new device class:
+        # S06Pro IR blaster + temperature/humidity station, t1_common_user_config_ir_ty
+        # 1.0.1 on TuyaOS 3.11.16, T1-3S, plaintext).
+        #
+        # Exercises all three emulated peripheral/radio models on BK7238 in one
+        # boot and proves they interlock:
+        #   1. UART1 / TuyaMCU at 9600 baud (--tuyamcu --tuyamcu-raw with
+        #      licensed product key jbe3snv4tki8oo9c): sends heartbeat (0x00),
+        #      product query (0x01), validates both product_key and firmware_key
+        #      (keyny8wdynkekrgw -> enter success_proc), and queries working
+        #      mode (0x02).
+        #   2. 802.11 MAC + virtual station (--wifi-peer auto): because the
+        #      active KV sector (0x1fb000, wr_cnt 39) was reset to AP pairing
+        #      mode (gw_wsm.stat:1, nc_tp:10), the device raises SmartLife-C8F2
+        #      on channel 6; our station associates, gets a DHCP lease
+        #      (192.168.176.100 from 192.168.176.1), answers ping, and captures
+        #      the Tuya LAN 3.5 UDP broadcast on port 6667.
+        #   3. BLE 5.2 core (--ble-core): brings up the controller, stages the
+        #      UUID 0xFD50 pairing advertisement carrying jbe3snv4tki8oo9c in
+        #      exchange memory, and logs ble adv updated.
+        # Only once the AP and BLE stack are up does the firmware send its
+        # Wi-Fi-state report (0x03, payload 0x01 = AP config mode:
+        # 55 aa 00 03 00 01 01 04) back to the MCU over UART1.
+        "name": "BK7238 Tuya S06Pro IR + TempHum (TuyaMCU + BLE 5.2 + Wi-Fi AP) handshakes and reports AP state",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7238_Tuya_S06Pro_IR_TempHum_TuyaMCU_T1-3S_1.0.1.bin"),
+        "args": ["--only-uart", "--uart1-hex", "-chip", "BK7238", "--ble-core",
+                 "--tuyamcu", "--tuyamcu-pid", "jbe3snv4tki8oo9c", "--tuyamcu-raw",
+                 "--wifi-peer", "auto"],
+        "timeout": 420,
+        "tags": ["BLE", "BLE core", "FIQ"],
+        "expected_strings": [
+            "device_id=0x21128000",
+            "< TuyaOS V:3.11.16 BS:40.00_PT:2.3_LAN:3.5_CAD:1.0.5_CD:1.0.0 >",
+            "t1_common_user_config_ir_ty sw ver:1.0.1",
+            "key_addr: 0x1f5000",
+            "0x88 0xd3 0x2a 0x22 0x15 0xba 0x68 0x4b 0xca 0x9b 0x19 0x65 0x68 0xbf 0x16 0xd7",
+            "have actived over 15 min, not enter mf_init",
+            "mf_init succ",
+            "read baud rate 9600",
+            # TuyaMCU startup handshake: heartbeat, product query, working-mode query.
+            "[UART1/MCU] 55 aa 00 00 00 00 ff 55 aa 00 01 00 00 00 55 aa 00 02 00 00 01",
+            "gw_cntl->gw_if.product_key:jbe3snv4tki8oo9c, input:jbe3snv4tki8oo9c",
+            "gw_cntl->gw_if.firmware_key:keyny8wdynkekrgw, input:keyny8wdynkekrgw",
+            "enter success_proc",
+            # BLE 5.2 exchange-memory advertisement + Wi-Fi state 0x03 report to MCU.
+            "uuid=0xFD50",
+            "jbe3snv4tki8oo9c  uuid=0xFD50",
+            "ble adv updated",
+            "[UART1/MCU] 55 aa 00 03 00 01 01 04",
+            # Pairing AP up on air: virtual station joins, gets DHCP lease, pings, sees LAN broadcast.
+            "[WIFI] found BSS 'SmartLife-C8F2'",
+            "[WIFI] associated with 'SmartLife-C8F2' (AID 1)",
+            "[NET] DHCP: we got 192.168.176.100/255.255.255.0 from the device (router 192.168.176.1)",
+            "[NET] ping reply from 192.168.176.1",
+            "Tuya LAN broadcast from 192.168.176.1:6667: Tuya LAN protocol 3.4/3.5 announcement, command 0x11, 265 bytes",
+        ],
+        # Both UART pairs (P0/P1 log, P10/P11 TuyaMCU) in second-function pull-up;
+        # the external MCU owns the sensors and LEDs, so P6/P26 stay untouched.
+        "expected_pins": {0: 0x78, 1: 0x78, 6: None, 10: 0x78, 11: 0x78, 26: None},
+    },
+    {
+        # First paired BK7238 dump that joins its stored network as a Wi-Fi
+        # station and calls the Tuya cloud: an IHSENO HAZ-IR-V3 standalone IR
+        # blaster (oem_t1_irbox_mol_ty:0.0.5 on TuyaOS 3.8.31, T1-3S, plaintext).
+        #
+        # Unlike the two BK7231N paired cloud cases (the PC321 3-phase meter and
+        # the Feconn MR16 bulb), which call the HTTPS activation endpoint with
+        # no pre-shared key set and stop before ClientKeyExchange (-0x7600),
+        # this dump is already bound ("already bind", psk_key / psk30_key stored
+        # in KV) and connects directly to its MQTT-over-TLS broker
+        # mqtts://m3-eu.lifeaiot.com:8883. When _tls_serve answers its PSK
+        # ClientHello with ServerHello (TLS_PSK_WITH_AES_128_GCM_SHA256) +
+        # ServerHelloDone, the firmware actually sends its ClientKeyExchange
+        # ("[NET] TLS ... pre-shared key identity:") before failing verification
+        # at mbedtls_ssl_handshake returned 0x7280 - the first real firmware in
+        # the suite exercising tls_psk_identity() in src/netstack.py.
+        #
+        # Also exercises:
+        #   * fast-connect fallback: attempts tkl_wifi_station_fast_connect to
+        #     the BSSID cached in flash (74:da:88:a5:9e:fb), times out, scans
+        #     for 'DOM-1', associates to our virtual AP, and persists the new
+        #     fast-connect record to flash ("writed fci to flash ssid=DOM-1").
+        #   * bound BLE 5.2 beacon (--ble-core): UUID 0xFD50 with bound flag
+        #     byte 0x4B ("50 fd 4b 0c 01 10 ...").
+        #   * pin config from {reset_pin:9,wfst_pin:26,infrr:8,...}: P8 (IR RX)
+        #     and P9 (reset button) in input pull-up (0x3C), P26 (Wi-Fi LED)
+        #     driven output high (0x02).
+        "name": "BK7238 Tuya IHSENO HAZ-IR-V3 IR Blaster (paired): joins stored network, BLE 5.2 adv, TLS-PSK cloud handshake",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7238_Tuya_IHSENO_HAZ_IR_V3_T1-3S_0.0.5.bin"),
+        "args": ["--only-uart", "-chip", "BK7238", "--ble-core", "--wifi-peer", "auto",
+                 "--pcap", "{pcap}", "--pcap-ip", "{pcap_ip}"],
+        "timeout": 420,
+        "tags": ["BLE", "BLE core", "FIQ"],
+        "expected_strings": [
+            "device_id=0x21128000",
+            "sdk_info:< TuyaOS V:3.8.31 BS:40.00_PT:2.3_LAN:3.5_CAD:1.0.5_CD:1.0.0 >",
+            "name:oem_t1_irbox_mol_ty:0.0.5",
+            "key_addr: 0x1f5000",
+            "gw_cntl->gw_wsm.stat:2",
+            "have actived over 15 min, not enter mf_init",
+            "mf_init succ",
+            "wifi soc init. pid:keycmhjv873dhvsn firmwarekey:keycmhjv873dhvsn ver:0.0.5",
+            "already bind",
+            # Bound BLE 5.2 beacon (0x4B flag byte in UUID 0xFD50 service data).
+            "uuid=0xFD50",
+            "50 fd 4b 0c 01 10 d7 be 6e",
+            "ble adv updated",
+            # Fast-connect attempt -> scan fallback -> associate to 'DOM-1' -> FCI flash write -> DHCP.
+            "[WIFI] device acts as a station (it authenticates): peer takes the access point role",
+            "[WIFI] device probes for 'DOM-1': adopting it as our SSID",
+            "[WIFI] station 80:64:7c:21:ff:7b associated to 'DOM-1'",
+            "writed fci to flash ssid=DOM-1",
+            "[NET] DHCP: device 80:64:7c:21:ff:7b got 192.168.1.100 (gateway/DNS 192.168.1.1)",
+            # Cloud MQTT-over-TLS connection: DNS -> ClientHello -> ServerHello -> ClientKeyExchange (PSK identity).
+            "connect to mqtt broker mqtts://m3-eu.lifeaiot.com:8883 port 8883",
+            "[NET] DNS m3-eu.lifeaiot.com -> 10.200.0.1 (offline sinkhole)",
+            "sends: TLS ClientHello (no server name)",
+            "client hello: version 1.2, 4 cipher suites (TLS_PSK_WITH_AES_128_GCM_SHA256, TLS_PSK_WITH_AES_128_CBC_SHA256, 0xc037, 0x00ff), no server name",
+            "answered with TLS_PSK_WITH_AES_128_GCM_SHA256, waiting for the key identity",
+            "pre-shared key identity: 49 bytes (0364d8879df5bbfb0eb28a17d0305ce89275808887f2c9d8426c203cae853ce6b763d35fbf7df39be0d3859b9cf1593327)",
+            "mbedtls_ssl_handshake returned 0x7280",
+        ],
+        "pcap_expect": ["beacon", "probe request", "authentication", "association request",
+                        "association response", "data", "DOM-1", "m3-eu"],
+        "ip_pcap_expect": ["m3-eu", "lifeaiot"],
+        "expected_pins": {0: 0x78, 1: 0x78, 8: 0x3C, 9: 0x3C, 10: 0x78, 11: 0x78, 26: 0x02},
     }
 ]
 
@@ -2411,6 +2605,32 @@ DESCRIPTIONS = {
         "Five BK7231N pwm_new channels at once at 16 kHz - the highest PWM frequency in the suite "
         "and the only case exercising all three pwm_new register groups simultaneously. Period "
         "1625 = 26 MHz / 16000 exactly, matching its stored pwmhz:16000.",
+    "BK7238 Tuya Onforu 100W CCT Floodlight (pwm_new 2-toggle CW, 256B flash page write) boots":
+        "The first BK7238 light in the suite that drives hardware PWM (TuyaOS 3.11.24, T1-U-HL "
+        "1.0.43, plaintext). Its stored Tuya config maps warm to P6 (PWM0) and cold to P26 (PWM5) "
+        "at 1000 Hz, and PWM0 uses two non-zero edge toggles (T1=0x171B, T2=0x4E75 -> 54.5% duty) "
+        "- the first real firmware exercising two-edge toggle replay in pwm_new_channels(). Also "
+        "guards BK7238's 256-byte flash page-write FIFO at 0x00803024 (REG_FLASH_PW_CONF), without "
+        "which 4K sector writes fail verification and reboot, and asserts [BLE_ADV] exchange-memory "
+        "extraction on the BLE 5.2 core (UUID 0xFD50 carrying keytfesxxsqewnqy).",
+    "BK7238 Tuya S06Pro IR + TempHum (TuyaMCU + BLE 5.2 + Wi-Fi AP) handshakes and reports AP state":
+        "The first BK7238 TuyaMCU firmware in the suite, and a new device class: an S06Pro IR "
+        "blaster + temperature/humidity station (t1_common_user_config_ir_ty 1.0.1, TuyaOS 3.11.16, "
+        "T1-3S, plaintext). Exercises all three emulated peripheral/radio models on BK7238 in one "
+        "run - UART1 TuyaMCU (0x00/0x01/0x02 handshake with licensed id jbe3snv4tki8oo9c), the "
+        "802.11 MAC + virtual station joining its SmartLife-C8F2 pairing AP (DHCP, ping, Tuya LAN "
+        "3.5 broadcast), and the BLE 5.2 core staging its UUID 0xFD50 beacon - and shows the "
+        "firmware report Wi-Fi state 0x01 (AP config mode, 55 aa 00 03 00 01 01 04) back to the MCU "
+        "once both radios are up.",
+    "BK7238 Tuya IHSENO HAZ-IR-V3 IR Blaster (paired): joins stored network, BLE 5.2 adv, TLS-PSK cloud handshake":
+        "The first paired BK7238 dump that joins its stored network ('DOM-1') as a Wi-Fi station and "
+        "reaches for the Tuya cloud (oem_t1_irbox_mol_ty:0.0.5 on TuyaOS 3.8.31, T1-3S, plaintext). "
+        "Because this unit is already bound ('already bind', psk30_key stored in KV), it connects "
+        "straight to its MQTT-over-TLS broker (m3-eu.lifeaiot.com:8883) and, when answered with "
+        "ServerHello (TLS_PSK_WITH_AES_128_GCM_SHA256), actually sends its ClientKeyExchange "
+        "(exercising tls_psk_identity() in src/netstack.py on real firmware for the first time) "
+        "before stopping at mbedtls_ssl_handshake 0x7280. Also covers fast-connect fallback + FCI "
+        "flash persistence, bound BLE 5.2 advertising (0x4B flag byte), and IR/button/LED GPIO mux.",
     "Berry Startup Command: print(\"Hello \" + str(5+2*2))":
         "Pulls OpenBeken's dedicated 1.18.302 Berry build and runs a one-line Berry script from the "
         "startup command: berry print(\"Hello \" + str(5+2*2)). Exercises the embedded VM end to "

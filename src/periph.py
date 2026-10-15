@@ -343,7 +343,7 @@ def pwm_registers(pwm):
 # lives here rather than in the caller because it is a decoding decision, and
 # there are now two callers - the self-test report and the GUI, which reads the
 # emulator's live register dicts instead of captured [EMU_*] lines.
-PWM_NEW_CHIPS = {"BK7231N", "BK7231M", "BL2028N"}
+PWM_NEW_CHIPS = {"BK7231N", "BK7231M", "BL2028N", "BK7238"}
 
 
 def decode_state(gpio, pwm, chip=""):
