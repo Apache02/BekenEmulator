@@ -65,6 +65,39 @@ BK7231_CHIP_IDS = (CHIP_FAMILIES["BK7231"][0], CHIP_FAMILIES["BK7231N"][0])
 SLOW_TICK_INSNS = 10000
 SLOW_TICK_MS = 2
 
+# The finer pacing grain, for UART bytes and the Wi-Fi MAC's in-flight
+# transmissions (see the "fast tick" in _pacing). Also the device-clock step
+# the chunked execution loop aims at, so that tick lands on its nominal
+# period rather than whenever a chunk happens to end.
+FAST_TICK_INSNS = 1000
+
+# Device-clock units one emu_start() call covers. All the emulator's periodic
+# work happens between two of them (see _run_chunked), so this is the grain
+# everything is paced on: one fast tick per chunk, ten chunks per slow tick,
+# which is the cadence the old per-block pacing produced. It also happens to
+# sit at the knee of the speed curve - best of three runs to a fixed 10M
+# device-clock count on a mathDemo boot: 250 -> 4.1s, 500 -> 3.8s,
+# 1000 -> 3.1s, 2000 -> 3.3s, 4000 -> 3.1s, 16000 -> 2.6s. Going past a fast
+# tick buys nothing until the step is many ticks long, and then it buys it by
+# delivering fewer interrupts per unit of device time, which is a behaviour
+# change rather than a speed-up.
+CHUNK_DEVICE_INSNS = FAST_TICK_INSNS
+
+# What one REAL guest instruction is worth on the insn_count device clock,
+# which is defined by the old per-block estimator (see hook_block): the ARM
+# instruction width, `(size >> 2) or 1` per basic block. In ARM state that is
+# exactly one per instruction. In Thumb state the instructions are 2 bytes, so
+# it would be one per two - except that the floor bites on every odd-length
+# block (a 3-instruction block is 6 bytes and counts 1, not 1.5), which pulls
+# the real figure well below a half. 0.42 is measured, not assumed:
+# scratch/calib.py runs the chunked loop with an extra counting-only block
+# hook and reports what the old estimator would have produced for the same
+# code. On an OpenBeken BK7231T boot it gives 0.4164 over 18.7M Thumb
+# instructions, stable at 0.40-0.44 across boot phases, and it is a property
+# of Thumb block lengths rather than of this firmware.
+CHUNK_SCALE_ARM = 1.0
+CHUNK_SCALE_THUMB = 0.42
+
 # How long UART1 receive bytes are held before the guest may read them. OpenBeken
 # enables UART1 RX early (~140k insns) but only registers its console callback
 # about a million instructions later in CMD_Init_Delayed, and the ISR discards
@@ -327,6 +360,19 @@ class BekenEmulator:
         self._snapshot_due = False
         self._uart_tail = b""
         self._resume_at = None
+        # Execution granularity. Normally the emulator drives Unicorn in
+        # chunks worth CHUNK_DEVICE_INSNS of device clock and does its
+        # periodic work between them (_run_chunked); EMU_BLOCK_PACING=1
+        # switches back to the old UC_HOOK_BLOCK callback, which is ~20x
+        # slower but defines the insn_count scale the chunked path
+        # reproduces. EMU_CHUNK_DEVICE_INSNS overrides the grain, for
+        # measuring it.
+        self._block_pacing = bool(os.environ.get("EMU_BLOCK_PACING"))
+        self.chunk_device_insns = int(os.environ.get("EMU_CHUNK_DEVICE_INSNS")
+                                      or CHUNK_DEVICE_INSNS)
+        # Bumped whenever trigger_irq/trigger_fiq actually takes an exception,
+        # i.e. moves PC out from under the chunk loop.
+        self._exc_epoch = 0
         # Advertising payloads already printed, so each is reported once.
         self._ble_adv_seen = set()
         # When EMU_REPORT is set (the self-test harness does this), periodically
@@ -540,13 +586,17 @@ class BekenEmulator:
         cpsr = self.mu.reg_read(UC_ARM_REG_CPSR)
         if (cpsr & 0x80) == 0:  # I bit is clear (IRQs enabled)
             pc = self.mu.reg_read(UC_ARM_REG_PC)
-            
+
             # Switch to IRQ mode (0x12), disable IRQs (0x80), clear Thumb bit (0x20)
             new_cpsr = (cpsr & ~0x3F) | 0x92
             self.mu.reg_write(UC_ARM_REG_CPSR, new_cpsr)
             self.mu.reg_write(UC_ARM_REG_SPSR, cpsr)
             self.mu.reg_write(UC_ARM_REG_LR, pc + 4)
             self.mu.reg_write(UC_ARM_REG_PC, 0x00000018)
+            # Tells _run_chunked that PC/CPSR moved under it, so the next
+            # chunk must start from the vector rather than where the guest
+            # was. Cheaper than re-reading both registers every chunk.
+            self._exc_epoch += 1
 
     def trigger_fiq(self):
         """Take the FIQ exception, if the ICU and the CPSR F bit allow it.
@@ -568,6 +618,7 @@ class BekenEmulator:
         self.mu.reg_write(UC_ARM_REG_SPSR, cpsr)
         self.mu.reg_write(UC_ARM_REG_LR, pc + 4)
         self.mu.reg_write(UC_ARM_REG_PC, 0x0000001C)
+        self._exc_epoch += 1            # see trigger_irq
 
     def hook_intr(self, mu, intno, user_data):
         pc = mu.reg_read(UC_ARM_REG_PC)
@@ -579,38 +630,58 @@ class BekenEmulator:
             mu.reg_write(UC_ARM_REG_LR, pc)
             mu.reg_write(UC_ARM_REG_PC, 0x00000008)
 
-    # Interrupt/pacing bookkeeping runs once per BASIC BLOCK, not per
-    # instruction. A per-instruction UC_HOOK_CODE callback dominated runtime
-    # (measured ~3.7x slower than a block hook on a real boot): Unicorn must
-    # leave the translated block to call into Python for every instruction,
-    # which defeats block execution. UC_HOOK_BLOCK fires once per ~5
-    # instructions, so whole blocks run natively between callbacks.
+    # Interrupt/pacing bookkeeping does NOT run per instruction. A
+    # per-instruction UC_HOOK_CODE callback dominated runtime (measured ~3.7x
+    # slower than a block hook on a real boot): Unicorn must leave the
+    # translated block to call into Python for every instruction, which
+    # defeats block execution.
     #
-    # insn_count is therefore an ESTIMATE: block byte size >> 2, i.e. the ARM
-    # instruction width. Pure-ARM code counts exactly; Thumb blocks undercount
-    # (slightly slowing the device clock there). Device time is already a
-    # fiction paced off this counter, so the approximation only nudges the
-    # wall<->device-time ratio - it never changes what the firmware computes.
+    # It used to run once per BASIC BLOCK (UC_HOOK_BLOCK -> hook_block), which
+    # is still available under EMU_BLOCK_PACING=1 and is what the insn_count
+    # scale is defined by. That too turned out to be the whole cost of the
+    # emulator: ~1.9 counted instructions per block means a ctypes callback
+    # into Python every two instructions, and a profile of a 15 s boot put
+    # ~80% of the time in hook_block plus Unicorn's callback glue. _run_chunked
+    # does the same work between counted emu_start() calls instead, so nothing
+    # calls into Python between chunks (see run()).
+    #
+    # insn_count is an ESTIMATE either way, and deliberately the SAME estimate:
+    # block byte size >> 2, i.e. the ARM instruction width. Pure-ARM code
+    # counts exactly; Thumb blocks undercount by ~2.4x (slightly slowing the
+    # device clock there). The chunked path reproduces that by scaling each
+    # chunk by the CPU state it ended in - see CHUNK_SCALE_THUMB.
+    # Device time is already a fiction paced off this counter, so the
+    # approximation only nudges the wall<->device-time ratio - it never changes
+    # what the firmware computes.
     # The periodic sources fire on threshold crossing (>= since last tick)
-    # rather than exact modulo, because the per-block increment is variable.
-    IRQ_CHECK_STRIDE = 20  # retained for reference; pacing is now per-block
+    # rather than exact modulo, because the per-chunk increment is variable.
+    IRQ_CHECK_STRIDE = 20  # retained for reference; pacing is now per-chunk
 
     def hook_block(self, mu, address, size, user_data):
+        """Legacy per-basic-block pacing (EMU_BLOCK_PACING=1); see _run_chunked."""
         state = self.state
         state.insn_count += (size >> 2) or 1
         # Where execution is right now. Read by the GUI status bar from another
         # thread, which is why it is captured here rather than via reg_read -
         # Unicorn is not safe to query while it is running.
         state.last_pc = address
+        self._pacing(state)
 
-        # GUI pause. One attribute test per basic block on the normal path; the
+    def _pacing(self, state):
+        """All the periodic device work, run once per block or once per chunk.
+
+        Called with state.insn_count already advanced for the piece of
+        execution that just happened, from a point where the CPU is between
+        instructions (a basic-block boundary, or an emu_start() chunk end).
+        """
+        # GUI pause. One attribute test per chunk on the normal path; the
         # blocking wait is only reached once actually paused, and it releases
         # the GIL so the UI thread gets it all.
         if self._paused:
             self._resume.wait()
 
-        # Snapshot request: taken here, at a block boundary, never from inside
-        # a memory hook where an instruction is half done.
+        # Snapshot request: taken here, between two instructions, never from
+        # inside a memory hook where an instruction is half done.
         if self._snapshot_path is not None:
             if self._snapshot_due or (self._snapshot_at_insns is not None
                                       and state.insn_count >= self._snapshot_at_insns):
@@ -647,10 +718,18 @@ class BekenEmulator:
                     state.pwm_dirty.clear()
                     state.uart1_events.clear()
                     buf.flush()
-                if state.insn_count - state.last_emit >= 1_000_000:
+                # Same line-boundary rule as the lines above, and for the same
+                # reason: this one used to open with "\n" unconditionally, so
+                # when the 1M-instruction tick landed mid-line it cut a guest
+                # log line in two - and since the harness filters [EMU_INSNS]
+                # out, what the test saw was a bare line break inside a string
+                # it was asserting on. Holding the emit until the stream is at
+                # a line start costs nothing: the next slow tick takes it.
+                if (state.insn_count - state.last_emit >= 1_000_000
+                        and state.uart_at_line_start):
                     state.last_emit = state.insn_count
                     buf = sys.__stdout__.buffer
-                    buf.write(b"\n[EMU_INSNS] %d\n" % state.insn_count)
+                    buf.write(b"[EMU_INSNS] %d\n" % state.insn_count)
                     buf.flush()
             # PWM/Timer (Tuya T-family tick through 0x802A04). Not on a pwm_new
             # firmware: that block has no such register, its ISR never acks
@@ -708,7 +787,7 @@ class BekenEmulator:
             self.trigger_fiq()
 
         # Fast tick (~every 1000 insns): UART RX/TX and SARADC interrupts.
-        if state.insn_count - state.last_fast >= 1000:
+        if state.insn_count - state.last_fast >= FAST_TICK_INSNS:
             state.last_fast = state.insn_count
             # A transmission in flight completes on this finer grain (~200 us
             # of device time), so a TX confirmation is not held for a whole
@@ -1367,7 +1446,11 @@ class BekenEmulator:
         self.mu.hook_add(UC_HOOK_MEM_WRITE, self.hook_mem_write_mmio, begin=self.ACCEL_BASE, end=self.ACCEL_BASE + 0x1000)
         self.mu.hook_add(UC_HOOK_MEM_READ, self.hook_mem_read_mmio, begin=self.ACCEL_BASE, end=self.ACCEL_BASE + 0x1000)
         self.mu.hook_add(UC_HOOK_MEM_UNMAPPED, self.hook_unmapped)
-        self._tick_hook = self.mu.hook_add(UC_HOOK_BLOCK, self.hook_block)
+        # Only under EMU_BLOCK_PACING: the chunked loop in run() does this
+        # work itself, and leaving the hook registered would cost the whole
+        # win (Unicorn calls it between every two guest instructions).
+        self._tick_hook = (self.mu.hook_add(UC_HOOK_BLOCK, self.hook_block)
+                           if self._block_pacing else None)
         self.mu.hook_add(UC_HOOK_INTR, self.hook_intr)
 
     # ------------------------------------------------------------ snapshots
@@ -1498,6 +1581,83 @@ class BekenEmulator:
         self._resume_at = pc | (1 if cpsr & 0x20 else 0)
         self.net_log("[SNAPSHOT] restored %s: %d instructions, pc 0x%08x" % (path, self.state.insn_count, pc))
 
+    def _run_chunked(self, start):
+        """Drive Unicorn one chunk of device time at a time, pacing between.
+
+        Unicorn's emu_start(count=N) runs exactly N guest instructions and
+        returns, so all the periodic device work can happen in this loop
+        instead of in a UC_HOOK_BLOCK callback. That matters because the
+        callback was the emulator: at ~1.9 counted instructions per basic
+        block, Unicorn was crossing the ctypes boundary into Python between
+        every two guest instructions. Nothing calls into Python between chunks
+        now except the MMIO hooks, which fire a few thousand times a second
+        rather than a hundred thousand.
+
+        Resuming is the same trick load_snapshot() uses: a chunk ends between
+        two instructions, so PC plus the CPSR Thumb bit is the whole of where
+        to carry on from.
+
+        The device clock (state.insn_count) deliberately does NOT become the
+        exact count Unicorn gives us here. Everything paced off it - UART
+        timing, the Wi-Fi MAC, interrupt rates, SLOW_TICK_INSNS - is
+        calibrated against the old per-block ESTIMATE, which counted one
+        instruction per 4 bytes of block and so ran at ~0.42 speed through
+        Thumb code. Feeding the exact count would make the device clock run
+        2.4x fast wherever the firmware is Thumb, which is most of an
+        OpenBeken app. So a chunk is converted back onto that scale by the
+        CPU state it ran in - CHUNK_SCALE_ARM / CHUNK_SCALE_THUMB.
+
+        That conversion also decides how LONG a chunk is: enough instructions
+        to advance the device clock by CHUNK_DEVICE_INSNS, which is one fast
+        tick. Sizing it in device units rather than instructions is what
+        keeps the pacing faithful - a fixed instruction count would land the
+        1000-unit fast tick on whatever multiple of the chunk's device step
+        came first (a 2048-instruction chunk steps 860 units in Thumb, so the
+        tick would fire every 1720 units, at 58% of its proper rate and with
+        the UART interrupts it drives thinned out to match). Only chunks that
+        straddle a mode switch step by something other than CHUNK_DEVICE_INSNS,
+        a few percent of them; measured end to end, a mathDemo boot reaches
+        its last log line within 3% of the device time the per-block pacing
+        gave it, having printed the same log - only the periodic "quicktick"
+        line moves, by one position, which is the tick phase shifting.
+        """
+        mu = self.mu
+        state = self.state
+        # Indexed by the Thumb bit: how many instructions to run, and - once
+        # the state the chunk ENDED in is known - what that is worth on the
+        # device clock. Both precomputed; the loop below only indexes.
+        device_step = self.chunk_device_insns
+        chunk_for = (max(1, round(device_step / CHUNK_SCALE_ARM)),
+                     max(1, round(device_step / CHUNK_SCALE_THUMB)))
+        step_for = tuple(tuple(max(1, int(chunk_for[entry] * scale))
+                               for scale in (CHUNK_SCALE_ARM, CHUNK_SCALE_THUMB))
+                         for entry in (0, 1))
+        emu_start = mu.emu_start
+        # Two reg_read calls, not reg_read_batch: the batch wrapper builds
+        # ctypes arrays and measured 2x slower than reading both directly.
+        reg_read = mu.reg_read
+        pacing = self._pacing
+        pc = start & ~1
+        thumb = start & 1
+        while True:
+            emu_start(pc | thumb, 0xFFFFFFFF, 0, chunk_for[thumb])
+            pc = reg_read(UC_ARM_REG_PC)
+            was_thumb, thumb = thumb, 1 if reg_read(UC_ARM_REG_CPSR) & 0x20 else 0
+            state.insn_count += step_for[was_thumb][thumb]
+            # Where execution is, for the GUI status bar in another thread.
+            state.last_pc = pc
+            epoch = self._exc_epoch
+            pacing(state)
+            if self.stopping:
+                break
+            if self._exc_epoch != epoch:
+                # The pacing work took an IRQ or FIQ: PC is now the vector and
+                # the mode/Thumb bit changed under us.
+                pc = reg_read(UC_ARM_REG_PC)
+                thumb = 1 if reg_read(UC_ARM_REG_CPSR) & 0x20 else 0
+            if pc == 0xFFFFFFFF:
+                break                   # ran into `until`: emulation is over
+
     def run(self):
         if getattr(self, "_resume_at", None) is not None:
             vector_base = self._resume_at
@@ -1521,7 +1681,10 @@ class BekenEmulator:
         self._print(f"Starting emulation at 0x{vector_base:08x}...")
         start_time = time.time()
         try:
-            self.mu.emu_start(vector_base, 0xFFFFFFFF, count=1000000000)
+            if self._block_pacing:
+                self.mu.emu_start(vector_base, 0xFFFFFFFF, count=1000000000)
+            else:
+                self._run_chunked(vector_base)
         except UcError as e:
             pc = self.mu.reg_read(UC_ARM_REG_PC)
             cpsr = self.mu.reg_read(UC_ARM_REG_CPSR)
