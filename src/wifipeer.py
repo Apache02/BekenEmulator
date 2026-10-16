@@ -241,6 +241,28 @@ class WifiPeer:
         if self._own_pcap and self.pcap is not None:
             self.pcap.close()
 
+    def device_reset(self, now_us=None):
+        """Forget the rebooted radio endpoint while retaining this peer/AP."""
+        now = self.now_us() if now_us is None else now_us
+        self._outq.clear()                 # frames addressed to the old MAC state
+        self.auth.clear()                  # WPA handshakes/session keys are link-local
+        self.bss = None
+        self.sta_state = "SCAN"
+        self.sta_next_us = now
+        self.sta_tries = 0
+        self.aid = 0
+        self.stations.clear()
+        self.next_aid = 1
+        self.last_beacon_us = None         # advertise immediately if we are the AP
+        # Keep the last auto-selected role as the first post-reset guess.  The
+        # link is now disconnected, so _pick_role may still flip it as soon as
+        # the rebooted device behaves differently; retaining it lets an AP
+        # resume beaconing immediately instead of waiting for role discovery.
+        if self.role != "auto":
+            self.active_role = self.role
+        if self.net is not None:
+            self.net.device_reset(now)
+
     def on_device_tx(self, frame, info=None):
         self.stats["rx"] += 1
         if self.pcap:
@@ -292,11 +314,16 @@ class WifiPeer:
             if self.active_role == "sta":
                 self._sta_learn_bss(sa, bssid, body, subtype)
             return
-        if subtype in (MGMT_PROBE_REQ, MGMT_AUTH, MGMT_ASSOC_REQ) and (self.active_role in (None, "ap")):
-            if subtype == MGMT_PROBE_REQ:
-                self._pick_role("ap", "it probes for networks")
-            else:
-                self._pick_role("ap", "it authenticates")
+        if subtype == MGMT_PROBE_REQ:
+            self._pick_role("ap", "it probes for networks")
+        elif subtype == MGMT_ASSOC_REQ:
+            self._pick_role("ap", "it associates")
+        elif (subtype == MGMT_AUTH and len(body) >= 4
+              and struct.unpack_from("<H", body, 2)[0] == 1):
+            # Authentication responses use the same management subtype.  Only
+            # sequence 1 proves that the device is initiating a station link;
+            # sequence 2 must continue through the peer's STA state machine.
+            self._pick_role("ap", "it authenticates")
         if self.active_role == "ap":
             self._ap_mgmt(subtype, da, sa, bssid, body)
         elif self.active_role == "sta":
@@ -626,9 +653,11 @@ def _run_selftests():
     class FakeNet:
         def __init__(self):
             self.gateway = True; self.ip = None; self.frames = []; self.up = None; self.output = None
+            self.reset_at = None
         def input(self, eth): self.frames.append(eth)
         def link_up(self, device_mac=None): self.up = device_mac
         def tick(self, now): pass
+        def device_reset(self, now): self.reset_at = now; self.up = None
         def close(self): self.closed = True
 
     clock = [0]
@@ -698,6 +727,33 @@ def _run_selftests():
     q.send_eth(dev + q.mac + b"\x08\x00" + b"X")
     f = sent2[-1]
     check((f[1] & 2) and f[4:10] == dev and f[10:16] == q.mac, "Ethernet -> FromDS data frame to the station")
+
+    print("== device reset: external AP survives, old link does not ==")
+    q._outq.append((clock[0] + 10_000, b"old", None))
+    q.auth[dev] = object()
+    q.device_reset(clock[0])
+    check(q.active_role == "ap" and not q.stations and not q.auth,
+          "reset keeps the auto-selected AP role but clears association and WPA state")
+    check(not q._outq and net2.reset_at == clock[0],
+          "queued radio frames are dropped and the IP side is reset at the same time")
+    before = len(sent2)
+    q.tick()
+    check(any(fc_fields(x)[1] == MGMT_BEACON for x in sent2[before:]),
+          "the surviving AP beacons immediately after the device resets")
+    flip_net = FakeNet()
+    flip_sent = []
+    flip = WifiPeer(str2mac("02:00:00:00:00:07"), flip_net,
+                    lambda f, d=None, _s=flip_sent: _s.append(f),
+                    log=lambda *a: None, now_us=lambda: clock[0])
+    flip.on_device_tx(flip._mgmt(
+        MGMT_BEACON, BCAST, dev, dev, struct.pack("<QHH", 0, 100, 0x0421)
+        + ie(IE_SSID, b"PairingAP") + ie(IE_RATES, RATES_BG) + ie(IE_DS, b"\x06")))
+    flip.device_reset(clock[0])
+    flip.on_device_tx(flip._mgmt(
+        MGMT_PROBE_REQ, BCAST, dev, BCAST,
+        ie(IE_SSID, b"HomeNet") + ie(IE_RATES, RATES_BG)))
+    check(flip.active_role == "ap",
+          "auto redetects a device that changes from AP to station across reset")
 
     print("== latency: frames reach the device after a delay ==")
     clk = [0]

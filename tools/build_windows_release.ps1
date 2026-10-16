@@ -24,7 +24,10 @@ try {
 
     $dataArgs = @()
     foreach ($name in $firmwareNames) {
-        $source = Join-Path "firmwares" $name
+        # PyInstaller resolves collected data relative to the generated .spec
+        # file, which lives under build/.  Use an absolute source so --specpath
+        # cannot silently redirect this to build/pyinstaller/firmwares.
+        $source = Join-Path $repoRoot (Join-Path "firmwares" $name)
         if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
             throw "Release firmware does not exist: $source"
         }

@@ -56,6 +56,9 @@ jobs:
     - name: GPIO button-to-relay firmware regression
       run: python tests/gpio_button.py
 
+    - name: Watchdog reboot model self-tests (synthetic firmware)
+      run: python tests/watchdog.py
+
     - name: Wi-Fi MAC hardware model self-tests (no firmware)
       run: python src/wifimac.py
 

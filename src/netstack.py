@@ -790,6 +790,10 @@ class HostIO:
         self.udp_in = collections.deque()        # (flow, data)
         self.udp_socks = {}             # sock -> flow
         self._stop = False
+        # Async DNS/connect workers capture this generation.  A device reboot
+        # increments it so a late result from the old TCP/IP instance cannot
+        # attach a socket or answer a query in the new one.
+        self.generation = 0
         self.thread = threading.Thread(target=self._run, name="netstack-io", daemon=True)
         self.thread.start()
 
@@ -811,6 +815,9 @@ class HostIO:
         return s
 
     def resolve(self, name, key):
+        with self.lock:
+            generation = self.generation
+
         def work():
             try:
                 ip = socket.gethostbyname(name)
@@ -818,24 +825,35 @@ class HostIO:
             except Exception:
                 res = None
             with self.lock:
-                self.dns_results.append((key, res))
+                if generation == self.generation and not self._stop:
+                    self.dns_results.append((key, res))
         threading.Thread(target=work, daemon=True).start()
 
     def connect(self, conn, ip, port):
+        with self.lock:
+            generation = self.generation
+
         def work():
+            s = None
             try:
                 s = socket.create_connection((ip, port), timeout=10)
-                if self._stop:          # shut down while this was connecting
-                    s.close()
-                    return
                 s.setblocking(False)
-                conn.sock = s
                 with self.lock:
+                    if self._stop or generation != self.generation:
+                        s.close()
+                        return
+                    conn.sock = s
                     self.socks[s] = conn
                     self.connect_results.append((conn, True))
             except Exception:
+                if s is not None:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
                 with self.lock:
-                    self.connect_results.append((conn, False))
+                    if generation == self.generation and not self._stop:
+                        self.connect_results.append((conn, False))
         threading.Thread(target=work, daemon=True).start()
 
     def attach(self, sock, conn):
@@ -937,6 +955,24 @@ class HostIO:
             sock.close()
         except Exception:
             pass
+
+    def reset_connections(self):
+        """Close device-side sockets but retain forward listeners and thread."""
+        with self.lock:
+            self.generation += 1
+            sockets = list(self.socks) + list(self.udp_socks)
+            sockets += [sock for sock, _ in self.accepted]
+            self.socks.clear()
+            self.udp_socks.clear()
+            self.accepted.clear()
+            self.dns_results.clear()
+            self.connect_results.clear()
+            self.udp_in.clear()
+        for sock in sockets:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
     def shutdown(self):
         """Stop the thread and close every host socket, the listeners included.
@@ -1635,6 +1671,58 @@ class NetStack:
         self.conns.clear()
         self.output = None
         self.on_frame = None
+
+    @staticmethod
+    def _forget_connection(conn):
+        """Remove retained payload/key material from one abandoned session."""
+        if conn.tls is not None:
+            conn.tls.clear_secrets()
+            conn.tls = None
+        conn.captured = b""
+        conn.rx_buf = b""
+        conn.tls_handshake_buf = b""
+        conn.tls_plain_buf = b""
+
+    def device_reset(self, now_us):
+        """Drop state owned by the rebooted device, keeping the outside LAN.
+
+        The router/AP, capture writer and listening port forwards are external
+        hardware and remain alive.  Associations call link_up() again after
+        reboot; every old transport flow and host socket is invalid then.
+        """
+        self.now_us = now_us
+        self.io.reset_connections()
+        for conn in tuple(self.conns.values()):
+            self._forget_connection(conn)
+        self.conns.clear()
+        self.udp_flows.clear()
+        self.dns_pending.clear()
+
+        # Accepted forward sockets which had not yet learned the device IP are
+        # not registered with HostIO, so close those explicitly.
+        waiting, self.pending_forward_wait = self.pending_forward_wait, []
+        for sock, _dport, _accepted_at in waiting:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+        self.link = False
+        self.link_up_us = None
+        self.device_mac = None
+        self.device_ip = None
+        self.probe_sent = False
+        self._next_probe_us = now_us
+        self._http_next_us = now_us
+        self.dhcp_state = "INIT"
+        self.dhcp_next_us = now_us
+        self.dhcp_server = None
+        self.offered = None
+        # In station mode this stack itself obtained an address from the
+        # device's AP, so that lease goes with the lost link.  In gateway mode
+        # our router address and lease table belong to the external LAN.
+        if not self.gateway:
+            self.ip = None
 
     # --------------------------------------------------------------- output
     def send_eth(self, dst_mac, ethertype, payload):

@@ -341,6 +341,10 @@ class BekenEmulator:
         # and a peer (src/wifipeer.py) can be attached to talk 802.11 to it.
         self.wifimac = None
         self.wifi_peer = None
+        # On-chip timers restart from zero on watchdog reset, while the access
+        # point/router and packet-capture clock outside the chip do not.  Add
+        # each completed boot here to give that external side monotonic time.
+        self._network_insn_offset = 0
         # Why run() ended early, as text, when it was an error rather than a
         # stop or the end of the program. run() only prints it; a front end
         # with its own error display reads it from here.
@@ -790,7 +794,8 @@ class BekenEmulator:
                 self.wifimac.on_tx = peer.on_device_tx
                 peer.inject = lambda f, decr=None: self.wifimac.inject(
                     f, self.state.insn_count, decr=decr)
-                peer.now_us = lambda: self.wifimac.now_us(self.state.insn_count)
+                peer.now_us = self._network_now_us
+                peer.device_reset(self._network_now_us())
         if self.blecore is not None:
             self.blecore = _blecore.BleCore(
                 self.XVR_BASE, SLOW_TICK_INSNS * 1000 // SLOW_TICK_MS,
@@ -808,6 +813,7 @@ class BekenEmulator:
         # Preserve only those external pad drives; controller configuration,
         # pending interrupts, RAM, and on-chip peripheral engines reset.
         gpio_inputs = dict(self.state.gpio_hw.inputs)
+        self._network_insn_offset += self.state.insn_count
 
         self.mu.mem_write(self.RAM_BASE, b"\x00" * self.RAM_SIZE)
         self.mu.mem_write(self.MMIO_BASE, b"\x00" * self.MMIO_SIZE)
@@ -870,6 +876,11 @@ class BekenEmulator:
         out.write(data)
         out.flush()
         self.state.uart_at_line_start = True
+
+    def _network_now_us(self):
+        """Monotonic time for the AP/router outside a rebooting device."""
+        insns = self._network_insn_offset + self.state.insn_count
+        return self.wifimac.now_us(insns) if self.wifimac is not None else 0
 
     def trace_pc(self, address):
         """Report the first execution of an exact guest PC.
@@ -936,7 +947,7 @@ class BekenEmulator:
                 inject=lambda f, decr=None: self.wifimac.inject(
                     f, self.state.insn_count, decr=decr),
                 log=self.net_log, role=role, ssid=ssid, channel=channel, pcap=pcap,
-                now_us=lambda: self.wifimac.now_us(self.state.insn_count),
+                now_us=self._network_now_us,
                 latency_us=self.NET_LATENCY_US, passphrase=passphrase)
         except BaseException:
             # The stack has already bound its forward ports; a peer that
@@ -2088,6 +2099,7 @@ class BekenEmulator:
                 "chip_variant": self.chip_variant,
                 "ble_adv_seen": self._ble_adv_seen,
                 "trng_state": self.trng_state,
+                "network_insn_offset": self._network_insn_offset,
             }, protocol=4)
         finally:
             for obj, saved in detached:
@@ -2154,6 +2166,7 @@ class BekenEmulator:
         self._ble_adv_seen = snap["ble_adv_seen"]
         if snap.get("trng_state") is not None:
             self.trng_state = snap["trng_state"]
+        self._network_insn_offset = snap.get("network_insn_offset", 0)
         if snap["blecore"] is not None:
             self.blecore = snap["blecore"]
             self.blecore.mem = (lambda addr, size: self.mu.mem_read(addr, size),
@@ -2170,7 +2183,7 @@ class BekenEmulator:
                 self.wifimac.on_tx = peer.on_device_tx
                 peer.inject = lambda f, decr=None: self.wifimac.inject(
                     f, self.state.insn_count, decr=decr)
-                peer.now_us = lambda: self.wifimac.now_us(self.state.insn_count)
+                peer.now_us = self._network_now_us
         # The run starts where the snapshot was taken: a block boundary.
         pc = self.mu.reg_read(UC_ARM_REG_PC)
         cpsr = self.mu.reg_read(UC_ARM_REG_CPSR)
