@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from src.crypto import (extract_and_decrypt, strip_crcs, parse_key, KNOWN_KEYS,
                         detect_bk7252_app_only)
 from src.emulator import BekenEmulator, CHIP_FAMILIES, CONSOLE_RX_HOLDOFF_INSNS
-from src import tuyamcu
+from src import tuyamcu, tuya_config
 from src.wifipeer import WIFI_ROLES
 
 # Data-point type names accepted by --tuyamcu-dp, mapped to the wire type codes.
@@ -221,7 +221,9 @@ def parse_args():
                              "firmware's own web panel. Repeatable.")
     parser.add_argument("--net-out", dest="net_out", action="store_true",
                         help="Let the device's outgoing DNS/TCP/UDP reach real hosts through "
-                             "the host's sockets. Default off: an offline network where DNS "
+                             "the host's sockets. For Tuya this can reconnect an identity "
+                             "already bound to the same app account; it does not pair or add "
+                             "a device. Default off: an offline network where DNS "
                              "names resolve to private sinkhole addresses, TCP connections are "
                              "accepted and what the firmware sends is logged ([NET] lines) and "
                              "captured, NTP is answered with the host clock.")
@@ -261,7 +263,8 @@ def parse_args():
                         help="Firmware decryption key: a known name (%s), 32 hex chars, or base64 of 16 bytes. "
                              "Omit for plaintext images (no decryption)." % ", ".join(sorted(KNOWN_KEYS)))
     parser.add_argument("-chip", "--chip", dest="chip", default="BK7231", metavar="CHIP",
-                        help="Chip identity served from the SCTRL id registers: %s. Default: BK7231 (T/U family)."
+                        help="Chip/variant served from the SCTRL id registers: %s. "
+                             "Default: BK7231; select BK7231U for its GPIO32..39 bank."
                              % ", ".join(sorted(CHIP_FAMILIES)))
     return parser.parse_args()
 
@@ -363,7 +366,8 @@ def build_emulator(dump_path, key=None, chip="BK7231", with_boot=False, only_uar
                          xvr_selfclear=xvr_selfclear, tuyamcu_dps=tuyamcu_dps,
                          tuyamcu_injects=tuyamcu_injects, uart_sink=uart_sink,
                          ble_core=ble_core, wifi=wifi,
-                         exception_vector_base=0x10000 if app_window is not None else 0)
+                         exception_vector_base=0x10000 if app_window is not None else 0,
+                         chip_variant=chip_name)
 
 
 def main():
@@ -398,13 +402,26 @@ def main():
             xvr_selfclear=args.xvr_selfclear, ble_core=args.ble_core,
             wifi=args.wifi or want_peer)
         if want_peer:
+            # The offline TLS peer needs the image's PSK to authenticate its
+            # local broker session.  --net-out is an opaque end-to-end relay,
+            # so do not recover or retain a redundant host-side copy there.
+            if args.net_out:
+                tls_psks = ()
+                tuya_legacy_identity_psk = False
+            else:
+                decoded_config = tuya_config.extract(args.dump_file)
+                tls_psks = tuya_config.tls_psk_candidates(decoded_config)
+                tuya_legacy_identity_psk = (
+                    tuya_config.uses_tuya_legacy_identity_psk(decoded_config))
             emu.attach_wifi_peer(role=args.wifi_peer or "auto", ssid=args.wifi_ssid,
                                  channel=args.wifi_channel, peer_mac=parse_mac(args.wifi_mac),
                                  passphrase=check_wifi_pass(args.wifi_pass),
                                  forwards=parse_forwards(args.net_forwards),
                                  net_out=args.net_out, pcap=args.pcap,
                                  http_gets=parse_http_gets(args.net_http_gets),
-                                 mqtt_pubs=parse_mqtt_pubs(args.mqtt_pubs))
+                                 mqtt_pubs=parse_mqtt_pubs(args.mqtt_pubs),
+                                 tls_psks=tls_psks,
+                                 tuya_legacy_identity_psk=tuya_legacy_identity_psk)
         if args.pcap_ip:
             from src import netstack as _netstack
             ip_cap = _netstack.EthPcap(args.pcap_ip)

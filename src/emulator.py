@@ -14,10 +14,12 @@ try:
     from . import tuyamcu as _tuyamcu
     from . import blecore as _blecore
     from . import wifimac as _wifimac
+    from . import gpio as _gpio
 except ImportError:
     import tuyamcu as _tuyamcu
     import blecore as _blecore
     import wifimac as _wifimac
+    import gpio as _gpio
 
 # Known chip identities served from the SCTRL id registers (0x00800000 chip
 # id, 0x00800004 device id), selectable with --chip. Values extracted from
@@ -26,6 +28,10 @@ except ImportError:
 # do not check these registers at all, so the BK7231 default is safe for them.
 CHIP_FAMILIES = {
     "BK7231": (0x0007231A, 0x18520001),   # BK7231T/U family (default)
+    # Same served ID as the generic family, but a distinct selection lets the
+    # emulator expose the U variant's GPIO32..39 bank without mapping those
+    # addresses as pins for BK7231T firmware.
+    "BK7231U": (0x0007231A, 0x18520001),
     # BK7231N/M silicon's own identity (sys_ctrl.h: CHIP_ID_BK7231N,
     # DEVICE_ID_BK7231N_A). Most N-family builds run fine on the default
     # above, but newer SDK builds check it: their bk_check_chip_id accepts
@@ -187,6 +193,10 @@ class SimulatorState:
         # performs only tens of GPIO writes (a couple of thousand PWM ones),
         # so recording them costs nothing measurable.
         self.gpio_cfg = {}         # pin -> last value written to its config reg
+        # Physical input levels and the GPIO controller's INTEN/INTLV/INTSTA
+        # registers.  The model itself is lock-free and pickleable; host-thread
+        # changes reach it through BekenEmulator's queue.
+        self.gpio_hw = _gpio.GpioModel()
         self.pwm_regs = {}         # register offset -> last value written
         # Keys changed since the last report emission. The snapshot used to go
         # out only on the 1,000,000-instruction [EMU_INSNS] tick, which races
@@ -272,14 +282,25 @@ class BekenEmulator:
     GDMA_DSTADDR_INC = 1 << 9
     GDMA_TRANS_LEN_POSI = 16    # length is stored as (bytes - 1)
     GPIO_BASE = 0x00802800
-    GPIO_END = 0x008028A0
-    # Capture-only upper bound for the WRITE hook. Wider than GPIO_END so the
-    # function-select registers REG_GPIO_FUNC_CFG_2/_3 (0x8028B8/0x8028BC) are
-    # recorded - they carry the P24/P26 pin-mux on BK7231N. GPIO_END itself
-    # must stay at 0x8028A0: the READ hook pull-simulates bit 0 for everything
-    # below it, which would corrupt read-modify-writes of a mux register.
-    GPIO_CAP_END = 0x008028C0
-    
+    GPIO_PIN_COUNT = 32
+    GPIO_PIN_END = GPIO_BASE + GPIO_PIN_COUNT * 4
+    GPIO_FUNC_CFG = GPIO_BASE + 32 * 4
+    GPIO_INTEN = GPIO_BASE + 33 * 4
+    GPIO_INTLV0 = GPIO_BASE + 34 * 4
+    GPIO_INTLV1 = GPIO_BASE + 35 * 4
+    GPIO_INTSTA = GPIO_BASE + 36 * 4
+    GPIO_FUNC_CFG_2 = GPIO_BASE + 46 * 4
+    GPIO_FUNC_CFG_3 = GPIO_BASE + 47 * 4
+    # BK7221U silicon (selected here as BK7252) has GPIO32..39 after the two
+    # function-select words, followed by a second interrupt bank.  Logical pin
+    # 32 is therefore physical register slot 48 -- never slot 32 (FUNC_CFG).
+    GPIO_EXT_PIN_FIRST = 32
+    GPIO_EXT_SLOT_FIRST = 48
+    GPIO_EXT_PIN_COUNT = 8
+    GPIO_EXT_PIN_END = GPIO_BASE + (GPIO_EXT_SLOT_FIRST + GPIO_EXT_PIN_COUNT) * 4
+    GPIO_INTEN2 = GPIO_BASE + 56 * 4
+    GPIO_INTLV3 = GPIO_BASE + 57 * 4
+    GPIO_INTSTA2 = GPIO_BASE + 58 * 4
     # UART Registers
     UART1_FIFO_PORT = 0x0080210c
     UART1_FIFO_STATUS = 0x00802108
@@ -292,9 +313,10 @@ class BekenEmulator:
     ICU_INT_ENABLE = 0x00802040  # ICU_INTERRUPT_ENABLE (0x802050 is ICU_ARM_WAKEUP_EN)
     ICU_GLOBAL_INT_EN = 0x00802044
 
-    def __init__(self, raw_flash, bootloader, app, with_boot=False, only_uart=False, chip_identity=None, uart1_hex=False, physical_flash=None, uart1_rx=b"", uart1_rx_delay=CONSOLE_RX_HOLDOFF_INSNS, tuyamcu_enabled=False, tuyamcu_pid=None, tuyamcu_raw=False, xvr_selfclear=False, tuyamcu_dps=None, tuyamcu_injects=None, uart_sink=None, ble_core=None, wifi=False, exception_vector_base=0):
+    def __init__(self, raw_flash, bootloader, app, with_boot=False, only_uart=False, chip_identity=None, uart1_hex=False, physical_flash=None, uart1_rx=b"", uart1_rx_delay=CONSOLE_RX_HOLDOFF_INSNS, tuyamcu_enabled=False, tuyamcu_pid=None, tuyamcu_raw=False, xvr_selfclear=False, tuyamcu_dps=None, tuyamcu_injects=None, uart_sink=None, ble_core=None, wifi=False, exception_vector_base=0, chip_variant=None):
         self.raw_flash = raw_flash
         self.xvr_selfclear = xvr_selfclear
+        self.chip_variant = (chip_variant or "").strip().upper()
         # Opt-in RivieraWaves Wi-Fi MAC model over 0xC0000000 (src/wifimac.py).
         # Off, the block is plain memory and the firmware's Wi-Fi stack comes up
         # but can never move a frame or see time pass; on, TX/RX descriptors,
@@ -334,7 +356,7 @@ class BekenEmulator:
         self.blecore = None
         chip_id = (chip_identity or CHIP_FAMILIES["BK7231"])[0]
         layout = BLE_CORE_LAYOUTS.get(chip_id)
-        if ble_core is True and layout is None:
+        if ble_core is True and (layout is None or self.chip_variant == "BK7231U"):
             raise ValueError("--ble-core models the BLE 5.x core of BK7231N/M (5.1) and "
                              "BK7238 (5.2); this chip has no such core.")
         want_ble_core = (ble_core is True or
@@ -433,6 +455,12 @@ class BekenEmulator:
         # That keeps the lock off the hot read path, which polls UART1 status
         # constantly during boot.
         self._rx_lock = threading.Lock()
+        # Host/UI threads enqueue physical GPIO changes here.  Only _pacing(),
+        # which runs between guest instructions on the emulation thread, drains
+        # them into state.gpio_hw.  In particular, set_gpio_input() never calls
+        # Unicorn from a foreign thread.
+        self._gpio_lock = threading.Lock()
+        self._gpio_events = []
         # Pause support for a GUI. Checked once per basic block, so it must
         # stay a plain attribute test - the Event is only touched once actually
         # paused. Pausing also hands the GIL back, which is what keeps a UI
@@ -482,6 +510,9 @@ class BekenEmulator:
         # other supported chip 0x900000 is the XVR register block instead. So
         # this flag switches that window between "RAM" and "XVR registers".
         self.is_bk7252 = (self.chip_id_value == CHIP_FAMILIES["BK7252"][0])
+        self.has_extended_gpio = (self.is_bk7252 or self.chip_variant == "BK7231U")
+        self.gpio_pin_count = (self.GPIO_EXT_PIN_FIRST + self.GPIO_EXT_PIN_COUNT
+                               if self.has_extended_gpio else self.GPIO_PIN_COUNT)
         # Chips whose 0x802B00 block is pwm_new (pwm_bk7231n.c). On the 7252
         # family the same window is the audio block. The BK7231 identity also
         # covers T/U, which never touch 0x802B00, so modelling it there is inert.
@@ -491,6 +522,8 @@ class BekenEmulator:
         self.is_bk7231 = self.chip_id_value in BK7231_CHIP_IDS
 
         self.state = SimulatorState()
+        if self.gpio_pin_count != self.state.gpio_hw.pin_count:
+            self.state.gpio_hw = _gpio.GpioModel(self.gpio_pin_count)
         self.flash_state = FlashState()
         # The unstripped dump. Flash reads are normally served from the
         # CRC-stripped (logical) image, but a 2MB physical dump only yields
@@ -571,6 +604,108 @@ class BekenEmulator:
         with self._rx_lock:
             self.uart1_rx += bytes(data)
 
+    def set_gpio_input(self, pin, level):
+        """Drive one GPIO input from a host thread, or release it with ``None``.
+
+        ``level`` is 0 or 1 while an external switch/sensor drives the pad.
+        ``None`` disconnects that external drive, after which the guest's pull
+        configuration decides the sampled level.  Calls are queued and applied
+        between guest instructions by the emulation thread; this method never
+        reads or writes Unicorn and is safe for a GUI callback.
+        """
+        if (not isinstance(pin, int) or isinstance(pin, bool)
+                or not 0 <= pin < self.gpio_pin_count):
+            raise ValueError("GPIO pin must be in the range 0-%d"
+                             % (self.gpio_pin_count - 1))
+        level = _gpio.GpioModel.check_level(level)
+        with self._gpio_lock:
+            self._gpio_events.append((pin, level))
+
+    def _gpio_slot(self, pin):
+        """Physical register slot for a logical GPIO number."""
+        if pin < self.GPIO_PIN_COUNT:
+            return pin
+        return self.GPIO_EXT_SLOT_FIRST + (pin - self.GPIO_EXT_PIN_FIRST)
+
+    def _gpio_pin_at(self, address):
+        """Logical GPIO at an MMIO address, excluding controller registers."""
+        # This helper is reached from the hooks for every MMIO access in the
+        # system.  Reject the overwhelmingly common non-GPIO case before doing
+        # alignment or division work.
+        end = self.GPIO_EXT_PIN_END if self.has_extended_gpio else self.GPIO_PIN_END
+        if address < self.GPIO_BASE or address >= end:
+            return None
+        if address & 3:
+            return None
+        slot = (address - self.GPIO_BASE) // 4
+        if 0 <= slot < self.GPIO_PIN_COUNT:
+            return slot
+        if (self.has_extended_gpio and self.GPIO_EXT_SLOT_FIRST <= slot
+                < self.GPIO_EXT_SLOT_FIRST + self.GPIO_EXT_PIN_COUNT):
+            return self.GPIO_EXT_PIN_FIRST + (slot - self.GPIO_EXT_SLOT_FIRST)
+        return None
+
+    def _gpio_config_word(self, pin):
+        # gpio_cfg keys are physical register slots.  That preserves the
+        # report's historical 0..31/function-register representation while
+        # keeping BK7231U/BK7252 logical P32 distinct from FUNC_CFG at slot 32.
+        return self.state.gpio_cfg.get(self._gpio_slot(pin), 0)
+
+    def _apply_gpio_events(self, state):
+        # A racy false here can only defer a just-enqueued event to the next
+        # pacing boundary.  It avoids acquiring a mutex on every normal chunk.
+        if not self._gpio_events:
+            return
+        with self._gpio_lock:
+            if not self._gpio_events:
+                return
+            events, self._gpio_events = self._gpio_events, []
+        for pin, level in events:
+            state.gpio_hw.drive(pin, level, self._gpio_config_word(pin))
+
+    def _sync_gpio_irq(self, state):
+        """Resample level sources and drive the GPIO controller's ICU line."""
+        state.gpio_hw.refresh_level_interrupts(self._gpio_config_word)
+        if state.gpio_hw.irq_asserted():
+            state.pending_irqs |= (1 << 7)
+        else:
+            state.pending_irqs &= ~(1 << 7)
+
+    def _restore_legacy_gpio_state(self):
+        """Build GPIO hardware state for a snapshot made before ``gpio_hw``.
+
+        Old snapshots still contain the controller/pin words in Unicorn's
+        mapped MMIO memory.  Their report-side ``gpio_cfg`` capture stopped at
+        slot 47, however, so upper P32..P39 (physical slots 48..55) must be
+        recovered explicitly for pull/level interrupt behaviour after resume.
+        """
+        def word(address):
+            try:
+                return struct.unpack("<I", self.mu.mem_read(address, 4))[0]
+            except Exception:
+                return 0
+
+        gpio_hw = _gpio.GpioModel(self.gpio_pin_count)
+        enabled = word(self.GPIO_INTEN)
+        if self.has_extended_gpio:
+            enabled |= (word(self.GPIO_INTEN2) & 0xFF) << 32
+        gpio_hw.write_enable(enabled)
+        gpio_hw.write_mode_word(0, word(self.GPIO_INTLV0))
+        gpio_hw.write_mode_word(16, word(self.GPIO_INTLV1))
+        if self.has_extended_gpio:
+            gpio_hw.write_mode_word(32, word(self.GPIO_INTLV3), count=8)
+            for pin in range(self.GPIO_EXT_PIN_FIRST,
+                             self.GPIO_EXT_PIN_FIRST + self.GPIO_EXT_PIN_COUNT):
+                slot = self._gpio_slot(pin)
+                if slot not in self.state.gpio_cfg:
+                    config = word(self.GPIO_BASE + slot * 4)
+                    # Zero is also the untouched/reset value.  It has no pull
+                    # or input sampling semantics to recover, so do not report
+                    # it as a firmware-configured pin merely because RAM read 0.
+                    if config:
+                        self.state.gpio_cfg[slot] = config
+        self.state.gpio_hw = gpio_hw
+
     def is_paused(self):
         return self._paused
 
@@ -649,7 +784,7 @@ class BekenEmulator:
 
     def attach_wifi_peer(self, role="auto", ssid=None, channel=1, peer_mac=None,
                          forwards=(), net_out=False, pcap=None, http_gets=(), mqtt_pubs=(),
-                         passphrase=None):
+                         passphrase=None, tls_psks=(), tuya_legacy_identity_psk=False):
         """Put a virtual station/access point and an IP network behind the MAC model.
 
         role "auto" lets the peer take the opposite role of whatever the
@@ -674,7 +809,8 @@ class BekenEmulator:
         net = _netstack.NetStack(mac, log=self.net_log, gateway=(role == "ap"),
                                  ip=_netstack.str2ip("192.168.1.1") if role == "ap" else None,
                                  net_out=net_out, forwards=forwards, http_gets=http_gets,
-                                 mqtt_pubs=mqtt_pubs)
+                                 mqtt_pubs=mqtt_pubs, tls_psks=tls_psks,
+                                 tuya_legacy_identity_psk=tuya_legacy_identity_psk)
         # Late binding on purpose: a front end may attach its frame sink after
         # the peer, and the snapshot path rebuilds this stack.
         net.on_frame = lambda d, f, us: (self.net_frame_sink(d, f, us)
@@ -708,6 +844,10 @@ class BekenEmulator:
         """
         peer, self.wifi_peer = self.wifi_peer, None
         if peer is not None:
+            # MacHw lives as long as the emulator object (the GUI keeps that
+            # object to display its final state).  Do not let its bound method
+            # keep the closed WifiPeer -> NetStack -> TLS credentials alive.
+            self.wifimac.on_tx = None
             peer.close()
 
     def _uart_write(self, data):
@@ -811,6 +951,15 @@ class BekenEmulator:
     # rather than exact modulo, because the per-chunk increment is variable.
     IRQ_CHECK_STRIDE = 20  # retained for reference; pacing is now per-chunk
 
+    @staticmethod
+    def _old_pwm_timer_status_mask(pwm_ctl):
+        """Status bits for enabled+interrupting old-PWM timer channels."""
+        mask = 0
+        for channel in range(6):
+            if ((pwm_ctl >> (4 * channel)) & 0xF) == 0x7:
+                mask |= 1 << channel
+        return mask
+
     def hook_block(self, mu, address, size, user_data):
         """Legacy per-basic-block pacing (EMU_BLOCK_PACING=1); see _run_chunked."""
         state = self.state
@@ -839,6 +988,13 @@ class BekenEmulator:
         # the GIL so the UI thread gets it all.
         if self._paused:
             self._resume.wait()
+
+        # External GPIO changes are queued by a GUI/host thread and become
+        # hardware state only here, between guest instructions.  Resampling
+        # level modes on every pacing boundary also gives held-low/high inputs
+        # their real level-triggered behaviour after the ISR clears INTSTA.
+        self._apply_gpio_events(state)
+        self._sync_gpio_irq(state)
 
         # Slow tick: raise the periodic sources' pending.
         if state.insn_count - state.last_slow >= SLOW_TICK_INSNS:
@@ -889,11 +1045,21 @@ class BekenEmulator:
                     buf = sys.__stdout__.buffer
                     buf.write(b"[EMU_INSNS] %d\n" % state.insn_count)
                     buf.flush()
-            # PWM/Timer (Tuya T-family tick through 0x802A04). Not on a pwm_new
-            # firmware: that block has no such register, its ISR never acks
-            # 0x802A04, and the bit would stay pending for good.
+            # PWM/Timer (Tuya T/Q-family RTOS tick through 0x802A04).  Each old
+            # PWM channel owns one nibble in PWM_CTL: enable, interrupt-enable,
+            # then the two-bit mode.  PMODE_TIMER is 1, hence an active clock
+            # channel has nibble 0b0111.  Do not hard-code channel zero here:
+            # the BK7231Q SDK uses channel 3 (CTL=0x7000, period at +0x20), and
+            # its ISR dispatch table quite correctly has no callback in slot 0.
+            # Raising bit 0 made the ISR acknowledge a source with no handler,
+            # leaving the FreeRTOS tick -- and every Tuya software timer -- at
+            # zero forever.
+            #
+            # Not on a pwm_new firmware: that block has no such status register,
+            # its ISR never acks 0x802A04, and the bit would stay pending.
             if state.icu_int_enable & (1 << 9) and not state.pwmn_seen:
-                state.pwm_status |= (1 << 0)
+                pwm_ctl = state.pwm_regs.get(0, 0)
+                state.pwm_status |= self._old_pwm_timer_status_mask(pwm_ctl)
             if state.icu_int_enable & (1 << 8): # BKTIMER (OpenBK)
                 state.timer3_5_ctl |= (1 << 7)
             # Pulse the SARADC interrupt (ICU bit 11) while samples pend, paced
@@ -1105,13 +1271,48 @@ class BekenEmulator:
         if self.blecore is not None and self.XVR_BASE <= address < self.XVR_BASE + self.blecore.window:
             self.blecore.write(address, value, self.state.insn_count)
 
-        # GPIO config registers - one 32-bit word per pin at GPIO_BASE + n*4.
-        # Bit 1 is the driven output level (GCFG_OUTPUT), bit 3 output-enable.
-        if self.GPIO_BASE <= address < self.GPIO_CAP_END:
-            _pin = (address - self.GPIO_BASE) // 4
-            self.state.gpio_cfg[_pin] = value & 0xFFFFFFFF
+        # GPIO input/interrupt controller.  Keep actual pin config slots apart
+        # from FUNC_CFG and INTEN/INTLV/INTSTA: the old broad range treated all
+        # of those controller words as imaginary pins 32+ and even applied pull
+        # synthesis to their reads.
+        _pin = self._gpio_pin_at(address)
+        if _pin is not None:
+            _slot = self._gpio_slot(_pin)
+            _old = self.state.gpio_cfg.get(_slot, 0)
+            _new = value & 0xFFFFFFFF
+            self.state.gpio_hw.config_changed(_pin, _old, _new)
+            self.state.gpio_cfg[_slot] = _new
             if self._emit_insns:
-                self.state.gpio_dirty.add(_pin)
+                self.state.gpio_dirty.add(_slot)
+            self._sync_gpio_irq(self.state)
+        elif address == self.GPIO_INTEN:
+            self.state.gpio_hw.write_enable(
+                (self.state.gpio_hw.int_enable & ~0xFFFFFFFF) | (value & 0xFFFFFFFF))
+            self._sync_gpio_irq(self.state)
+        elif address == self.GPIO_INTLV0:
+            self.state.gpio_hw.write_mode_word(0, value)
+            self._sync_gpio_irq(self.state)
+        elif address == self.GPIO_INTLV1:
+            self.state.gpio_hw.write_mode_word(16, value)
+            self._sync_gpio_irq(self.state)
+        elif address == self.GPIO_INTSTA:
+            self.state.gpio_hw.clear_status(value & 0xFFFFFFFF)
+            self._sync_gpio_irq(self.state)
+        elif self.has_extended_gpio and address == self.GPIO_INTEN2:
+            low = self.state.gpio_hw.int_enable & 0xFFFFFFFF
+            self.state.gpio_hw.write_enable(low | ((value & 0xFF) << 32))
+            self._sync_gpio_irq(self.state)
+        elif self.has_extended_gpio and address == self.GPIO_INTLV3:
+            self.state.gpio_hw.write_mode_word(32, value, count=8)
+            self._sync_gpio_irq(self.state)
+        elif self.has_extended_gpio and address == self.GPIO_INTSTA2:
+            self.state.gpio_hw.clear_status((value & 0xFF) << 32)
+            self._sync_gpio_irq(self.state)
+        elif address in (self.GPIO_FUNC_CFG, self.GPIO_FUNC_CFG_2, self.GPIO_FUNC_CFG_3):
+            _slot = (address - self.GPIO_BASE) // 4
+            self.state.gpio_cfg[_slot] = value & 0xFFFFFFFF
+            if self._emit_insns:
+                self.state.gpio_dirty.add(_slot)
 
         # PWM block. pwm.h places PWM_BASE at either PWM_NEW_BASE (0x802A00)
         # or PWM_NEW_BASE + 0x80 depending on a build switch, so capture the
@@ -1321,23 +1522,45 @@ class BekenEmulator:
         if address == 0x00800004:
             mu.mem_write(address, struct.pack("<I", self.device_id_value))
             return
-        # GPIO config registers (0x802800 + pin*4). Bit 0 is the input level,
-        # which real silicon drives; with nothing connected the pull decides it.
-        # Model that: a pin with the pull enabled reads back high for pull-up
-        # and low for pull-down. Without this, bit 0 always reads 0 and any
-        # firmware waiting for a pulled-up pin spins forever (BK7231U's
-        # RT-Thread build does exactly that before printing anything).
-        if self.GPIO_BASE <= address < self.GPIO_END:
-            try:
-                cfg = struct.unpack("<I", mu.mem_read(address, 4))[0]
-            except Exception:
-                cfg = 0
-            if cfg & (1 << 5):  # GCFG_PULL_ENABLE
-                if cfg & (1 << 4):  # GCFG_PULL_MODE: 1 = up
-                    cfg |= 1
-                else:
-                    cfg &= ~1
-            mu.mem_write(address, struct.pack("<I", cfg))
+        # GPIO config reads combine firmware-owned config with the external pad
+        # level.  Only real pin slots come through this path; the adjacent
+        # interrupt controller words have their own semantics below.
+        _pin = self._gpio_pin_at(address)
+        if _pin is not None:
+            _slot = self._gpio_slot(_pin)
+            if _slot in self.state.gpio_cfg:
+                cfg = self.state.gpio_cfg[_slot]
+            else:
+                try:
+                    cfg = struct.unpack("<I", mu.mem_read(address, 4))[0]
+                except Exception:
+                    cfg = 0
+            cfg = self.state.gpio_hw.read_config(_pin, cfg)
+            mu.mem_write(address, struct.pack("<I", cfg & 0xFFFFFFFF))
+            return
+        if address == self.GPIO_INTEN:
+            mu.mem_write(address, struct.pack("<I", self.state.gpio_hw.int_enable & 0xFFFFFFFF))
+            return
+        if address == self.GPIO_INTLV0:
+            mu.mem_write(address, struct.pack("<I", self.state.gpio_hw.read_mode_word(0)))
+            return
+        if address == self.GPIO_INTLV1:
+            mu.mem_write(address, struct.pack("<I", self.state.gpio_hw.read_mode_word(16)))
+            return
+        if address == self.GPIO_INTSTA:
+            mu.mem_write(address, struct.pack("<I", self.state.gpio_hw.int_status & 0xFFFFFFFF))
+            return
+        if self.has_extended_gpio and address == self.GPIO_INTEN2:
+            mu.mem_write(address, struct.pack("<I",
+                                              (self.state.gpio_hw.int_enable >> 32) & 0xFF))
+            return
+        if self.has_extended_gpio and address == self.GPIO_INTLV3:
+            mu.mem_write(address, struct.pack("<I",
+                                              self.state.gpio_hw.read_mode_word(32, count=8)))
+            return
+        if self.has_extended_gpio and address == self.GPIO_INTSTA2:
+            mu.mem_write(address, struct.pack("<I",
+                                              (self.state.gpio_hw.int_status >> 32) & 0xFF))
             return
 
         if address == 0x00802A04:
@@ -1720,6 +1943,7 @@ class BekenEmulator:
                 "blecore": self.blecore,
                 "wifimac": self.wifimac,
                 "chip": (self.chip_id_value, self.device_id_value),
+                "chip_variant": self.chip_variant,
                 "ble_adv_seen": self._ble_adv_seen,
                 "trng_state": self.trng_state,
             }, protocol=4)
@@ -1741,6 +1965,9 @@ class BekenEmulator:
             raise ValueError("%s is not a snapshot of this emulator" % path)
         if snap["chip"] != (self.chip_id_value, self.device_id_value):
             raise ValueError("snapshot was taken with a different -chip identity")
+        if (snap.get("chip_variant") is not None
+                and snap["chip_variant"] != self.chip_variant):
+            raise ValueError("snapshot was taken with a different -chip variant")
         if (snap["wifimac"] is None) != (self.wifimac is None):
             raise ValueError("snapshot was taken %s the Wi-Fi MAC model (--wifi); use the same option"
                              % ("with" if snap["wifimac"] is not None else "without"))
@@ -1756,6 +1983,19 @@ class BekenEmulator:
         self.state = snap["state"]
         if not hasattr(self.state, "idle_task"):
             self.state.idle_task = None     # a snapshot from before idle skipping
+        if not hasattr(self.state, "gpio_hw"):
+            # BKSNAP01 predates the GPIO model.  Preserve its register state as
+            # far as that format permits: INTEN/INTLV were formerly ordinary
+            # mapped words.  INTSTA starts clear because old snapshots could
+            # contain only the guest's last W1C write, not hardware status.
+            self._restore_legacy_gpio_state()
+        elif self.state.gpio_hw.pin_count != self.gpio_pin_count:
+            raise ValueError("snapshot GPIO width does not match its chip identity")
+        # Host-side events are deliberately outside snapshots, like socket and
+        # GUI state.  Do not let a press queued before the load leak into the
+        # restored device on its next pacing boundary.
+        with self._gpio_lock:
+            self._gpio_events = []
         self.flash_state = snap["flash_state"]
         if snap["physical_flash"] is not None:
             self.physical_flash = bytearray(snap["physical_flash"])

@@ -109,6 +109,34 @@ _NETWORK_SECRET_FIELDS = {
     "pskKey", "psk_key", "psk30_key", "auth_key", "token", "reg_key",
 }
 
+_STORED_ID_FIELDS = (
+    "uuid", "auth_key", "ap_ssid", "pskKey", "psk_key", "psk30_key",
+)
+_MIN_STORED_ID_LEN = 8
+_MAX_STORED_ID_LEN = 512
+
+
+def _stored_id_value(buf, name):
+    """Return one bounded ASCII value from a loose storage record.
+
+    Valid JSON is decoded separately in :func:`_collect`.  This fallback is
+    for the adjacent, torn, or ``name=value`` records found in some storage
+    sectors.  Tuya PSK 3.0 values use standard Base64, so ``+``, ``/`` and
+    padding ``=`` are part of the token.  Requiring a real field separator and
+    a trailing record delimiter prevents a damaged printable run from being
+    accepted only as a matching prefix.
+    """
+    key = name.encode("ascii") if isinstance(name, str) else name
+    token = rb"([A-Za-z0-9_+/\-=]{%d,%d})" % (
+        _MIN_STORED_ID_LEN, _MAX_STORED_ID_LEN)
+    pattern = (rb"(?<![A-Za-z0-9_])" + re.escape(key)
+               + rb"(?:[\"']?\s*[:=]\s*[\"']?|\s+)"
+               + token + rb"(?=$|[\"'\s,;}\]\x00])")
+    match = re.search(pattern, buf)
+    if match is None:
+        return None
+    return match.group(1).decode("ascii")
+
 
 def _network_raw(obj, original):
     """JSON text safe for reports while retaining the record's shape."""
@@ -171,12 +199,30 @@ def _parse_loose(text):
 
 def _collect(buf):
     """Pull the interesting records out of a (decrypted) buffer."""
-    found = {"network": None, "dps": [], "pins": [], "ids": {}, "raw": []}
+    found = {"network": None, "dps": [], "pins": [], "ids": {}, "raw": [],
+             "tls_mode": None}
     seen_dp = set()
     for _off, blob in _json_objects(buf):
         obj = _decode(blob)
         if not isinstance(obj, dict):
             continue
+        # Credential-only KV records do not carry schemaId/productKey/devId,
+        # so recover their known fields from every valid JSON object.  Keep
+        # the exact decoded string; presentation code masks it below.
+        for name in _STORED_ID_FIELDS:
+            value = obj.get(name)
+            if isinstance(value, (str, int)):
+                value = str(value)
+                if _MIN_STORED_ID_LEN <= len(value) <= _MAX_STORED_ID_LEN:
+                    found["ids"].setdefault(name, value)
+        # dy_tls_m is not a credential.  Mode 2 identifies the older Tuya
+        # PSK-only/bootstrap path whose firmware may configure the same
+        # 32-byte constant as both the TLS key and its clear identity.
+        if found["tls_mode"] is None and "dy_tls_m" in obj:
+            try:
+                found["tls_mode"] = int(obj["dy_tls_m"])
+            except (TypeError, ValueError):
+                pass
         text = blob.decode("ascii", "replace")
         if "nc_tp" in obj or "ssid" in obj:
             if found["network"] is None:
@@ -208,10 +254,11 @@ def _collect(buf):
                 found["pins"] = pairs
                 found["raw"].insert(0, text)
                 break
-    for name in (b"uuid", b"auth_key", b"ap_ssid", b"pskKey", b"psk_key", b"psk30_key"):
-        m = re.search(name + rb"[\"':= ]{1,4}([A-Za-z0-9_\-]{8,40})", buf)
-        if m:
-            found["ids"][name.decode()] = m.group(1).decode("ascii", "replace")
+    for name in _STORED_ID_FIELDS:
+        value = _stored_id_value(buf, name)
+        if value is not None:
+            # Prefer an exact json.loads result over the loose fallback.
+            found["ids"].setdefault(name, value)
     return found
 
 
@@ -444,6 +491,8 @@ def extract(path):
             found["raw"].insert(0, plain["raw"][0] if plain["raw"] else "")
         for k, v in plain["ids"].items():
             found["ids"].setdefault(k, v)
+        if found["tls_mode"] is None:
+            found["tls_mode"] = plain["tls_mode"]
 
     if not (found["pins"] or found["dps"] or found["network"] or found["ids"]):
         return None
@@ -458,8 +507,61 @@ def extract(path):
         "network": found["network"],
         "dps": found["dps"],
         "ids": found["ids"],
+        "tls_mode": found["tls_mode"],
         "human": summarise(found, key_off, inner, encrypted),
     }
+
+
+def tls_psk_candidates(decoded):
+    """Return private TLS-PSK byte candidates from an extracted config.
+
+    Tuya generations use slightly different field spellings.  Prefer PSK 3.0,
+    retain the older spellings as authenticated fallbacks, and never derive a
+    key from the masked human summary.  The TLS peer decides which candidate is
+    correct only by verifying the client's encrypted Finished message.
+    """
+    ids = (decoded or {}).get("ids")
+    if not isinstance(ids, dict):
+        return ()
+    out = []
+    for name in ("psk30_key", "psk_key", "pskKey"):
+        value = ids.get(name)
+        if not isinstance(value, str):
+            continue
+        try:
+            candidate = value.encode("ascii")
+        except UnicodeEncodeError:
+            continue
+        if not (_MIN_STORED_ID_LEN <= len(candidate) <= _MAX_STORED_ID_LEN):
+            continue
+        if candidate not in out:
+            out.append(candidate)
+    return tuple(out)
+
+
+def uses_tuya_legacy_identity_psk(decoded):
+    """Whether this config enables Tuya's legacy identity-as-PSK trial.
+
+    Some PSK-only TuyaOS builds keep a normal 37-character cloud ``psk_key``
+    in storage but use a separate embedded 32-byte bootstrap value for an
+    initial connection, passing that value to mbedTLS as both PSK and identity.
+    Keep this compatibility behavior narrowly gated to the observed config
+    generation and token shape.  The network peer still authenticates the
+    encrypted Finished before accepting the identity as a usable key.
+    """
+    if not isinstance(decoded, dict) or decoded.get("tls_mode") != 2:
+        return False
+    ids = decoded.get("ids")
+    if not isinstance(ids, dict) or ids.get("psk30_key"):
+        return False
+    value = ids.get("psk_key", ids.get("pskKey"))
+    if not isinstance(value, str):
+        return False
+    try:
+        candidate = value.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    return len(candidate) == 37 and candidate.isalnum()
 
 
 def _run_selftests():
@@ -492,6 +594,70 @@ def _run_selftests():
     network = _collect(b'{"nc_tp":3,"ssid":"Home Net","passwd":"password1"}')
     check("Home Net" not in network["raw"][0] and "password1" not in network["raw"][0],
           "raw report records mask stored WiFi credentials")
+
+    print("== stored credential recovery ==")
+    # Synthetic rather than copied from a dump: its shape exercises both
+    # standard-Base64 punctuation and the former 40-character truncation.
+    psk30 = "A" * 21 + "+" + "B" * 20 + "/="
+    from_json = _collect(
+        b'{"psk30_key":"' + psk30.encode("ascii") + b'"}')
+    json_value = from_json["ids"].get("psk30_key")
+    check(json_value is not None, "PSK 3.0 is recovered from credential-only JSON")
+    check(json_value is not None and len(json_value) == len(psk30),
+          "standard Base64 PSK 3.0 keeps its full length")
+    check(json_value == psk30,
+          "standard Base64 punctuation and padding survive JSON recovery")
+
+    from_loose = _collect(
+        b"\x00psk30_key=" + psk30.encode("ascii") + b"\x00")
+    check(from_loose["ids"].get("psk30_key") == psk30,
+          "the bounded loose-storage fallback preserves the same full value")
+    too_long = b"A" * (_MAX_STORED_ID_LEN + 1)
+    overrun = _collect(b"psk30_key=" + too_long + b"\x00")
+    check("psk30_key" not in overrun["ids"],
+          "the loose-storage fallback does not accept a truncated prefix")
+    embedded = _collect(
+        b"backup_psk30_key=" + psk30.encode("ascii") + b"\x00")
+    check("psk30_key" not in embedded["ids"],
+          "the loose-storage fallback requires an exact field name")
+
+    masked = [value for label, value in summarise(from_json, None, None, False)
+              if label == "PSK 3.0 key"]
+    mask_shape_ok = (len(masked) == 1 and len(masked[0]) == len(psk30)
+                     and masked[0].count("*") == len(psk30) - 4)
+    check(mask_shape_ok, "the human/GUI summary keeps the recovered PSK masked")
+
+    candidates = tls_psk_candidates({"ids": {
+        "psk30_key": "synthetic-psk30-value==",
+        "psk_key": "synthetic-legacy-value",
+        "pskKey": "synthetic-legacy-value",
+        "auth_key": "not-a-tls-candidate",
+    }})
+    check(candidates == (b"synthetic-psk30-value==", b"synthetic-legacy-value"),
+          "TLS candidates prefer PSK 3.0, include legacy spelling and remove duplicates")
+    check(tls_psk_candidates({"ids": {"psk30_key": "nonascii-\u017c"}}) == ()
+          and tls_psk_candidates(None) == (),
+          "invalid or absent private PSKs are ignored without inventing a key")
+
+    legacy_cfg = {
+        "tls_mode": 2,
+        "ids": {"psk_key": "A" * 37},
+    }
+    check(uses_tuya_legacy_identity_psk(legacy_cfg),
+          "Tuya TLS mode 2 with its exact legacy PSK shape enables identity-key trial")
+    check(not uses_tuya_legacy_identity_psk({
+              "tls_mode": 2,
+              "ids": {"psk_key": "A" * 37, "psk30_key": "B" * 44},
+          })
+          and not uses_tuya_legacy_identity_psk({
+              "tls_mode": 1,
+              "ids": {"psk_key": "A" * 37},
+          })
+          and not uses_tuya_legacy_identity_psk({
+              "tls_mode": 2,
+              "ids": {"psk_key": "A" * 36},
+          }),
+          "PSK 3.0, another TLS mode, or another key shape keeps legacy trial disabled")
 
     print("\nAll %d Tuya config self-tests passed." % n)
     return n

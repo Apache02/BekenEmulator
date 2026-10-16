@@ -9,9 +9,14 @@ GPIO layout (beken378/driver/gpio/gpio.h):
         bit0 input level   bit1 output level   bit2 input enable
         bit3 output enable bit4 pull up/down   bit5 pull enable
         bit6 second function enable            bit7 input monitor
-    index 32 is REG_GPIO_FUNC_CFG, 46 is REG_GPIO_FUNC_CFG_2 - function
+    index 32 is REG_GPIO_FUNC_CFG, 46/47 are REG_GPIO_FUNC_CFG_2/_3 - function
     selects, not pins, so they are reported separately rather than decoded as
     if they were.
+
+BK7231U/BK7252 P32..P39 are not contiguous with P0..P31: their physical
+register slots are 48..55, after those function-select words.  The decoder
+translates those slots back to logical pin numbers for front ends while
+keeping the function words separate.
 
 A pin the firmware never wrote is left as "factory": on real silicon that is
 whatever reset state the pad has, and the emulator has not been told otherwise.
@@ -21,7 +26,10 @@ import os
 import re
 
 PIN_COUNT = 32
-FUNC_REGS = {32: "REG_GPIO_FUNC_CFG", 46: "REG_GPIO_FUNC_CFG_2"}
+BK7252_PIN_COUNT = 40
+BK7252_EXT_SLOT = 48
+FUNC_REGS = {32: "REG_GPIO_FUNC_CFG", 46: "REG_GPIO_FUNC_CFG_2",
+             47: "REG_GPIO_FUNC_CFG_3"}
 
 
 
@@ -141,10 +149,21 @@ def parse_lines(lines):
     return gpio, pwm
 
 
-def gpio_table(gpio):
+def gpio_pin_values(gpio, chip=""):
+    """Return a logical ``pin -> config`` map, excluding controller words."""
+    pins = {pin: value for pin, value in gpio.items() if 0 <= pin < PIN_COUNT}
+    if chip in ("BK7231U", "BK7252"):
+        for pin in range(PIN_COUNT, BK7252_PIN_COUNT):
+            slot = BK7252_EXT_SLOT + pin - PIN_COUNT
+            if slot in gpio:
+                pins[pin] = gpio[slot]
+    return pins
+
+
+def gpio_table(gpio, pin_count=PIN_COUNT):
     """[(pin, alias, state, detail)] for every pin, touched or not."""
     rows = []
-    for pin in range(PIN_COUNT):
+    for pin in range(pin_count):
         alias = pin_alias(pin)
         if pin in gpio:
             detail = decode_pin(gpio[pin])
@@ -360,9 +379,13 @@ def decode_state(gpio, pwm, chip=""):
     else:
         channels, ctl, base = pwm_channels(pwm)
         layout = "old"
-    return {"gpio": gpio_table(gpio),
+    logical_gpio = gpio_pin_values(gpio, chip)
+    pin_count = BK7252_PIN_COUNT if chip in ("BK7231U", "BK7252") else PIN_COUNT
+    return {"gpio": gpio_table(logical_gpio, pin_count),
             "pwm_layout": layout,
-            "raw": gpio,
+            # Logical pin keys are what GUI actions and report assertions need;
+            # controller/function registers remain available through ``func``.
+            "raw": logical_gpio,
             "pwm_pins": pwm_output_pins(gpio),
             "func": func_rows(gpio),
             "pwm_ctl": ctl,

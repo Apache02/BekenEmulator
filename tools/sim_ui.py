@@ -60,8 +60,44 @@ FIRMWARE_DIR = os.path.join(ROOT_DIR, "firmwares")
 DEFAULT_IMAGE = os.path.join(
     FIRMWARE_DIR, "OpenBK7231T_QIO_1.18.300_mathDemo_obkStartupCommand_uartConsole.bin")
 
+# Useful end-to-end runs, kept close to DEFAULT_IMAGE so this is also the one
+# inventory a developer updates when a bundled dump is renamed.  These are
+# deliberately profiles rather than mere paths: several families share an ID,
+# encrypted OpenBeken images need their known key, and the paired cloud examples
+# are pointless without the Wi-Fi peer.  A paired profile deliberately enables
+# the real outbound relay: if that exact device identity is still bound to the
+# user's Tuya account, the app can see it come online.  No credential is stored
+# here -- each paired image's provisioning data comes from its own flash.
+INTERESTING_DUMPS = (
+    {"label": "OBK T", "file": "OpenBK7231T_QIO_1.18.300.bin",
+     "chip": "BK7231", "key": "TUYA", "wifi": True},
+    {"label": "OBK N", "file": "OpenBK7231N_QIO_1.18.300.bin",
+     "chip": "BK7231N", "key": "TUYA", "wifi": True},
+    {"label": "OBK 7238", "file": "OpenBK7238_QIO_1.18.300.bin",
+     "chip": "BK7238", "key": "(none)", "wifi": True},
+    {"label": "OBK 7252", "file": "OpenBK7252_QIO_1.18.300.bin",
+     "chip": "BK7252", "key": "(none)", "wifi": True},
+    {"label": "WB3S relay", "file": "BK7231T_Tuya_1G_Switch_WB3S-IPEX_1.0.4.bin",
+     "chip": "BK7231", "key": "TUYA", "wifi": True},
+    {"label": "MOES relay", "file": "BK7231Q_Tuya_MOES_Relay_WA2_1.1.3.bin",
+     "chip": "BK7231", "key": "(none)", "wifi": True},
+    {"label": "GBDQA breaker", "file": "BK7238_GBDQA_63V_16A.bin",
+     "chip": "BK7238", "key": "(none)", "wifi": True, "paired": True,
+     "net_out": True},
+    {"label": "IR blaster",
+     "file": "BK7238_Tuya_IHSENO_HAZ_IR_V3_T1-3S_0.0.5.bin",
+     "chip": "BK7238", "key": "(none)", "wifi": True, "paired": True,
+     "net_out": True},
+    {"label": "LSC bulb",
+     "file": "BK7231N_Tuya_LSC_GLS_A60_CBLC5_1.6.0.bin",
+     "chip": "BK7231N", "key": "TUYA", "wifi": True, "paired": True,
+     "net_out": True},
+)
+
 POLL_MS = 60            # how often the UI drains the emulator's output buffer
 MAX_LINES = 4000        # per pane; older lines are dropped so a long run is bounded
+FRAME_PRIVACY_NOTE = ("Raw frames and saved PCAPs can contain identities or credentials "
+                      "that firmware sends in clear.")
 
 # Device time per emulated second, from the emulator's own tick model rather
 # than a copy of its numbers. Used only to label the status bar - it is an
@@ -118,6 +154,10 @@ NET_TITLE = "network - virtual Wi-Fi and IP bridge"
 # the window's memory at a few tens of MB on a very long run; older frames are
 # dropped and the window says how many.
 MAX_FRAMES = 20000
+# First entry in the captured-traffic target selector.  Real addresses are
+# compared as parsed IPv4 endpoints; this label can therefore never collide
+# with or accidentally substring-match one.
+ALL_FRAME_TARGETS = "All targets"
 # How to switch the bridge on, said by both the network pane and the
 # captured-traffic window while they are empty.
 WIFI_HOWTO = "Enable \"Wi-Fi peer\" on the Config tab before Run"
@@ -129,26 +169,30 @@ NET_IDLE_HINT = ("Nothing on air yet. %s to attach the virtual radio and the IP 
 # convenience only: a missing or unreadable file just means the defaults.
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".bekensim_ui.json")
 
-# Every Config-tab option and its default. The GUI attaches its safe, offline
-# virtual Wi-Fi peer by default; the command line remains explicitly opt-in.
+# Every Config-tab option and its default. The GUI is an integration tool, so
+# its virtual router relays outbound traffic by default. The command-line
+# emulator remains explicitly opt-in through --net-out.
 OPTION_DEFAULTS = {
     "boot": False, "xvr_selfclear": False, "blecore": False,
     "tuyamcu": False, "tuyamcu_pid": "", "tuyamcu_raw": False,
-    "wifi": True, "wifi_role": "auto", "wifi_ssid": "", "wifi_pass": "",
+    "wifi": True, "net_out": True,
+    "wifi_role": "auto", "wifi_ssid": "", "wifi_pass": "",
     "fwd_local": "8080", "fwd_device": "80",
     "pcap": False, "pcap_path": "",
     "http_gets": "", "mqtt_pubs": "",
 }
 # The two options typed one-per-line in a small text box rather than an entry.
 TEXT_OPTIONS = ("http_gets", "mqtt_pubs")
-# Never written to the settings file: it may well be a real network's
-# passphrase, since that is the one a paired device has stored.
-UNSAVED_OPTIONS = ("wifi_pass",)
+# Never written to the settings file: a passphrase is secret, while net_out
+# should always return to the documented GUI default rather than silently
+# inheriting an older version's saved choice.
+UNSAVED_OPTIONS = ("wifi_pass", "net_out")
 
 
-# -chip collapses the whole BK7231 T/U/N/M/Q family onto one identity, so the
-# silicon name periph reads off the filename maps down to these four.
-CLI_FAMILY = {"BK7238": "BK7238", "BK7252N": "BK7252N", "BK7252": "BK7252"}
+# Most BK7231 variants share one served identity.  U stays explicit because
+# its second GPIO bank is a real hardware-layout distinction.
+CLI_FAMILY = {"BK7231U": "BK7231U", "BK7238": "BK7238",
+              "BK7252N": "BK7252N", "BK7252": "BK7252"}
 
 
 def guess_chip(path):
@@ -200,6 +244,18 @@ class SimulatorUI:
         self._u2_partial = ""
         self.quick_buttons = []
         self._periph_key = None       # last GPIO/PWM snapshot drawn
+        # Pins the user is holding through the GPIO pane: pin -> driven level.
+        # These are external pad levels, not firmware register edits.  Keeping
+        # the state here lets a press survive a table redraw (a relay write can
+        # otherwise replace every Treeview row while the button is held).
+        self._gpio_pressed = {}
+        self._gpio_selected = None
+        # The image selector describes the *next* run and may change while the
+        # current firmware is still executing.  Keep the running image's
+        # decoded wiring separate so a Browse cannot silently invert a held
+        # button's active level.
+        self._run_tuya_config = None
+        self._run_image = None
         self._tuya_key = None         # (path, size, mtime) of config currently drawn
         self.tuya_config = None
 
@@ -269,6 +325,28 @@ class SimulatorUI:
             var.trace_add("write", lambda *_a: self._options_changed())
             self.opt[name] = var
         self.opt_text = {}
+
+        # One click selects a known-useful image with the correct chip/key and
+        # starts it through the ordinary Run path.  Keeping this above the Run
+        # controls makes it a launcher, while the image row still shows exactly
+        # what was selected and remains fully editable afterwards.
+        self.interesting_buttons = []
+        self.interesting_group_labels = []
+        for paired, title in ((False, "Quick run:"),
+                              (True, "Real Tuya reconnect (owned IDs only; sends to cloud):")):
+            interesting = ttk.Frame(self.root)
+            interesting.pack(fill="x", padx=6, pady=(0, 3))
+            heading = ttk.Label(interesting, text=title)
+            heading.pack(side="left", padx=(0, 4))
+            self.interesting_group_labels.append(heading)
+            for profile in INTERESTING_DUMPS:
+                if bool(profile.get("paired")) != paired:
+                    continue
+                button = ttk.Button(
+                    interesting, text=profile["label"],
+                    command=lambda p=profile: self._run_interesting(p))
+                button.pack(side="left", padx=(0, 4))
+                self.interesting_buttons.append(button)
 
         run = ttk.Frame(self.root)
         run.pack(fill="x", padx=6)
@@ -346,6 +424,9 @@ class SimulatorUI:
         self.tree.tag_configure("factory", foreground="#5b6472")   # de-emphasised
         self.tree.tag_configure("out", foreground="#0b6b3a")       # driven output
         self.tree.tag_configure("func", foreground="#14448f")      # peripheral owns the pad
+        self.tree.tag_configure("pressed", foreground="#9b2c2c")   # externally driven input
+        self.tree.bind("<<TreeviewSelect>>", self._gpio_selection_changed)
+        self.tree.bind("<Double-1>", self._gpio_double_click)
 
         # Packed bottom-up ahead of the table, like the rows under the logs,
         # so a short window squeezes the table and not these.
@@ -356,6 +437,17 @@ class SimulatorUI:
         ttk.Label(peri, textvariable=self.var_pwm, anchor="w",
                   wraplength=300, justify="left").pack(side="bottom", fill="x", pady=(4, 0),
                                                        before=pf)
+
+        gpio_ctl = ttk.Frame(peri)
+        gpio_ctl.pack(side="bottom", fill="x", pady=(4, 0), before=pf)
+        self.var_gpio_action = tk.StringVar(
+            value="Select a configured GPIO input to simulate its button.")
+        ttk.Label(gpio_ctl, textvariable=self.var_gpio_action, anchor="w").pack(
+            side="left", fill="x", expand=True)
+        self.btn_gpio_press = ttk.Button(gpio_ctl, text="Press", width=13,
+                                         state="disabled",
+                                         command=self._toggle_gpio_input)
+        self.btn_gpio_press.pack(side="right", padx=(6, 0))
 
         right = ttk.LabelFrame(panes, text="UART2 - firmware debug log", padding=4)
         self.txt2 = self._console(right, mono)
@@ -562,8 +654,10 @@ class SimulatorUI:
             return box
 
         def note(box, row, text):
-            ttk.Label(box, text=text, foreground="#5b6472", wraplength=300,
-                      justify="left").grid(row=row, column=2, sticky="w", padx=(10, 0), pady=3)
+            label = ttk.Label(box, text=text, foreground="#5b6472", wraplength=300,
+                              justify="left")
+            label.grid(row=row, column=2, sticky="w", padx=(10, 0), pady=3)
+            return label
 
         def check(box, row, name, text, help_):
             w = ttk.Checkbutton(box, text=text, variable=self.opt[name])
@@ -597,24 +691,32 @@ class SimulatorUI:
         note(dev, 5, "Send product info in the raw 16-byte form newer TuyaOS needs, not JSON.")
         self.opt_widgets["tuyamcu"] = [pid, raw]
 
-        net = group(1, "Network (offline: nothing leaves this machine)")
+        net = group(1, "Network")
         check(net, 0, "wifi", "Wi-Fi peer",
-              "Attach a virtual radio peer and an offline IP network: DHCP, DNS, and "
-              "local answers to HTTP, MQTT and TLS.")
-        ttk.Label(net, text="role").grid(row=1, column=0, sticky="w", padx=(18, 6), pady=3)
+              "Attach a virtual radio peer and IP network. Outbound traffic is relayed through "
+              "this computer by default; clear the option below for an offline sinkhole.")
+        net_out = check(
+            net, 1, "net_out", "real internet / Tuya cloud",
+            "Relay the firmware's outbound DNS, TCP and UDP through this computer. This does "
+            "not pair or add a device. It only reconnects an already-bound identity; if its "
+            "credentials remain valid and the app uses the same account and region, that "
+            "existing device may come online. Use only identities you own; keep the physical "
+            "device offline to avoid a duplicate connection. Frame history stays complete, "
+            "but real-cloud TLS/MQTT payloads remain encrypted.")
+        ttk.Label(net, text="role").grid(row=2, column=0, sticky="w", padx=(18, 6), pady=3)
         role = ttk.Combobox(net, textvariable=self.opt["wifi_role"], values=list(WIFI_ROLES),
                             state="readonly", width=8)
-        role.grid(row=1, column=1, sticky="w", pady=3)
-        note(net, 1, "auto takes the opposite role to whatever the device turns out to be.")
-        ssid = entry(net, 2, "wifi_ssid", "network name",
+        role.grid(row=2, column=1, sticky="w", pady=3)
+        note(net, 2, "auto takes the opposite role to whatever the device turns out to be.")
+        ssid = entry(net, 3, "wifi_ssid", "network name",
                      "Empty adopts whichever network the device asks for.")
-        pw = entry(net, 3, "wifi_pass", "passphrase",
+        pw = entry(net, 4, "wifi_pass", "passphrase",
                    "Makes the access point WPA2 protected. A paired device only joins with "
                    "the passphrase it stored. Not saved between launches.")
         pw.configure(show="*")
-        ttk.Label(net, text="forward").grid(row=4, column=0, sticky="w", padx=(18, 6), pady=3)
+        ttk.Label(net, text="forward").grid(row=5, column=0, sticky="w", padx=(18, 6), pady=3)
         fwd = ttk.Frame(net)
-        fwd.grid(row=4, column=1, sticky="w", pady=3)
+        fwd.grid(row=5, column=1, sticky="w", pady=3)
         ttk.Label(fwd, text="127.0.0.1:").pack(side="left")
         f_local = ttk.Entry(fwd, textvariable=self.opt["fwd_local"], width=6)
         f_local.pack(side="left")
@@ -625,18 +727,20 @@ class SimulatorUI:
                                            command=self._open_forward,
                                            state="disabled")
         self.btn_open_forward.pack(side="left", padx=(8, 0))
-        note(net, 4, "A local port forwarded to a device port, e.g. its web panel. Clear both "
+        note(net, 5, "A local port forwarded to a device port, e.g. its web panel. Clear both "
                      "to turn it off. Open works while that forward is running.")
         pcap = ttk.Checkbutton(net, text="radio capture", variable=self.opt["pcap"])
-        pcap.grid(row=5, column=0, sticky="w", padx=(18, 0), pady=3)
+        pcap.grid(row=6, column=0, sticky="w", padx=(18, 0), pady=3)
         pfile = ttk.Frame(net)
-        pfile.grid(row=5, column=1, sticky="w", pady=3)
+        pfile.grid(row=6, column=1, sticky="w", pady=3)
         p_entry = ttk.Entry(pfile, textvariable=self.opt["pcap_path"], width=14)
         p_entry.pack(side="left")
         p_browse = ttk.Button(pfile, text="...", width=3, command=self._browse_pcap)
         p_browse.pack(side="left", padx=(2, 0))
-        note(net, 5, "Save every 802.11 frame to a pcap file for Wireshark. The IP-level "
-                     "capture is in the network pane's Details window.")
+        self.lbl_radio_capture_note = note(
+            net, 6,
+            "Save every 802.11 frame to a pcap file for Wireshark. The IP-level "
+            "capture is in the network pane's Details window. " + FRAME_PRIVACY_NOTE)
 
         def lines_box(row, name, label, help_):
             ttk.Label(net, text=label).grid(row=row, column=0, sticky="nw", padx=(18, 6), pady=3)
@@ -650,13 +754,13 @@ class SimulatorUI:
                                                         self._options_changed()))
             return box
 
-        gets = lines_box(6, "http_gets", "HTTP GET",
+        gets = lines_box(7, "http_gets", "HTTP GET",
                          "One path per line, requested from the device's port 80 once it "
                          "is reachable. E.g. /cm?cmnd=POWER%20ON")
-        pubs = lines_box(7, "mqtt_pubs", "MQTT messages",
+        pubs = lines_box(8, "mqtt_pubs", "MQTT messages",
                          "One TOPIC=PAYLOAD per line, pushed to the device once it "
                          "subscribes to a matching topic.")
-        self.opt_widgets["wifi"] = [role, ssid, pw, f_local, f_dev, pcap, p_entry, p_browse,
+        self.opt_widgets["wifi"] = [net_out, role, ssid, pw, f_local, f_dev, pcap, p_entry, p_browse,
                                     gets, pubs]
         self.opt_widgets["pcap"] = [p_entry, p_browse]
 
@@ -706,7 +810,7 @@ class SimulatorUI:
             extra = [x for x in (o["tuyamcu_pid"].strip(), "raw" if o["tuyamcu_raw"] else "") if x]
             parts.append("TuyaMCU" + (" (%s)" % ", ".join(extra) if extra else ""))
         if o["wifi"]:
-            extra = [o["wifi_role"]]
+            extra = [o["wifi_role"], "real internet" if o["net_out"] else "offline"]
             if o["wifi_ssid"].strip():
                 extra.append("'%s'" % o["wifi_ssid"])
             # Named either way: the passphrase is not remembered, so after a
@@ -766,7 +870,7 @@ class SimulatorUI:
                 raise ValueError("Radio capture is ticked but no file is set.")
             if not os.path.isdir(os.path.dirname(os.path.abspath(pcap))):
                 raise ValueError("Radio capture: the folder for %s does not exist." % pcap)
-        cfg.update({"wifi_role": o["wifi_role"],
+        cfg.update({"wifi_role": o["wifi_role"], "net_out": o["net_out"],
                     # Neither is stripped: an SSID is matched exactly and salts
                     # the WPA2 key, and spaces are part of a passphrase.
                     "wifi_ssid": o["wifi_ssid"] if o["wifi_ssid"].strip() else None,
@@ -921,11 +1025,13 @@ class SimulatorUI:
         self._load_image(paths[0], run=True)
         return getattr(event, "action", None)
 
-    def _load_image(self, path, run=False):
+    def _load_image(self, path, run=False, chip=None, key=None):
         """Point the window at an image and, if asked, run it - stopping a run
         in progress first, so a drop always means 'run this one now'."""
         self.var_image.set(path)
-        self.var_chip.set(guess_chip(path))
+        self.var_chip.set(chip or guess_chip(path))
+        if key is not None:
+            self.var_key.set(key)
         self._refresh_tuya_config(path=path)
         self.tabs.select(self.run_tab)
         if not run:
@@ -936,6 +1042,32 @@ class SimulatorUI:
             self.var_state.set("stopping the current run to start %s ..." % os.path.basename(path))
         else:
             self._on_run()
+
+    def _run_interesting(self, profile):
+        """Load and immediately run one entry from :data:`INTERESTING_DUMPS`."""
+        path = os.path.join(FIRMWARE_DIR, profile["file"])
+        if not os.path.isfile(path):
+            messagebox.showerror(
+                "BekenSimulator",
+                "The bundled quick-run image is missing:\n%s" % path)
+            return
+        if profile.get("wifi"):
+            self.opt["wifi"].set(True)
+            # A quick run must be reproducible even after the Config tab was
+            # used for another network.  In particular, paired Tuya firmware
+            # is a station already, so a retained ``sta`` peer role would put
+            # both ends in the same role and prevent the advertised call-home
+            # run.  Empty fields let the offline peer adopt the dump's stored
+            # network, matching the command-line regression setup.
+            self.opt["wifi_role"].set("auto")
+            self.opt["wifi_ssid"].set("")
+            self.opt["wifi_pass"].set("")
+            # Each shortcut starts from the documented GUI default unless a
+            # profile explicitly overrides it. A stale saved setting never
+            # decides whether this new run can reach the network.
+            self.opt["net_out"].set(bool(
+                profile.get("net_out", OPTION_DEFAULTS["net_out"])))
+        self._load_image(path, run=True, chip=profile["chip"], key=profile["key"])
 
     def _console(self, parent, mono, height=18):
         frame = ttk.Frame(parent)
@@ -1013,11 +1145,21 @@ class SimulatorUI:
         ent.bind("<Return>", lambda e: self._refresh_details())
         ttk.Button(bar, text="Apply", width=7, command=self._refresh_details).pack(side="left")
         ttk.Button(bar, text="Refresh", width=8, command=self._refresh_details).pack(side="left", padx=4)
+        ttk.Label(bar, text="target host:").pack(side="left", padx=(4, 0))
+        self.var_frame_target = tk.StringVar(value=ALL_FRAME_TARGETS)
+        self.frame_target = ttk.Combobox(bar, textvariable=self.var_frame_target,
+                                         values=(ALL_FRAME_TARGETS,), width=15,
+                                         state="readonly")
+        self.frame_target.pack(side="left", padx=(4, 6))
+        self.frame_target.bind("<<ComboboxSelected>>", lambda _e: self._refresh_details())
         ttk.Button(bar, text="Save .pcap...", width=13,
                    command=self._save_pcap).pack(side="right")
         self.var_frame_count = tk.StringVar(value="")
         ttk.Label(win, textvariable=self.var_frame_count, anchor="w",
                   padding=(8, 0)).pack(fill="x")
+        self.var_frame_privacy = tk.StringVar(value=FRAME_PRIVACY_NOTE)
+        ttk.Label(win, textvariable=self.var_frame_privacy, anchor="w",
+                  foreground="#8a4b08", padding=(8, 2)).pack(fill="x")
 
         split = ttk.PanedWindow(win, orient="vertical")
         split.pack(fill="both", expand=True, padx=6, pady=(2, 6))
@@ -1056,16 +1198,61 @@ class SimulatorUI:
         win.protocol("WM_DELETE_WINDOW", win.destroy)
         self._refresh_details()
 
+    @staticmethod
+    def _frame_target_host(direction, data):
+        """The remote IPv4 host for a captured frame, or ``None``.
+
+        For a frame emitted by the device the counterpart is its destination;
+        for a frame delivered to the device it is its source.  Addresses which
+        cannot identify one target host are deliberately absent from the
+        selector: unspecified, limited broadcast, and multicast.
+        """
+        endpoints = netstack.ipv4_endpoints(data)
+        if endpoints is None:
+            return None
+        if direction == "from device":
+            host = endpoints[1]
+        elif direction == "to device":
+            host = endpoints[0]
+        else:
+            return None
+        if host in (b"\x00" * 4, b"\xff" * 4) or 224 <= host[0] <= 239:
+            return None
+        return netstack.ip2str(host)
+
+    @classmethod
+    def _target_hosts(cls, frames):
+        """Unique, numerically ordered remote hosts present in *frames*."""
+        hosts = {cls._frame_target_host(direction, data)
+                 for direction, data, _us in frames}
+        hosts.discard(None)
+        return sorted(hosts, key=lambda host: tuple(int(part) for part in host.split(".")))
+
+    def _refresh_target_hosts(self, frames):
+        """Update the selector without losing a still-present selection."""
+        if getattr(self, "frame_target", None) is None:
+            return
+        choices = [ALL_FRAME_TARGETS] + self._target_hosts(frames)
+        current = self.var_frame_target.get()
+        self.frame_target.configure(values=choices)
+        if current not in choices:
+            self.var_frame_target.set(ALL_FRAME_TARGETS)
+
     def _visible_frames(self):
         """The captured frames the filter box lets through, with their numbers."""
         with self._out_lock:
             frames = list(self._frames)
         base = self._frames_dropped
+        self._refresh_target_hosts(frames)
         needle = (getattr(self, "var_frame_filter", None).get().strip().lower()
                   if getattr(self, "var_frame_filter", None) else "")
+        target = (getattr(self, "var_frame_target", None).get()
+                  if getattr(self, "var_frame_target", None) else ALL_FRAME_TARGETS)
         out = []
         for i, (direction, data, us) in enumerate(frames):
             what = netstack.describe_frame(data)
+            if target != ALL_FRAME_TARGETS and self._frame_target_host(direction, data) != target:
+                continue
             if needle and needle not in what.lower() and needle not in direction.lower():
                 continue
             out.append((base + i + 1, direction, data, us, what))
@@ -1177,6 +1364,165 @@ class SimulatorUI:
                 self._hex_col = 0
         return "".join(out)
 
+    @staticmethod
+    def _gpio_is_input(raw):
+        """Whether a firmware GPIO word leaves the pad as a plain input.
+
+        The Beken SDK's input modes all set bits 2+3 (input enable and output
+        disable).  Second-function modes set bit 6 and must not be offered as
+        buttons even when the peripheral itself receives data on that pad.
+        """
+        return raw is not None and (raw & 0x0C) == 0x0C and not (raw & 0x40)
+
+    @staticmethod
+    def _tuya_button_levels(decoded):
+        """{pin: active_level} recovered from Tuya's wiring record.
+
+        Only pin/level pairs already decoded in memory are considered.  The
+        raw protected-storage records (which can carry credentials) never
+        reach this path or a widget.
+        """
+        pairs = dict((str(k), str(v)) for k, v in (decoded or {}).get("pairs", []))
+        out = {}
+        button = re.compile(r"^(?:bt(?:\d+)?_pin|bt|k\d+pin_pin|key\d*_pin|"
+                            r"reset_pin|total_bt_pin)$")
+        for name, value in pairs.items():
+            if not button.match(name):
+                continue
+            try:
+                pin = int(value, 0)
+            except ValueError:
+                continue
+            stem = name[:-4] if name.endswith("_pin") else name
+            level = pairs.get(stem + "_lv")
+            if level in ("0", "1"):
+                out[pin] = int(level)
+        return out
+
+    def _gpio_press_level(self, pin, raw):
+        """Return (active level, explanation) for a selected input."""
+        decoded = self._run_tuya_config if self._running() else self.tuya_config
+        stored = self._tuya_button_levels(decoded).get(pin)
+        if stored is not None:
+            return stored, "Tuya config says active %s" % ("HIGH" if stored else "LOW")
+        if raw & (1 << 5):
+            idle = 1 if raw & (1 << 4) else 0
+            return 1 - idle, "%s input" % ("pull-up" if idle else "pull-down")
+        # A floating input has no electrically knowable idle level.  LOW is a
+        # deterministic, common button convention; say so rather than quietly
+        # presenting a guess as decoded hardware metadata.
+        return 0, "no pull; defaulting the simulated press to LOW"
+
+    def _gpio_config(self, pin):
+        """Return one logical pin's live config, including BK7252's upper bank."""
+        if self.emu is None:
+            return None
+        slot = pin
+        if pin >= periph.PIN_COUNT and getattr(self.emu, "has_extended_gpio", False):
+            slot = periph.BK7252_EXT_SLOT + pin - periph.PIN_COUNT
+        return getattr(self.emu.state, "gpio_cfg", {}).get(slot)
+
+    def _selected_gpio(self):
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        iid = sel[0]
+        if not iid.startswith("gpio:"):
+            return None
+        try:
+            return int(iid.split(":", 1)[1])
+        except ValueError:
+            return None
+
+    def _gpio_selection_changed(self, _event=None):
+        self._gpio_selected = self._selected_gpio()
+        self._update_gpio_control()
+
+    def _gpio_double_click(self, event):
+        iid = self.tree.identify_row(event.y)
+        if iid:
+            self.tree.selection_set(iid)
+            self._gpio_selected = self._selected_gpio()
+            self._update_gpio_control()
+            if str(self.btn_gpio_press.cget("state")) != "disabled":
+                self._toggle_gpio_input()
+        return "break"
+
+    def _update_gpio_control(self):
+        pin = self._gpio_selected
+        if pin is None:
+            pin = self._selected_gpio()
+            self._gpio_selected = pin
+        if pin is None:
+            self.btn_gpio_press.config(text="Press", state="disabled")
+            self.var_gpio_action.set("Select a configured GPIO input to simulate its button.")
+            return
+
+        if pin in self._gpio_pressed:
+            level = self._gpio_pressed[pin]
+            self.btn_gpio_press.config(text="Release P%d" % pin,
+                                       state="normal" if (self._running() and not self._stop_requested)
+                                       else "disabled")
+            self.var_gpio_action.set("P%d is PRESSED %s; release it after the firmware debounces."
+                                     % (pin, "HIGH" if level else "LOW"))
+            return
+
+
+        raw = self._gpio_config(pin)
+        if not self._gpio_is_input(raw):
+            self.btn_gpio_press.config(text="Press P%d" % pin, state="disabled")
+            self.var_gpio_action.set("P%d is not a plain GPIO input." % pin)
+            return
+
+        level, why = self._gpio_press_level(pin, raw)
+        self.btn_gpio_press.config(text="Press P%d" % pin,
+                                   state="normal" if (self._running() and not self._stop_requested)
+                                   else "disabled")
+        self.var_gpio_action.set("P%d: %s; Press drives %s, then click Release."
+                                 % (pin, why, "HIGH" if level else "LOW"))
+
+    def _toggle_gpio_input(self):
+        """Press or release the selected pad through the emulator input API."""
+        pin = self._gpio_selected if self._gpio_selected is not None else self._selected_gpio()
+        if pin is None or not self._running() or self._stop_requested:
+            self._update_gpio_control()
+            return
+        if pin in self._gpio_pressed:
+            try:
+                self.emu.set_gpio_input(pin, None)
+            except (AttributeError, ValueError) as exc:
+                self.var_state.set("GPIO release failed: %s" % exc)
+                return
+            del self._gpio_pressed[pin]
+        else:
+            raw = self._gpio_config(pin)
+            if not self._gpio_is_input(raw):
+                self._update_gpio_control()
+                return
+            level, _why = self._gpio_press_level(pin, raw)
+            try:
+                self.emu.set_gpio_input(pin, level)
+            except (AttributeError, ValueError) as exc:
+                self.var_state.set("GPIO press failed: %s" % exc)
+                return
+            self._gpio_pressed[pin] = level
+        self._periph_key = None
+        self._refresh_periph()
+        self._update_gpio_control()
+
+    def _release_gpio_inputs(self):
+        """Release every UI-held pad, including on Stop/close/new Run."""
+        emu = self.emu
+        for pin in list(self._gpio_pressed):
+            if emu is not None:
+                try:
+                    emu.set_gpio_input(pin, None)
+                except (AttributeError, ValueError):
+                    pass
+        self._gpio_pressed.clear()
+        self._periph_key = None
+        self._update_gpio_control()
+
     def _refresh_periph(self):
         """Redraw the GPIO/PWM table from the emulator's live registers.
 
@@ -1197,17 +1543,30 @@ class SimulatorUI:
             return
 
         key = (tuple(sorted(gpio.items())), tuple(sorted(pwm.items())),
-               self.var_all_pins.get())
+               self.var_all_pins.get(), tuple(sorted(self._gpio_pressed.items())))
         if key == self._periph_key:
+            self._update_gpio_control()
             return              # nothing moved; leave the widget alone
         self._periph_key = key
 
         # decode_state wants the fine-grained silicon name (BK7231N, not the
         # four -chip identities), which the dump's filename carries.
-        data = periph.decode_state(gpio, pwm, periph.chip_from_name(self.var_image.get()))
+        # The image field can be changed while this run remains alive.  Decode
+        # the live peripheral map with the running image/chip, not the next
+        # image selected in the header.
+        image = self._run_image or self.var_image.get()
+        if getattr(self.emu, "has_extended_gpio", False):
+            chip = (getattr(self.emu, "chip_variant", "")
+                    or ("BK7252" if getattr(self.emu, "is_bk7252", False)
+                        else "BK7231U"))
+        else:
+            chip = periph.chip_from_name(image)
+        data = periph.decode_state(gpio, pwm, chip)
+        selected = self._gpio_selected
         self.tree.delete(*self.tree.get_children())
         if not data:
             self.var_pwm.set("firmware has not touched GPIO or PWM yet")
+            self._update_gpio_control()
             return
 
         show_all = self.var_all_pins.get()
@@ -1221,11 +1580,18 @@ class SimulatorUI:
             else:
                 tag = "func"
             raw = data["raw"].get(pin)
-            self.tree.insert("", "end", tags=(tag,), values=(
+            if pin in self._gpio_pressed:
+                driven = self._gpio_pressed[pin]
+                detail += " — PRESSED %s" % ("HIGH" if driven else "LOW")
+                tag = "pressed"
+            self.tree.insert("", "end", iid="gpio:%d" % pin, tags=(tag,), values=(
                 pin, alias or "", detail, "" if raw is None else "0x%02X" % raw))
 
         for name, value in data["func"]:
             self.tree.insert("", "end", tags=("func",), values=("", name, "function select", value))
+
+        if selected is not None and self.tree.exists("gpio:%d" % selected):
+            self.tree.selection_set("gpio:%d" % selected)
 
         chans = data.get("pwm_channels") or []
         if chans:
@@ -1235,6 +1601,7 @@ class SimulatorUI:
         else:
             self.var_pwm.set("PWM pins %s, no channels decoded"
                              % (data["pwm_pins"] or "-"))
+        self._update_gpio_control()
 
     def _render_uart2(self, data):
         """Firmware log text, optionally with the quicktick chatter dropped.
@@ -1358,6 +1725,23 @@ class SimulatorUI:
             self.tabs.select(self.config_tab)
             messagebox.showerror("BekenSimulator", str(e))
             return
+        self._run_tuya_config = self.tuya_config
+        self._run_image = path
+        # Snapshot private cloud credentials only for the offline TLS peer.
+        # A real-cloud run is a transparent TCP relay and neither needs nor
+        # should retain a second copy of the dump's secret in the host stack.
+        # Stored candidates stay out of widgets, logs and saved settings; the
+        # offline peer uses them only to authenticate the encrypted Finished.
+        # The byte-exact packet viewer is intentionally different: if firmware
+        # sends credential material in clear, its warning explains that the raw
+        # frame and any exported PCAP preserve those bytes.
+        if cfg.get("net_out"):
+            cfg["tls_psks"] = ()
+            cfg["tuya_legacy_identity_psk"] = False
+        else:
+            cfg["tls_psks"] = tuya_config.tls_psk_candidates(self._run_tuya_config)
+            cfg["tuya_legacy_identity_psk"] = (
+                tuya_config.uses_tuya_legacy_identity_psk(self._run_tuya_config))
         self._active_forward_url = ("http://127.0.0.1:%d/" % cfg["forwards"][0][0]
                                     if cfg.get("forwards") else None)
         # Loading and setup happen on the worker. The button is enabled from
@@ -1365,6 +1749,7 @@ class SimulatorUI:
         self._update_open_forward()
         self._save_settings()
 
+        self._release_gpio_inputs()
         self._clear()
         self._periph_key = None
         self._tx_count = {1: 0, 2: 0}
@@ -1419,12 +1804,16 @@ class SimulatorUI:
             emu.net_sink = self._net_sink
             emu.net_frame_sink = self._frame_sink
             if cfg["wifi"]:
-                # net_out is never set: the GUI's network stays offline, and
-                # what the device tries to reach is logged, not reached.
                 emu.attach_wifi_peer(role=cfg["wifi_role"], ssid=cfg["wifi_ssid"],
                                      passphrase=cfg["wifi_pass"], forwards=cfg["forwards"],
+                                     net_out=cfg["net_out"],
                                      pcap=cfg["pcap"], http_gets=cfg["http_gets"],
-                                     mqtt_pubs=cfg["mqtt_pubs"])
+                                     mqtt_pubs=cfg["mqtt_pubs"],
+                                     tls_psks=(() if cfg["net_out"] else
+                                               cfg.get("tls_psks", ())),
+                                     tuya_legacy_identity_psk=(
+                                         False if cfg["net_out"] else cfg.get(
+                                             "tuya_legacy_identity_psk", False)))
             emu.setup()
             self.emu = emu
             # A Stop pressed while loading found no emulator to stop; honour
@@ -1459,6 +1848,7 @@ class SimulatorUI:
 
     def _on_stop(self):
         self._stop_requested = True
+        self._release_gpio_inputs()
         if self.emu is not None:
             self.emu.stop()
         self.btn_stop.config(state="disabled")
@@ -1467,6 +1857,7 @@ class SimulatorUI:
 
     def _on_close(self):
         self._save_settings()
+        self._release_gpio_inputs()
         if self.emu is not None:
             self.emu.stop()
         self.root.destroy()
@@ -1635,6 +2026,7 @@ class SimulatorUI:
             return
         if self.emu is None:
             self._update_open_forward()
+            self._update_gpio_control()
             return
 
         self._update_open_forward()
@@ -1667,6 +2059,7 @@ class SimulatorUI:
                insns / float(GUEST_SECOND_INSNS), now - self.started_at,
                self.emu.state.last_pc, self._tx_count[1], self._tx_count[2],
                len(self.emu.uart1_rx), "ready" if ready else "not listening yet"))
+        self._update_gpio_control()
 
     def _fmt_insns(self):
         n = self.emu.state.insn_count if self.emu else 0
@@ -1680,6 +2073,7 @@ class SimulatorUI:
             btn.config(state=state)
 
     def _finish(self):
+        self._release_gpio_inputs()
         self.btn_run.config(state="normal")
         self.btn_stop.config(state="disabled")
         self.btn_pause.config(state="disabled", text="Pause")
@@ -1802,6 +2196,8 @@ def _run_selftests():
     ui._open_details()
     check(ui._detail_win is not None and ui._detail_win.winfo_exists(),
           "the details window opens from the pane")
+    check(ui.var_frame_privacy.get() == FRAME_PRIVACY_NOTE,
+          "the raw-frame viewer warns that exact captures can contain clear credentials")
     rows = ui.frame_tree.get_children()
     check(len(rows) == 2, "both captured frames are listed")
     # Tk hands row values back as strings whatever went in.
@@ -1880,9 +2276,49 @@ def _run_selftests():
           "...and leaves its bytes on screen rather than jumping to the newest")
     check(len(ui.frame_tree.get_children()) == 3, "while still listing what has since arrived")
 
+    print("== captured traffic target-host selector ==")
+    remote_ip = netstack.str2ip("10.200.0.2")
+    reply_seg = netstack.tcp_segment(remote_ip, dev_ip, 1883, 40127, 1, 2,
+                                     netstack.TCP_ACK, 8192)
+    f_reply = netstack.eth_frame(dev, ours, netstack.ETH_IP, reply_seg)
+    near_ip = netstack.str2ip("10.200.0.20")
+    near_seg = netstack.tcp_segment(dev_ip, near_ip, 40128, 1883, 1, 0,
+                                    netstack.TCP_SYN, 8192)
+    f_near = netstack.eth_frame(ours, dev, netstack.ETH_IP, near_seg)
+    ui._frame_sink("to device", f_reply, 1_800_000)
+    ui._frame_sink("from device", f_near, 1_900_000)
+    ui._refresh_details()
+    choices = tuple(ui.frame_target.cget("values"))
+    check(choices == (ALL_FRAME_TARGETS, "10.200.0.2", "10.200.0.20", "192.168.1.1"),
+          "the target list contains each exact remote IPv4 host once, in numeric order")
+    ui.var_frame_target.set("10.200.0.2")
+    ui.var_frame_filter.set("")
+    ui._refresh_details()
+    check(len(ui.frame_tree.get_children()) == 3,
+          "selecting a target keeps both traffic directions and repeated frames")
+    ui.var_frame_filter.set("PSH")
+    ui._refresh_details()
+    check(len(ui.frame_tree.get_children()) == 2,
+          "the exact target selection combines with the existing text filter")
+    special = [
+        ("from device", netstack.eth_frame(ours, dev, netstack.ETH_IP,
+                                            netstack.udp_packet(dev_ip, bytes(4), 1, 1, b"")), 0),
+        ("from device", netstack.eth_frame(ours, dev, netstack.ETH_IP,
+                                            netstack.udp_packet(dev_ip, b"\xff" * 4, 1, 1, b"")), 0),
+        ("from device", netstack.eth_frame(ours, dev, netstack.ETH_IP,
+                                            netstack.udp_packet(dev_ip, netstack.str2ip("239.1.2.3"),
+                                                                1, 1, b"")), 0),
+    ]
+    check(ui._target_hosts(special) == [],
+          "unspecified, broadcast and multicast endpoints are not offered as target hosts")
+    ui.var_frame_target.set(ALL_FRAME_TARGETS)
+    ui.var_frame_filter.set("")
+    ui._refresh_details()
+
     ui._clear()
-    check(not ui.frame_tree.get_children() and "Nothing captured yet" in ui.var_frame_count.get(),
-          "Clear empties the captured frames as well as the pane")
+    check(not ui.frame_tree.get_children() and "Nothing captured yet" in ui.var_frame_count.get()
+          and tuple(ui.frame_target.cget("values")) == (ALL_FRAME_TARGETS,),
+          "Clear empties the captured frames and target hosts as well as the pane")
     ui._detail_win.destroy()
 
     # --- Config tab -------------------------------------------------------
@@ -1891,19 +2327,81 @@ def _run_selftests():
     check(cfg["wifi"] is True and cfg["tuyamcu"] is False and cfg["boot"] is False
           and cfg["xvr_selfclear"] is False and cfg["blecore"] is False
           and cfg["tuyamcu_pid"] is None and cfg["tuyamcu_raw"] is False
-          and cfg["forwards"] == [(8080, 80)],
-          "the Config defaults attach the Wi-Fi peer and leave other peers off")
+          and cfg["net_out"] is True and cfg["forwards"] == [(8080, 80)],
+          "the Config defaults attach Wi-Fi with real outbound access")
+    check(guess_chip("OpenBK7231U_QIO.bin") == "BK7231U"
+          and guess_chip("OpenBK7231T_QIO.bin") == "BK7231",
+          "chip guessing distinguishes U's extended GPIO bank from generic BK7231")
     check(str(ui.opt_text["http_gets"].cget("state")) == "normal"
           and str(ui.opt_widgets["pcap"][0].cget("state")) == "disabled"
           and str(ui.opt_widgets["tuyamcu"][0].cget("state")) == "disabled",
           "default Wi-Fi fields are active while capture and TuyaMCU fields stay gated")
+    check(FRAME_PRIVACY_NOTE in ui.lbl_radio_capture_note.cget("text"),
+          "the radio-PCAP option carries the same clear-credential warning")
     check(str(ui.btn_open_forward.cget("state")) == "disabled",
           "Open in browser waits until a configured forward is actually running")
-    check(ui.var_summary.get() == "options: Wi-Fi peer (auto, open, :8080 to :80)",
+    check(ui.var_summary.get() == "options: Wi-Fi peer (auto, real internet, open, :8080 to :80)",
           "the summary line shows the default Wi-Fi peer")
+
+    print("== interesting-dump quick runs ==")
+    labels = [button.cget("text") for button in ui.interesting_buttons]
+    check(labels == [profile["label"] for profile in INTERESTING_DUMPS]
+          and {"OBK T", "OBK N", "OBK 7238", "MOES relay",
+               "GBDQA breaker", "IR blaster", "LSC bulb"}
+          <= set(labels),
+          "the launcher exposes the requested OpenBeken, relay and paired-cloud profiles")
+    check([label.cget("text") for label in ui.interesting_group_labels]
+          == ["Quick run:", "Real Tuya reconnect (owned IDs only; sends to cloud):"],
+          "proven paired callers have their own clearly labelled launcher row")
+    check(all(os.path.isfile(os.path.join(FIRMWARE_DIR, p["file"]))
+              and p["chip"] in CHIP_FAMILIES
+              and (p["key"] == "(none)" or p["key"] in KNOWN_KEYS)
+              for p in INTERESTING_DUMPS),
+          "every quick-run profile names a bundled image and a valid chip/key combination")
+    old_image, old_chip, old_key = (ui.var_image.get(), ui.var_chip.get(), ui.var_key.get())
+    old_wifi = {name: ui.opt[name].get()
+                for name in ("wifi", "net_out", "wifi_role", "wifi_ssid", "wifi_pass")}
+    started = []
+    real_run, real_refresh = ui._on_run, ui._refresh_tuya_config
+    ui._on_run = lambda: started.append(
+        (ui.var_image.get(), ui.var_chip.get(), ui.var_key.get(),
+         ui.opt["wifi"].get(), ui.opt["net_out"].get(), ui.opt["wifi_role"].get(),
+         ui.opt["wifi_ssid"].get(), ui.opt["wifi_pass"].get()))
+    ui._refresh_tuya_config = lambda *args, **kwargs: None
+    try:
+        paired_profiles = [p for p in INTERESTING_DUMPS if p.get("paired")]
+        for paired in paired_profiles:
+            # Prove the shortcut is not poisoned by settings retained from a
+            # previous manual run.
+            ui.opt["wifi"].set(False)
+            ui.opt["net_out"].set(False)
+            ui.opt["wifi_role"].set("sta")
+            ui.opt["wifi_ssid"].set("wrong-network")
+            ui.opt["wifi_pass"].set("wrongpass")
+            ui._run_interesting(paired)
+        paired_runs = started[-len(paired_profiles):]
+        check(len(paired_profiles) >= 3
+              and all(run == (os.path.join(FIRMWARE_DIR, profile["file"]),
+                              profile["chip"], profile["key"], True, True, "auto", "", "")
+                      for profile, run in zip(paired_profiles, paired_runs)),
+              "every paired-cloud shortcut selects its exact profile and a known-good "
+              "real-cloud relay, then runs")
+        moes = next(p for p in INTERESTING_DUMPS if p["label"] == "MOES relay")
+        ui._run_interesting(moes)
+        check(started[-1][0] == os.path.join(FIRMWARE_DIR, moes["file"])
+              and started[-1][1:3] == ("BK7231", "(none)") and started[-1][4] is True,
+              "ordinary shortcuts inherit the real-internet GUI default too")
+    finally:
+        ui._on_run, ui._refresh_tuya_config = real_run, real_refresh
+        ui.var_image.set(old_image)
+        ui.var_chip.set(old_chip)
+        ui.var_key.set(old_key)
+        for name, value in old_wifi.items():
+            ui.opt[name].set(value)
 
     cfg = ui._collect_cfg()
     check(cfg["wifi_role"] == "auto" and cfg["forwards"] == [(8080, 80)]
+          and cfg["net_out"] is True
           and cfg["wifi_ssid"] is None and cfg["wifi_pass"] is None and cfg["pcap"] is None
           and cfg["http_gets"] == [] and cfg["mqtt_pubs"] == [],
           "the default Wi-Fi peer uses auto role and forwards 8080 to 80")
@@ -1988,6 +2486,10 @@ def _run_selftests():
           and "Wi-Fi peer (auto" in summary, "the summary line follows the choices")
     check("WPA2" in summary and "2 HTTP GET" in summary,
           "it names WPA2 when a passphrase is set, and counts the HTTP requests")
+    ui.opt["net_out"].set(True)
+    check("real internet" in ui.var_summary.get(),
+          "the summary makes an externally connected run unmistakable")
+    ui.opt["net_out"].set(False)
     ui.opt["wifi_pass"].set("")
     check("open" in ui.var_summary.get() and "WPA2" not in ui.var_summary.get(),
           "...and says 'open' without one, which is what a relaunch leaves")
@@ -2041,8 +2543,11 @@ def _run_selftests():
         ui.opt["wifi_pass"].set("password1")
         ui.opt["pcap"].set(True)
         ui.opt["pcap_path"].set("cap.pcap")
+        ui.opt["net_out"].set(False)
         ui._set_text_option("mqtt_pubs", "cmnd/obk/POWER=OFF")
         cfg = ui._collect_cfg()
+        cfg["tls_psks"] = (b"synthetic-gui-cloud-key",)
+        cfg["tuya_legacy_identity_psk"] = True
         ui._stop_requested = False
         ui._worker("image.bin", cfg)
         b, p = calls["build"], calls["peer"]
@@ -2051,9 +2556,12 @@ def _run_selftests():
               and b["ble_core"] is None,
               "the worker passes device options and leaves BLE hardware selection automatic")
         check(p == {"role": "ap", "ssid": "HomeNet", "passphrase": "password1",
-                    "forwards": [(9090, 80)], "pcap": "cap.pcap", "http_gets": ["/cm?cmnd=POWER%20ON",
-                    "/index"], "mqtt_pubs": [("cmnd/obk/POWER", b"OFF")]},
-              "the worker passes the network options, the chosen role included, and no net_out")
+                    "forwards": [(9090, 80)], "net_out": False,
+                    "pcap": "cap.pcap", "http_gets": ["/cm?cmnd=POWER%20ON",
+                    "/index"], "mqtt_pubs": [("cmnd/obk/POWER", b"OFF")],
+                    "tls_psks": (b"synthetic-gui-cloud-key",),
+                    "tuya_legacy_identity_psk": True},
+              "the worker passes offline network options and private TLS mode")
         check(calls["order"] == ["setup", "run"] and ui.finished == "emulation finished",
               "a run nobody stopped goes straight from setup to run")
         check(calls["closed"] == 1, "the run's network is released when it ends, freeing the port")
@@ -2067,13 +2575,37 @@ def _run_selftests():
 
         ui.var_image.set(img)
         ui._pending_run = True
-        ui._on_run()
+        real_refresh = ui._refresh_tuya_config
+        private_cfg = {"tls_mode": 2, "ids": {"psk_key": "A" * 37}}
+
+        def refresh_private(*_args, **_kwargs):
+            ui.tuya_config = private_cfg
+            return private_cfg
+
+        ui._refresh_tuya_config = refresh_private
+        try:
+            ui._on_run()
+        finally:
+            ui._refresh_tuya_config = real_refresh
         ui.thread.join(5)
         check(calls["order"] == ["setup", "run"] and ui._stop_requested is False,
               "Run clears a Stop left over from the previous run")
         check(ui._pending_run is False, "...and uses up a dropped image that was waiting")
+        check(calls["peer"]["tls_psks"] == (b"A" * 37,)
+              and calls["peer"]["tuya_legacy_identity_psk"] is True
+              and ui._run_tuya_config is private_cfg,
+              "Run snapshots the selected image's private PSK mode for its offline TLS peer")
         check(ui._active_forward_url == "http://127.0.0.1:9090/",
               "Run binds Open in browser to that run's validated local port")
+
+        ui.opt["net_out"].set(True)
+        ui._on_run()
+        ui.thread.join(5)
+        check(calls["peer"]["net_out"] is True
+              and calls["peer"]["tls_psks"] == ()
+              and calls["peer"]["tuya_legacy_identity_psk"] is False,
+              "a real-cloud Run passes no PSK copy to its transparent network relay")
+        ui.opt["net_out"].set(False)
 
         ui.finished = ui.error = None
         calls["run_error"] = "UC_ERR_FETCH_UNMAPPED at pc 0x00000000"
@@ -2122,6 +2654,129 @@ def _run_selftests():
     class Alive:                         # a worker thread that is still going
         def is_alive(self):
             return True
+
+    print("== GPIO inputs: pressing a real emulated pad from the table ==")
+
+    class GPIOEmu:
+        def __init__(self):
+            self.state = SimpleNamespace(
+                # Pull-up input, pull-down input, output, second function.
+                gpio_cfg={6: 0x3C, 7: 0x2C, 18: 0x02, 24: 0x78}, pwm_regs={})
+            self.inputs = []
+            self.stopped = False
+
+        def set_gpio_input(self, pin, level):
+            self.inputs.append((pin, level))
+
+        def stop(self):
+            self.stopped = True
+
+    gpio_emu = GPIOEmu()
+    ui.emu, ui.thread = gpio_emu, Alive()
+    ui._stop_requested = False
+    ui.tuya_config = None
+    ui._periph_key = None
+    ui._refresh_periph()
+    check(all(ui.tree.exists("gpio:%d" % p) for p in (6, 7, 18, 24)),
+          "configured GPIO rows have stable pin identities")
+
+    ui.tree.selection_set("gpio:6")
+    ui._gpio_selection_changed()
+    check(str(ui.btn_gpio_press.cget("state")) == "normal"
+          and ui.btn_gpio_press.cget("text") == "Press P6"
+          and "drives LOW" in ui.var_gpio_action.get(),
+          "a pull-up input offers a LOW press")
+    ui._toggle_gpio_input()
+    check(gpio_emu.inputs[-1] == (6, 0)
+          and ui.btn_gpio_press.cget("text") == "Release P6"
+          and "PRESSED LOW" in ui.tree.item("gpio:6", "values")[2],
+          "Press drives the external pad low and marks it as held")
+
+    # A relay write redraws the table while the key is held.  The selected pin
+    # and the release action must survive that redraw or the input gets stuck.
+    gpio_emu.state.gpio_cfg[18] = 0x00
+    ui._refresh_periph()
+    check(ui.tree.selection() == ("gpio:6",)
+          and ui.btn_gpio_press.cget("text") == "Release P6",
+          "a relay change preserves the held input and its selection")
+    ui._toggle_gpio_input()
+    check(gpio_emu.inputs[-1] == (6, None) and 6 not in ui._gpio_pressed,
+          "Release disconnects the external drive so the hardware pull-up wins again")
+
+    ui.tree.selection_set("gpio:7")
+    ui._gpio_selection_changed()
+    ui._toggle_gpio_input()
+    check(gpio_emu.inputs[-1] == (7, 1), "a pull-down input gets a HIGH press")
+    ui._toggle_gpio_input()
+
+    before_inputs = list(gpio_emu.inputs)
+    ui.tree.selection_set("gpio:18")
+    ui._gpio_selection_changed()
+    ui._toggle_gpio_input()
+    check(str(ui.btn_gpio_press.cget("state")) == "disabled"
+          and gpio_emu.inputs == before_inputs,
+          "an output row cannot be driven through the input control")
+    ui.tree.selection_set("gpio:24")
+    ui._gpio_selection_changed()
+    check(str(ui.btn_gpio_press.cget("state")) == "disabled",
+          "a peripheral-owned pad is not mislabelled as a push button")
+
+    levels = ui._tuya_button_levels(
+        {"pairs": [("bt1_pin", "6"), ("bt1_lv", "1"),
+                   ("reset_pin", "9"), ("reset_lv", "0"),
+                   ("rl1_pin", "18"), ("rl1_lv", "1")]})
+    check(levels == {6: 1, 9: 0},
+          "Tuya button active levels are used without treating relay metadata as a button")
+
+    # The header may already point at the next dump while the current one is
+    # still running.  Its wiring must not change the live device's polarity.
+    ui._run_tuya_config = {"pairs": [("bt1_pin", "6"), ("bt1_lv", "0")]}
+    ui.tuya_config = {"pairs": [("bt1_pin", "6"), ("bt1_lv", "1")]}
+    check(ui._gpio_press_level(6, 0x3C)[0] == 0,
+          "a newly browsed image cannot change the running image's button polarity")
+    ui._run_tuya_config = None
+    ui.tuya_config = None
+
+    # BK7252 puts logical P32..P39 at physical slots 48..55.  The table and
+    # action API must expose the logical number, without mistaking FUNC_CFG at
+    # slot 32 for a pin.
+    gpio_emu.is_bk7252 = True
+    gpio_emu.has_extended_gpio = True
+    gpio_emu.chip_variant = "BK7252"
+    gpio_emu.state.gpio_cfg.update({32: 0xA5A5, 48: 0x3C})
+    ui._run_image = "BK7252_upper_bank.bin"
+    ui._periph_key = None
+    ui._refresh_periph()
+    check(ui.tree.exists("gpio:32")
+          and ui.tree.item("gpio:32", "values")[3] == "0x3C",
+          "BK7252 slot 48 is shown as logical input P32, not FUNC_CFG")
+    ui.tree.selection_set("gpio:32")
+    ui._gpio_selection_changed()
+    ui._toggle_gpio_input()
+    check(gpio_emu.inputs[-1] == (32, 0),
+          "the BK7252 upper-bank Press action drives logical P32")
+    ui._toggle_gpio_input()
+    gpio_emu.is_bk7252 = False
+    gpio_emu.has_extended_gpio = False
+    gpio_emu.chip_variant = "BK7231"
+    del gpio_emu.state.gpio_cfg[48]
+    ui._run_image = None
+    ui._periph_key = None
+    ui._refresh_periph()
+
+    ui.tree.selection_set("gpio:6")
+    ui._gpio_selection_changed()
+    ui._toggle_gpio_input()
+    ui._on_stop()
+    check(gpio_emu.inputs[-1] == (6, None) and not ui._gpio_pressed and gpio_emu.stopped,
+          "Stop releases every held GPIO before stopping the emulator")
+    ui.emu = ui.thread = None
+    ui._stop_requested = False
+    ui._gpio_selected = None
+    ui._run_tuya_config = None
+    ui._run_image = None
+    ui.tree.selection_remove(ui.tree.selection())
+    ui._update_gpio_control()
 
     ui.thread = Alive()
     listening = SimpleNamespace(
@@ -2215,8 +2870,10 @@ def _run_selftests():
             check(len(decoded_calls) == before,
                   "the Tuya decoder is cached while the selected file is unchanged")
             ui._load_image(other)
+            empty_note = ("No recoverable" if tuya_config.AES is not None
+                          else "Tuya config unavailable")
             check(ui.tuya_config is None and not ui.tuya_tree.get_children()
-                  and "No recoverable" in ui.var_tuya_status.get(),
+                  and empty_note in ui.var_tuya_status.get(),
                   "loading another image clears stale Tuya config")
         finally:
             tuya_config.extract = real_extract
@@ -2229,14 +2886,16 @@ def _run_selftests():
             ui._save_settings()
             with open(spath, encoding="utf-8") as f:
                 saved = json.load(f)
-            check("wifi_pass" not in saved and saved["wifi_ssid"] == "HomeNet"
+            check("wifi_pass" not in saved and "net_out" not in saved
+                  and saved["wifi_ssid"] == "HomeNet"
                   and saved["mqtt_pubs"] == "cmnd/obk/POWER=OFF",
-                  "settings are saved without the Wi-Fi passphrase")
+                  "settings are saved without the Wi-Fi passphrase or external-access grant")
             check(not os.path.exists(spath + ".tmp") and os.path.isabs(saved["image"]),
                   "the file is swapped in whole, and the image is saved as an absolute path")
 
             win2, ui2 = window(settings_path=spath)
             check(ui2.opt["wifi"].get() is True and ui2.opt["wifi_ssid"].get() == "HomeNet"
+                  and ui2.opt["net_out"].get() is True
                   and ui2.opt["fwd_local"].get() == "9090" and ui2.opt["wifi_pass"].get() == ""
                   and ui2.opt["wifi_role"].get() == "ap"
                   and ui2.opt_text["mqtt_pubs"].get("1.0", "end-1c") == "cmnd/obk/POWER=OFF",
@@ -2279,9 +2938,11 @@ def _run_selftests():
             check(ui3.opt["wifi"].get() is True and ui3.opt["wifi_role"].get() == "auto"
                   and ui3.opt["fwd_local"].get() == "8080" and ui3.opt["boot"].get() is True,
                   "saved values of the wrong type or out of range are ignored one by one")
-            ui3._apply_settings({"wifi_role": "sta", "wifi_pass": "password1"})
-            check(ui3.opt["wifi_role"].get() == "sta" and ui3.opt["wifi_pass"].get() == "",
-                  "a valid saved role is restored; a passphrase in the file never is")
+            ui3._apply_settings({"wifi_role": "sta", "wifi_pass": "password1",
+                                 "net_out": False})
+            check(ui3.opt["wifi_role"].get() == "sta" and ui3.opt["wifi_pass"].get() == ""
+                  and ui3.opt["net_out"].get() is True,
+                  "a valid saved role is restored; secrets and stale network policy never are")
             with open(spath, "w", encoding="utf-8") as f:
                 f.write("[]")
             check(ui3._load_settings() == {},
@@ -2299,8 +2960,9 @@ def _run_selftests():
 
     ui._reset_options()
     check(ui.opt_text["mqtt_pubs"].get("1.0", "end-1c") == ""
-          and ui.opt["wifi"].get() is True and ui.opt["wifi_pass"].get() == "",
-          "Reset to defaults restores Wi-Fi on and clears the optional values")
+          and ui.opt["wifi"].get() is True and ui.opt["net_out"].get() is True
+          and ui.opt["wifi_pass"].get() == "",
+          "Reset to defaults restores real-internet Wi-Fi and clears optional values")
 
     # Dropping a file: during a run it stops that run and waits for it to end,
     # then starts; while idle it starts at once.

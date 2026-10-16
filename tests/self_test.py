@@ -5,6 +5,14 @@ import os
 import sys
 from datetime import datetime, timezone
 
+# Firmware occasionally emits valid Unicode that the legacy Windows console
+# code page cannot represent.  A failed assertion must still print its capture
+# instead of replacing the useful failure with UnicodeEncodeError.
+try:
+    sys.stdout.reconfigure(errors="backslashreplace")
+except (AttributeError, OSError):
+    pass
+
 # Get the path to the root directory
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 MAIN_SCRIPT = os.path.join(ROOT_DIR, 'src', 'main.py')
@@ -901,8 +909,10 @@ TEST_CASES = [
     {
         "name": "OpenBK7231U_QIO_1.18.300 Boot to 1s timers",
         "binary": os.path.join(ROOT_DIR, "firmwares", "OpenBK7231U_QIO_1.18.300.bin"),
-        # Plaintext image (beken_freertos_sdk layout) - no key.
-        "args": ["--only-uart"],
+        # Plaintext image (beken_freertos_sdk layout) - no key.  The explicit
+        # U variant enables its GPIO32..39 register bank despite sharing the
+        # generic BK7231 chip/device ID.
+        "args": ["--only-uart", "-chip", "BK7231U"],
         "timeout": 180,
         "expected_strings": [
             "OpenBK7231U, version 1.18.300",
@@ -2589,12 +2599,10 @@ TEST_CASES = [
         # no pre-shared key set and stop before ClientKeyExchange (-0x7600),
         # this dump is already bound ("already bind", psk_key / psk30_key stored
         # in KV) and connects directly to its MQTT-over-TLS broker
-        # mqtts://m3-eu.lifeaiot.com:8883. When _tls_serve answers its PSK
-        # ClientHello with ServerHello (TLS_PSK_WITH_AES_128_GCM_SHA256) +
-        # ServerHelloDone, the firmware actually sends its ClientKeyExchange
-        # ("[NET] TLS ... pre-shared key identity:") before failing verification
-        # at mbedtls_ssl_handshake returned 0x7280 - the first real firmware in
-        # the suite exercising tls_psk_identity() in src/netstack.py.
+        # mqtts://m3-eu.lifeaiot.com:8883. The emulator recovers the image's own
+        # PSK 3.0 internally, authenticates the client's encrypted Finished,
+        # sends its encrypted Finished, then serves the device's MQTT 3.1 flow
+        # from the offline broker. No device key is logged or placed in the UI.
         #
         # Also exercises:
         #   * fast-connect fallback: attempts tkl_wifi_station_fast_connect to
@@ -2604,8 +2612,8 @@ TEST_CASES = [
         #   * bound BLE 5.2 beacon (--ble-core): UUID 0xFD50 with bound flag
         #     byte 0x4B ("50 fd 4b 0c 01 10 ...").
         #   * pin config from {reset_pin:9,wfst_pin:26,infrr:8,...}: P8 (IR RX)
-        #     and P9 (reset button) in input pull-up (0x3C), P26 (Wi-Fi LED)
-        #     driven output high (0x02).
+        #     and P9 (reset button) in input pull-up (0x3C). After the cloud
+        #     session is established, active-low P26 drives the Wi-Fi LED low.
         "name": "BK7238 Tuya IHSENO HAZ-IR-V3 IR Blaster (paired): joins stored network, BLE 5.2 adv, TLS-PSK cloud handshake",
         "binary": os.path.join(ROOT_DIR, "firmwares",
                                "BK7238_Tuya_IHSENO_HAZ_IR_V3_T1-3S_0.0.5.bin"),
@@ -2633,19 +2641,27 @@ TEST_CASES = [
             "[WIFI] station 80:64:7c:21:ff:7b associated to 'DOM-1'",
             "writed fci to flash ssid=DOM-1",
             "[NET] DHCP: device 80:64:7c:21:ff:7b got 192.168.1.100 (gateway/DNS 192.168.1.1)",
-            # Cloud MQTT-over-TLS connection: DNS -> ClientHello -> ServerHello -> ClientKeyExchange (PSK identity).
+            # Cloud MQTT-over-TLS connection: DNS -> authenticated TLS -> the
+            # real encrypted CONNECT/SUBSCRIBE/PUBLISH exchange.
             "connect to mqtt broker mqtts://m3-eu.lifeaiot.com:8883 port 8883",
             "[NET] DNS m3-eu.lifeaiot.com -> 10.200.0.1 (offline sinkhole)",
             "sends: TLS ClientHello (no server name)",
             "client hello: version 1.2, 4 cipher suites (TLS_PSK_WITH_AES_128_GCM_SHA256, TLS_PSK_WITH_AES_128_CBC_SHA256, 0xc037, 0x00ff), no server name",
             "answered with TLS_PSK_WITH_AES_128_GCM_SHA256, waiting for the key identity",
-            "pre-shared key identity: 49 bytes (0364d8879df5bbfb0eb28a17d0305ce89275808887f2c9d8426c203cae853ce6b763d35fbf7df39be0d3859b9cf1593327)",
+            "pre-shared key identity: 49 bytes",
+            "handshake authenticated; serving encrypted MQTT offline",
+            "connected to the offline broker",
+            "MQTT SUBSCRIBE smart/device/in/",
+            "MQTT PUBLISH smart/device/out/",
+        ],
+        "unexpected_strings": [
             "mbedtls_ssl_handshake returned 0x7280",
+            "client Finished authentication failed",
         ],
         "pcap_expect": ["beacon", "probe request", "authentication", "association request",
                         "association response", "data", "DOM-1", "m3-eu"],
         "ip_pcap_expect": ["m3-eu", "lifeaiot"],
-        "expected_pins": {0: 0x78, 1: 0x78, 8: 0x3C, 9: 0x3C, 10: 0x78, 11: 0x78, 26: 0x02},
+        "expected_pins": {0: 0x78, 1: 0x78, 8: 0x3C, 9: 0x3C, 10: 0x78, 11: 0x78, 26: 0x00},
     },
     {
         # Stock BK7231T BN-LINK metering plug from FlashDumps.  This older
@@ -2693,18 +2709,19 @@ TEST_CASES = [
         ],
     },
     {
-        # Stock LSC GLS A60 RGB+CCT bulb from FlashDumps.  It uses a recent
-        # BK7231N TuyaOS lighting stack and an external five-channel driver.
-        # --ble-core is justified by the observed gates: without it boot stops
-        # after printing the BLE MAC.  The first model reached Tuya's HCI
-        # callback registration but then spun on the separate link-layer
-        # RWBLECNTL at +0x800.  The 5.1 model now owns that register and clears
-        # its hardware-completed reset commands, allowing the second link-layer
-        # init, application startup, advertising and Wi-Fi scan to run.
-        "name": "BK7231N Tuya LSC GLS A60 CBLC5 clears BLE reset and starts its application",
+        # Stock paired LSC GLS A60 RGB+CCT bulb from FlashDumps.  Its exact
+        # BK7231N identity selects the BLE 5.1 controller automatically.  The
+        # device then joins the network retained in flash and takes TuyaOS
+        # 3.3's older dynamic-TLS mode: the firmware passes one embedded
+        # 32-byte bootstrap token as both mbedTLS identity and PSK.  The local
+        # peer accepts that mode only for the matching decoded configuration
+        # and only after the encrypted Finished authenticates, then serves the
+        # bulb's real MQTT traffic without anything leaving this machine.
+        "name": "BK7231N Tuya LSC GLS A60 CBLC5 joins and authenticates cloud MQTT",
         "binary": os.path.join(ROOT_DIR, "firmwares",
                                "BK7231N_Tuya_LSC_GLS_A60_CBLC5_1.6.0.bin"),
-        "args": ["--only-uart", "-key", "TUYA", "--ble-core"],
+        "args": ["--only-uart", "-key", "TUYA", "-chip", "BK7231N",
+                 "--wifi-peer", "auto"],
         "timeout": 180,
         "tags": ["BLE", "BLE core", "FIQ"],
         "expected_strings": [
@@ -2727,6 +2744,19 @@ TEST_CASES = [
             "[BLE_ADV] EM 0x00910000",
             "Start Adv",
             "ble adv && resp changed",
+            "[WIFI] device acts as a station",
+            "[NET] DHCP: device",
+            "mqtt ip:",
+            "sends: TLS ClientHello",
+            "pre-shared key identity: 32 bytes",
+            "handshake authenticated; serving encrypted MQTT offline",
+            "connected to the offline broker",
+            "MQTT SUBSCRIBE ",
+            "MQTT PUBLISH ",
+        ],
+        "unexpected_strings": [
+            "mbedtls_ssl_handshake returned 0x7280",
+            "client Finished authentication failed",
         ],
     },
     {
@@ -2807,8 +2837,8 @@ TEST_CASES = [
         # bistable relay (separate on/off coils) and metering configuration.
         # The old case stopped at app_init immediately before the paired unit's
         # network/BLE/application path.  The 5.2 controller and virtual network
-        # now take it through HCI sync, metering start, its stored-network join
-        # and the first TLS-PSK cloud handshake.
+        # now take it through HCI sync, metering start, its stored-network join,
+        # authenticated TLS-PSK and the first encrypted MQTT cloud exchange.
         "name": "BK7238 Tuya GBDQA protection switch starts metering, BLE and cloud TLS",
         "binary": os.path.join(ROOT_DIR, "firmwares",
                                "BK7238_GBDQA_63V_16A.bin"),
@@ -2841,6 +2871,14 @@ TEST_CASES = [
             "tuya_measure_chip ok",
             "connect to mqtt broker mqtts://m3.tuyacn.com:8886 port 8886",
             "pre-shared key identity: 49 bytes",
+            "handshake authenticated; serving encrypted MQTT offline",
+            "connected to the offline broker",
+            "MQTT SUBSCRIBE smart/device/in/",
+            "MQTT PUBLISH smart/device/out/",
+        ],
+        "unexpected_strings": [
+            "mbedtls_ssl_handshake returned 0x7280",
+            "client Finished authentication failed",
         ],
     },
     {
@@ -2986,11 +3024,12 @@ DESCRIPTIONS = {
         "A newly added stock one-gang wall-switch dump on Tuya SDK 1.0.1. Its recovered board "
         "configuration is consumed by the application and maps the relay, physical button and "
         "Wi-Fi status LED to the expected pins before BLE advertising starts.",
-    "BK7231N Tuya LSC GLS A60 CBLC5 clears BLE reset and starts its application":
-        "A stock LSC RGB+CCT bulb on TuyaOS 3.3.44 that previously spun after HCI callback "
-        "registration on the BK7231N BLE 5.1 link-layer reset bit. The model now completes that "
-        "hardware reset, so the firmware reinitializes the BLE SDK, finishes its application, "
-        "starts advertising from exchange memory and begins Wi-Fi scanning.",
+    "BK7231N Tuya LSC GLS A60 CBLC5 joins and authenticates cloud MQTT":
+        "A paired LSC RGB+CCT bulb on TuyaOS 3.3.44 that previously spun after HCI callback "
+        "registration. Its real BK7231N selection now brings BLE up automatically, joins the "
+        "stored network and exercises Tuya's older mode-2 identity-as-PSK bootstrap. The offline "
+        "peer authenticates the encrypted Finished before returning server Finished, CONNACK and "
+        "SUBACK, and captures the bulb's first encrypted PUBLISH without logging its credential.",
     "BK7231N Tuya CB3S IR module reaches production-monitor endpoint":
         "A factory CB3S dump carrying Tuya's IR-box application. Its real BK7231N identity "
         "selects BLE hardware automatically, with no BLE/XVR workaround flags. The stock image "
@@ -3005,8 +3044,9 @@ DESCRIPTIONS = {
     "BK7238 Tuya GBDQA protection switch starts metering, BLE and cloud TLS":
         "A paired BK7238 GBDQA protection switch that previously stopped at app_init. With its "
         "BLE 5.2 controller and network peer active, it synchronizes the host stack, starts the "
-        "bistable relay and metering application, rejoins its stored network and emits the first "
-        "TLS-PSK cloud handshake.",
+        "bistable relay and metering application, rejoins its stored network, authenticates with "
+        "the dump's recovered PSK3, and completes MQTT CONNECT, SUBSCRIBE and its first QoS1 "
+        "PUBLISH against the offline cloud broker.",
     "BK7238 Tuya T1-U PCIe card serves its BLE/Wi-Fi pairing interfaces":
         "A three-channel BK7238 PCIe remote-boot card that previously stopped after loading its "
         "board map. It now completes BLE 5.2 startup, publishes its Tuya service, raises the open "
@@ -3171,11 +3211,11 @@ DESCRIPTIONS = {
         "The first paired BK7238 dump that joins its stored network ('DOM-1') as a Wi-Fi station and "
         "reaches for the Tuya cloud (oem_t1_irbox_mol_ty:0.0.5 on TuyaOS 3.8.31, T1-3S, plaintext). "
         "Because this unit is already bound ('already bind', psk30_key stored in KV), it connects "
-        "straight to its MQTT-over-TLS broker (m3-eu.lifeaiot.com:8883) and, when answered with "
-        "ServerHello (TLS_PSK_WITH_AES_128_GCM_SHA256), actually sends its ClientKeyExchange "
-        "(exercising tls_psk_identity() in src/netstack.py on real firmware for the first time) "
-        "before stopping at mbedtls_ssl_handshake 0x7280. Also covers fast-connect fallback + FCI "
-        "flash persistence, bound BLE 5.2 advertising (0x4B flag byte), and IR/button/LED GPIO mux.",
+        "straight to its MQTT-over-TLS broker (m3-eu.lifeaiot.com:8883). The simulator recovers the "
+        "dump's own PSK3 internally, verifies the encrypted TLS Finished, and serves its real MQTT "
+        "CONNECT, SUBSCRIBE and first QoS1 PUBLISH from the offline broker. Also covers fast-connect "
+        "fallback + FCI flash persistence, bound BLE 5.2 advertising (0x4B flag byte), and the "
+        "post-connect IR/button/Wi-Fi-LED GPIO state.",
     "Berry Startup Command: print(\"Hello \" + str(5+2*2))":
         "Pulls OpenBeken's dedicated 1.18.302 Berry build and runs a one-line Berry script from the "
         "startup command: berry print(\"Hello \" + str(5+2*2)). Exercises the embedded VM end to "
@@ -3448,8 +3488,8 @@ def dump_url(binary):
 
 # Which silicon a test covers, read off the dump's filename. Longer names come
 # first so BK7252N is not matched as BK7252, and BK7231N not as BK7231. This is
-# the *part* the dump came from, which is finer-grained than the emulated
-# identity: --chip collapses the whole T/U/N/M family onto BK7231.
+# the *part* the dump came from, which is finer-grained than most served chip
+# IDs.  BK7231U remains explicit because its upper GPIO bank differs from T.
 def chip_of(test_config):
     """Best-effort chip name for a test: filename first, then the -chip arg."""
     name = periph.chip_from_name(test_config["binary"])

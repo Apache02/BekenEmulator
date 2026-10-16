@@ -188,6 +188,18 @@ def test_ble_core_selection():
     assert ambiguous.blecore is None
     assert forced.blecore is not None and forced.blecore.layout == "5.1"
 
+    # BK7231U serves the generic family's same silicon ID, but an explicit
+    # variant selection exposes its second GPIO bank and keeps its BLE 4.2
+    # hardware out of the unrelated BLE 5.1 model.
+    bk7231u = _build_from_bytes(raw, chip="BK7231U", only_uart=True,
+                               save_decrypted=False)
+    assert bk7231u.has_extended_gpio and bk7231u.gpio_pin_count == 40
+    assert bk7231u.blecore is None
+    assert not ambiguous.has_extended_gpio and ambiguous.gpio_pin_count == 32
+    _assert_raises("this chip has no such core", lambda: _build_from_bytes(
+        raw, chip="BK7231U", only_uart=True, save_decrypted=False,
+        ble_core=True))
+
     # False remains a deliberate API-level diagnostic opt-out, while chips
     # without this BLE generation stay off in automatic mode and reject a
     # nonsensical force exactly as the CLI has always done.

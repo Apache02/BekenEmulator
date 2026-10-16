@@ -28,6 +28,7 @@ count), like the firmware; host sockets are serviced from a helper thread
 that only moves bytes in and out of queues.
 """
 import hashlib
+import hmac
 import os
 import select
 import socket
@@ -226,6 +227,239 @@ TLS_PSK_SUITES = {
 }
 TLS_VERSIONS = {0x0301: "1.0", 0x0302: "1.1", 0x0303: "1.2", 0x0304: "1.3"}
 
+TLS12 = b"\x03\x03"
+TLS_PSK_AES_128_GCM_SHA256 = 0x00A8
+TLS_EXT_EXTENDED_MASTER_SECRET = 0x0017
+TLS_MAX_PLAINTEXT = 1 << 14
+TLS_MAX_CIPHERTEXT = TLS_MAX_PLAINTEXT + 2048
+TLS_MAX_FRAGMENT_LENGTHS = {1: 512, 2: 1024, 3: 2048, 4: 4096}
+
+
+class TLSProtocolError(ValueError):
+    """A malformed, unexpected, or unauthenticated TLS record.
+
+    The exception deliberately carries no key-dependent detail.  Callers may
+    report the generic failure, but must never turn candidate PSKs into log
+    messages while diagnosing it.
+    """
+
+
+def tls12_prf(secret, label, seed, length):
+    """TLS 1.2 PRF using SHA-256 (RFC 5246 section 5)."""
+    secret, label, seed = bytes(secret), bytes(label), bytes(seed)
+    out = bytearray()
+    prf_seed = label + seed
+    a = hmac.new(secret, prf_seed, hashlib.sha256).digest()
+    while len(out) < length:
+        out.extend(hmac.new(secret, a + prf_seed, hashlib.sha256).digest())
+        a = hmac.new(secret, a, hashlib.sha256).digest()
+    return bytes(out[:length])
+
+
+def tls_psk_premaster(psk):
+    """Plain-PSK premaster secret from RFC 4279 section 2."""
+    psk = bytes(psk)
+    if not psk or len(psk) > 0xFFFF:
+        raise TLSProtocolError("invalid TLS PSK length")
+    size = struct.pack("!H", len(psk))
+    return size + bytes(len(psk)) + size + psk
+
+
+class TLS12PSKGCMServer:
+    """The encrypted half of a TLS 1.2 plain-PSK server handshake.
+
+    This intentionally implements one suite: TLS_PSK_WITH_AES_128_GCM_SHA256,
+    with Extended Master Secret.  Candidate keys stay opaque.  Each candidate
+    is tried against the authenticated client Finished record and only the one
+    that verifies is retained indirectly, as the derived traffic keys.  The
+    PSK itself is then discarded.
+    """
+
+    def __init__(self, psks, client_random, server_random,
+                 client_hello, server_handshakes,
+                 max_plaintext=TLS_MAX_PLAINTEXT,
+                 tuya_legacy_identity_psk=False):
+        candidates = []
+        for psk in psks:
+            if not isinstance(psk, (bytes, bytearray, memoryview)):
+                raise TypeError("TLS PSK candidates must be byte strings")
+            psk = bytes(psk)
+            if psk and len(psk) <= 0xFFFF:
+                candidates.append(psk)
+        if not candidates:
+            raise TLSProtocolError("no usable TLS PSK candidates")
+        if len(client_random) != 32 or len(server_random) != 32:
+            raise TLSProtocolError("TLS randoms must be 32 bytes")
+        if not (client_hello[:1] == b"\x01" and server_handshakes[:1] == b"\x02"):
+            raise TLSProtocolError("incomplete TLS handshake transcript")
+        if not 1 <= max_plaintext <= TLS_MAX_PLAINTEXT:
+            raise TLSProtocolError("invalid TLS plaintext limit")
+
+        self._psks = tuple(candidates)
+        self._tuya_legacy_identity_psk = bool(tuya_legacy_identity_psk)
+        self.client_random = bytes(client_random)
+        self.server_random = bytes(server_random)
+        self.transcript = bytearray(client_hello + server_handshakes)
+        self.state = "client_key_exchange"
+        self.client_seq = 0
+        self.server_seq = 0
+        self.client_key = self.server_key = None
+        self.client_iv = self.server_iv = None
+        self.max_plaintext = max_plaintext
+
+    @staticmethod
+    def _decrypt(key, implicit_iv, seq, content_type, version, fragment):
+        if (len(version) != 2 or len(fragment) < 8 + 16
+                or len(fragment) > TLS_MAX_CIPHERTEXT):
+            raise TLSProtocolError("malformed encrypted TLS record")
+        explicit, sealed = fragment[:8], fragment[8:]
+        ciphertext, tag = sealed[:-16], sealed[-16:]
+        aad = struct.pack("!Q", seq) + bytes([content_type]) + version + struct.pack("!H", len(ciphertext))
+        try:
+            from Crypto.Cipher import AES
+            cipher = AES.new(key, AES.MODE_GCM, nonce=implicit_iv + explicit, mac_len=16)
+            cipher.update(aad)
+            return cipher.decrypt_and_verify(ciphertext, tag)
+        except (ImportError, ValueError, KeyError) as exc:
+            raise TLSProtocolError("TLS record authentication failed") from exc
+
+    @staticmethod
+    def _encrypt(key, implicit_iv, seq, content_type, version, plaintext):
+        if len(version) != 2 or len(plaintext) > TLS_MAX_PLAINTEXT:
+            raise TLSProtocolError("invalid TLS record plaintext")
+        # RFC 5288 leaves construction of the 8-byte explicit part to the
+        # implementation.  The record sequence number is deterministic and
+        # unique within this traffic-key epoch, which satisfies its MUST.
+        seq_bytes = struct.pack("!Q", seq)
+        explicit = seq_bytes
+        aad = seq_bytes + bytes([content_type]) + version + struct.pack("!H", len(plaintext))
+        try:
+            from Crypto.Cipher import AES
+            cipher = AES.new(key, AES.MODE_GCM, nonce=implicit_iv + explicit, mac_len=16)
+            cipher.update(aad)
+            ciphertext, tag = cipher.encrypt_and_digest(bytes(plaintext))
+        except ImportError as exc:
+            raise TLSProtocolError("AES-GCM support is unavailable") from exc
+        fragment = explicit + ciphertext + tag
+        return bytes([content_type]) + version + struct.pack("!H", len(fragment)) + fragment
+
+    def add_client_key_exchange(self, message):
+        """Add the complete ClientKeyExchange handshake message."""
+        if self.state != "client_key_exchange" or len(message) < 6 or message[0] != 0x10:
+            raise TLSProtocolError("unexpected TLS ClientKeyExchange")
+        declared = int.from_bytes(message[1:4], "big")
+        if declared != len(message) - 4:
+            raise TLSProtocolError("malformed TLS ClientKeyExchange")
+        ident_len = struct.unpack("!H", message[4:6])[0]
+        if ident_len != len(message) - 6:
+            raise TLSProtocolError("malformed TLS PSK identity")
+        self.transcript.extend(message)
+        self.state = "change_cipher_spec"
+        identity = bytes(message[6:])
+        # A legacy Tuya PSK-only/bootstrap path configures one embedded value
+        # as both its key and its clear identity. Trial it only for the exact
+        # observed 32-byte alphanumeric shape and only when the caller opted
+        # into that Tuya compatibility mode. Matching the shape does not admit
+        # a session: finish() must still authenticate the encrypted Finished.
+        if (self._tuya_legacy_identity_psk and len(identity) == 32
+                and identity.isalnum() and identity not in self._psks):
+            self._psks += (identity,)
+        return identity
+
+    def change_cipher_spec(self, payload):
+        if self.state != "change_cipher_spec" or payload != b"\x01":
+            raise TLSProtocolError("unexpected TLS ChangeCipherSpec")
+        self.state = "client_finished"
+
+    def _candidate_schedule(self, psk):
+        premaster = tls_psk_premaster(psk)
+        session_hash = hashlib.sha256(self.transcript).digest()
+        master = tls12_prf(premaster, b"extended master secret", session_hash, 48)
+        block = tls12_prf(master, b"key expansion",
+                          self.server_random + self.client_random, 40)
+        return master, block[:16], block[16:32], block[32:36], block[36:40]
+
+    def finish(self, version, fragment):
+        """Authenticate client Finished and return server CCS + Finished."""
+        if self.state != "client_finished":
+            raise TLSProtocolError("unexpected TLS Finished")
+
+        selected = None
+        transcript_hash = hashlib.sha256(self.transcript).digest()
+        for psk in self._psks:
+            master, ckey, skey, civ, siv = self._candidate_schedule(psk)
+            try:
+                plain = self._decrypt(ckey, civ, 0, 0x16, version, fragment)
+            except TLSProtocolError:
+                continue
+            expected = (b"\x14\x00\x00\x0c"
+                        + tls12_prf(master, b"client finished", transcript_hash, 12))
+            if hmac.compare_digest(plain, expected):
+                selected = (master, ckey, skey, civ, siv, plain)
+                break
+        # Candidate secrets are no longer useful after this decision.  Do not
+        # retain wrong keys (or the selected PSK itself) in the live session.
+        self._psks = ()
+        self._tuya_legacy_identity_psk = False
+        if selected is None:
+            raise TLSProtocolError("TLS Finished authentication failed")
+
+        master, self.client_key, self.server_key, self.client_iv, self.server_iv, plain = selected
+        self.client_seq = 1
+        self.transcript.extend(plain)
+        server_verify = tls12_prf(
+            master, b"server finished", hashlib.sha256(self.transcript).digest(), 12)
+        server_finished = b"\x14\x00\x00\x0c" + server_verify
+        encrypted = self._encrypt(self.server_key, self.server_iv, 0, 0x16,
+                                  TLS12, server_finished)
+        self.server_seq = 1
+        self.state = "established"
+        return b"\x14\x03\x03\x00\x01\x01" + encrypted
+
+    @property
+    def established(self):
+        return self.state == "established"
+
+    def clear_secrets(self):
+        """Drop every credential/traffic-key reference when a run closes."""
+        self._psks = ()
+        self._tuya_legacy_identity_psk = False
+        self.client_key = self.server_key = None
+        self.client_iv = self.server_iv = None
+        self.transcript.clear()
+        self.state = "closed"
+
+    def decrypt_record(self, content_type, version, fragment):
+        if not self.established:
+            raise TLSProtocolError("TLS application record before Finished")
+        plain = self._decrypt(self.client_key, self.client_iv, self.client_seq,
+                              content_type, version, fragment)
+        if len(plain) > self.max_plaintext:
+            raise TLSProtocolError("TLS plaintext exceeds negotiated fragment limit")
+        self.client_seq += 1
+        return plain
+
+    def encrypt_record(self, content_type, plaintext, version=TLS12):
+        if not self.established:
+            raise TLSProtocolError("TLS application record before Finished")
+        if len(plaintext) > self.max_plaintext:
+            raise TLSProtocolError("TLS plaintext exceeds negotiated fragment limit")
+        record = self._encrypt(self.server_key, self.server_iv, self.server_seq,
+                               content_type, version, plaintext)
+        self.server_seq += 1
+        return record
+
+    def encrypt_records(self, content_type, plaintext, version=TLS12):
+        """Encrypt plaintext across records respecting max_fragment_length."""
+        plaintext = bytes(plaintext)
+        if not plaintext:
+            return self.encrypt_record(content_type, b"", version)
+        out = bytearray()
+        for off in range(0, len(plaintext), self.max_plaintext):
+            out.extend(self.encrypt_record(
+                content_type, plaintext[off:off + self.max_plaintext], version))
+        return bytes(out)
+
 
 def tls_client_hello(data):
     """What a TLS ClientHello says in clear, or None if this is not one.
@@ -238,24 +472,53 @@ def tls_client_hello(data):
     try:
         if len(data) < 45 or data[0] != 0x16 or data[5] != 0x01:
             return None
+        record_len = struct.unpack("!H", data[3:5])[0]
+        if (len(data) < 5 + record_len or record_len < 4
+                or record_len > TLS_MAX_PLAINTEXT):
+            return None
+        handshake_len = int.from_bytes(data[6:9], "big")
+        if handshake_len + 4 > record_len:
+            return None
+        handshake_end = 9 + handshake_len
         ver = struct.unpack("!H", data[9:11])[0]
+        random = bytes(data[11:43])
         p = 11 + 32                             # past version and random
         p += 1 + data[p]                        # session id
+        if p + 2 > handshake_end:
+            return None
         cs_len = struct.unpack("!H", data[p:p + 2])[0]
+        if cs_len % 2:
+            return None
         p += 2
+        if p + cs_len + 1 > handshake_end:
+            return None
         suites = [struct.unpack("!H", data[p + i:p + i + 2])[0] for i in range(0, cs_len, 2)]
         p += cs_len
         p += 1 + data[p]                        # compression methods
+        if p > handshake_end:
+            return None
         exts = {}
-        if p + 2 <= len(data):
+        if p + 2 <= handshake_end:
             ext_len = struct.unpack("!H", data[p:p + 2])[0]
             p += 2
-            end = min(p + ext_len, len(data))
+            if p + ext_len != handshake_end:
+                return None
+            end = p + ext_len
             while p + 4 <= end:
                 et, el = struct.unpack("!HH", data[p:p + 4])
+                if p + 4 + el > end:
+                    return None
+                if et in exts:
+                    return None
                 exts[et] = data[p + 4:p + 4 + el]
                 p += 4 + el
+            if p != end:
+                return None
+        elif p != handshake_end:
+            return None
         return {"version": TLS_VERSIONS.get(ver, "0x%04x" % ver),
+                "random": random,
+                "handshake": bytes(data[5:handshake_end]),
                 "suites": suites,
                 "psk": [s for s in suites if s in TLS_PSK_SUITES],
                 "extensions": exts,
@@ -377,6 +640,32 @@ def hexdump(data, width=16, base=0):
         text = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
         out.append("%08x  %-*s  %s" % (base + off, width * 3 - 1, hexed, text))
     return "\n".join(out)
+
+
+def ipv4_endpoints(frame):
+    """Return an Ethernet frame's ``(source, destination)`` IPv4 addresses.
+
+    The addresses are returned as four-byte values, matching the rest of this
+    module.  ``None`` means the frame is not a complete, internally plausible
+    Ethernet/IPv4 packet.  Keeping this parser separate from the human-readable
+    description lets callers compare addresses exactly instead of scraping (or
+    substring-matching) the text produced by :func:`describe_frame`.
+    """
+    try:
+        if len(frame) < 14 + 20 or frame[12:14] != struct.pack("!H", ETH_IP):
+            return None
+        packet = frame[14:]
+        if packet[0] >> 4 != 4:
+            return None
+        ihl = (packet[0] & 0x0F) * 4
+        if ihl < 20 or len(packet) < ihl:
+            return None
+        total = struct.unpack("!H", packet[2:4])[0]
+        if total < ihl or total > len(packet):
+            return None
+        return bytes(packet[12:16]), bytes(packet[16:20])
+    except (IndexError, TypeError, struct.error):
+        return None
 
 
 def describe_frame(frame):
@@ -697,6 +986,10 @@ class TcpConn:
         self.proto = None               # capture: 'http' | 'mqtt' | 'raw' once recognised
         self.answered = False           # capture/http: reply sent
         self.subscribed = []            # capture/mqtt: topic filters the device asked for
+        self.tls = None                 # TLS12PSKGCMServer once a supported hello is answered
+        self.tls_handshake_buf = b""    # clear handshake messages, without record headers
+        self.tls_plain_buf = b""        # decrypted application bytes awaiting MQTT framing
+        self.tls_app_proto = None       # application protocol recognised inside TLS
         self.fin_sent = False
         self.fin_rcvd = False
         self.close_after_flush = False
@@ -836,7 +1129,13 @@ class TcpConn:
                     self.proto = "mqtt"
                 elif self.rx_buf.split(b" ", 1)[0] in HTTP_METHODS:
                     self.proto = "http"
-                elif tls_client_hello(self.rx_buf) is not None:
+                # A TLS record header arrives before the whole ClientHello in
+                # perfectly ordinary TCP segmentation.  Classify from that
+                # header and let _tls_serve wait for its declared length;
+                # requiring a complete hello here would permanently label a
+                # split handshake as opaque raw bytes.
+                elif (self.rx_buf[0] == 0x16 and self.rx_buf[1] == 0x03
+                      and self.rx_buf[2] in (0x01, 0x02, 0x03)):
                     self.proto = "tls"
                 else:
                     self.proto = "raw"          # anything else: capture only
@@ -883,14 +1182,22 @@ class TcpConn:
         self.close_after_flush = True
         self.stack.log("[NET] HTTP %s answered 200 (offline)" % request)
 
-    def _mqtt_serve(self):
+    def _mqtt_send(self, payload, over_tls=False):
+        """Queue one broker packet, encrypting it for an established TLS peer."""
+        if over_tls:
+            if self.tls is None or not self.tls.established:
+                raise TLSProtocolError("MQTT reply before TLS Finished")
+            payload = self.tls.encrypt_records(0x17, payload)
+        self.queue(payload)
+
+    def _mqtt_serve(self, over_tls=False):
         """A broker that accepts everything: CONNACK, SUBACK, PUBACK, PINGRESP.
 
         Every PUBLISH is logged as topic = payload. MQTT 3.1/3.1.1 framing:
         one type/flags byte, a 1-4 byte remaining length, the body.
         """
         while True:
-            buf = self.rx_buf
+            buf = self.tls_plain_buf if over_tls else self.rx_buf
             if len(buf) < 2:
                 return
             n, mult, p = 0, 1, 1
@@ -906,9 +1213,12 @@ class TcpConn:
             if len(buf) < p + n:
                 return                          # packet incomplete
             ptype, flags, body = buf[0] >> 4, buf[0] & 0x0F, buf[p:p + n]
-            self.rx_buf = buf[p + n:]
+            if over_tls:
+                self.tls_plain_buf = buf[p + n:]
+            else:
+                self.rx_buf = buf[p + n:]
             if ptype == 1:                      # CONNECT
-                self.queue(b"\x20\x02\x00\x00")
+                self._mqtt_send(b"\x20\x02\x00\x00", over_tls)
                 self.stack.log("[NET] MQTT %s connected to the offline broker" % self.log_prefix)
             elif ptype == 3:                    # PUBLISH
                 qos = (flags >> 1) & 3
@@ -923,11 +1233,11 @@ class TcpConn:
                 self.stack.log("[NET] MQTT PUBLISH %s = %s" % (topic, text))
                 self.stack.mqtt_publishes.append((topic, payload))
                 if qos == 1:
-                    self.queue(b"\x40\x02" + pid)
+                    self._mqtt_send(b"\x40\x02" + pid, over_tls)
                 elif qos == 2:
-                    self.queue(b"\x50\x02" + pid)
+                    self._mqtt_send(b"\x50\x02" + pid, over_tls)
             elif ptype == 6:                    # PUBREL (QoS 2)
-                self.queue(b"\x70\x02" + body[:2])
+                self._mqtt_send(b"\x70\x02" + body[:2], over_tls)
             elif ptype == 8:                    # SUBSCRIBE
                 pid, q, granted, topics = body[:2], 2, b"", []
                 while q + 2 <= len(body):
@@ -935,31 +1245,28 @@ class TcpConn:
                     topics.append(body[q + 2:q + 2 + tlen].decode("utf-8", "replace"))
                     granted += bytes([min(body[q + 2 + tlen] if q + 2 + tlen < len(body) else 0, 1)])
                     q += 3 + tlen
-                self.queue(bytes([0x90, 2 + len(granted)]) + pid + granted)
+                self._mqtt_send(bytes([0x90, 2 + len(granted)]) + pid + granted, over_tls)
                 self.stack.log("[NET] MQTT SUBSCRIBE %s" % ", ".join(topics))
                 self.subscribed.extend(topics)
-                self._mqtt_deliver()
+                self._mqtt_deliver(over_tls)
             elif ptype == 10:                   # UNSUBSCRIBE
-                self.queue(b"\xb0\x02" + body[:2])
+                self._mqtt_send(b"\xb0\x02" + body[:2], over_tls)
             elif ptype == 12:                   # PINGREQ
-                self.queue(b"\xd0\x00")
+                self._mqtt_send(b"\xd0\x00", over_tls)
             elif ptype == 14:                   # DISCONNECT
                 self.close_after_flush = True
                 return
 
     def _tls_serve(self):
-        """Answer a TLS-PSK handshake far enough to learn who is calling.
+        """Serve TLS-PSK, completing the supported GCM+EMS flow when keyed.
 
-        A device's cloud connection cannot be decrypted here: the shared secret
-        lives in its provisioning data. But the handshake's first steps are in
-        clear, and a client only sends the identity of the key it intends to
-        use AFTER the server has replied. So this replies: ServerHello picking
-        one of the offered PSK suites, then ServerHelloDone. The device answers
-        with a ClientKeyExchange naming its key, which is logged, and then
-        switches to encryption and the conversation goes dark - as it should.
-
-        Nothing here weakens anything: no key is recovered or guessed, and the
-        handshake cannot complete, because completing it needs the secret.
+        Without a configured candidate PSK this retains the useful inspection
+        behaviour: answer through ServerHelloDone, record the clear PSK
+        identity, and stop at ChangeCipherSpec.  With candidates, no key is
+        selected merely because the identity looks plausible.  The encrypted
+        client Finished must authenticate and contain the right transcript
+        verify_data first; only then is the server Finished sent and decrypted
+        application data handed to the offline MQTT broker.
         """
         while True:
             buf = self.rx_buf
@@ -969,61 +1276,176 @@ class TcpConn:
                 self.proto = "raw"              # not TLS after all
                 return
             n = struct.unpack("!H", buf[3:5])[0]
+            encrypted_epoch = (self.tls is not None
+                               and self.tls.state in ("client_finished", "established"))
+            limit = TLS_MAX_CIPHERTEXT if encrypted_epoch else TLS_MAX_PLAINTEXT
+            if n > limit:
+                self._tls_fail("record exceeds the TLS length limit")
+                return
             if len(buf) < 5 + n:
                 return                          # record incomplete
             rec, self.rx_buf = buf[:5 + n], buf[5 + n:]
-            info = tls_client_hello(rec)
-            if info and not self.answered:
-                self.answered = True
-                named = ", ".join(TLS_PSK_SUITES.get(s, "0x%04x" % s) for s in info["suites"])
-                self.stack.log("[NET] TLS %s client hello: version %s, %d cipher suites (%s)%s"
-                               % (self.log_prefix, info["version"], len(info["suites"]), named,
-                                  ", server name %s" % info["sni"] if info["sni"] else
-                                  ", no server name"))
-                if not info["psk"]:
-                    self.stack.log("[NET] TLS %s offers no pre-shared-key suite, so nothing "
-                                   "further can be read" % self.log_prefix)
+            content_type, version, fragment = rec[0], rec[1:3], rec[5:]
+
+            # Once CCS has installed the client write keys, a type-0x16 record
+            # is ciphertext, not another clear handshake message.
+            if self.tls is not None and self.tls.state == "client_finished":
+                if content_type != 0x16:
+                    self._tls_fail("expected the encrypted client Finished")
                     return
-                self.queue(self._tls_server_hello(info["psk"][0], info.get("extensions") or {}))
-                self.stack.log("[NET] TLS %s answered with %s, waiting for the key identity"
-                               % (self.log_prefix, TLS_PSK_SUITES[info["psk"][0]]))
+                try:
+                    server_flight = self.tls.finish(version, fragment)
+                except TLSProtocolError:
+                    self._tls_fail("client Finished authentication failed")
+                    return
+                self.queue(server_flight)
+                self.stack.log("[NET] TLS %s handshake authenticated; serving encrypted MQTT "
+                               "offline" % self.log_prefix)
                 continue
-            ident = tls_psk_identity(rec)
-            if ident is not None:
-                if ident and all(32 <= b < 127 for b in ident):
-                    text = ident.decode("ascii")
-                else:
-                    text = "%d bytes (%s)" % (len(ident), ident.hex())
-                self.stack.log("[NET] TLS %s pre-shared key identity: %s"
-                               % (self.log_prefix, text))
-                self.stack.tls_identities.append((self.log_prefix, ident))
+
+            if self.tls is not None and self.tls.established:
+                try:
+                    plain = self.tls.decrypt_record(content_type, version, fragment)
+                except TLSProtocolError:
+                    self._tls_fail("encrypted record authentication failed")
+                    return
+                if content_type == 0x17:
+                    self.tls_plain_buf += plain
+                    if self.tls_app_proto is None:
+                        if mqtt_connect_info(self.tls_plain_buf) is not None:
+                            self.tls_app_proto = "mqtt"
+                        elif len(self.tls_plain_buf) >= 12:
+                            self.tls_app_proto = "raw"
+                            self.stack.log("[NET] TLS %s decrypted non-MQTT application data"
+                                           % self.log_prefix)
+                    if self.tls_app_proto == "mqtt":
+                        self._mqtt_serve(over_tls=True)
+                elif content_type == 0x15:
+                    self.stack.log("[NET] TLS %s received an authenticated alert"
+                                   % self.log_prefix)
+                    self.close_after_flush = True
+                # Post-handshake type 0x16 is authenticated but there is no
+                # renegotiation/session-ticket machinery in this small server.
                 continue
-            if rec[0] == 0x14:
-                # ChangeCipherSpec: everything the device sends after this is
-                # encrypted, including the Finished - which is itself a type
-                # 0x16 record, so it must NOT be fed back to the identity
-                # parser. Dropping to "raw" stops this responder being called
-                # again for the connection; the rest is captured, never read.
+
+            if content_type == 0x16:
+                self.tls_handshake_buf += fragment
+                while len(self.tls_handshake_buf) >= 4:
+                    msg_len = int.from_bytes(self.tls_handshake_buf[1:4], "big")
+                    if msg_len > 0x10000:
+                        self._tls_fail("oversized clear handshake message")
+                        return
+                    if len(self.tls_handshake_buf) < 4 + msg_len:
+                        break
+                    msg = self.tls_handshake_buf[:4 + msg_len]
+                    self.tls_handshake_buf = self.tls_handshake_buf[4 + msg_len:]
+                    if msg[0] == 0x01 and not self.answered:
+                        hello_rec = b"\x16" + version + struct.pack("!H", len(msg)) + msg
+                        info = tls_client_hello(hello_rec)
+                        if info is None:
+                            self._tls_fail("malformed ClientHello")
+                            return
+                        self.answered = True
+                        named = ", ".join(TLS_PSK_SUITES.get(s, "0x%04x" % s)
+                                          for s in info["suites"])
+                        self.stack.log(
+                            "[NET] TLS %s client hello: version %s, %d cipher suites (%s)%s"
+                            % (self.log_prefix, info["version"], len(info["suites"]), named,
+                               ", server name %s" % info["sni"] if info["sni"] else
+                               ", no server name"))
+                        if not info["psk"]:
+                            self.stack.log("[NET] TLS %s offers no pre-shared-key suite, so "
+                                           "nothing further can be read" % self.log_prefix)
+                            return
+                        ems = info["extensions"].get(TLS_EXT_EXTENDED_MASTER_SECRET)
+                        mfl_data = info["extensions"].get(0x0001)
+                        mfl = (TLS_MAX_FRAGMENT_LENGTHS.get(mfl_data[0])
+                               if mfl_data is not None and len(mfl_data) == 1
+                               else None)
+                        can_complete = (bool(self.stack.tls_psks)
+                                        and info["version"] == "1.2"
+                                        and TLS_PSK_AES_128_GCM_SHA256 in info["psk"]
+                                        and ems == b"")
+                        suite = (TLS_PSK_AES_128_GCM_SHA256 if can_complete
+                                 else info["psk"][0])
+                        reply = self._tls_server_hello(suite, info["extensions"])
+                        if can_complete:
+                            try:
+                                self.tls = TLS12PSKGCMServer(
+                                    self.stack.tls_psks, info["random"], reply[11:43],
+                                    info["handshake"], reply[5:],
+                                    max_plaintext=mfl or TLS_MAX_PLAINTEXT,
+                                    tuya_legacy_identity_psk=(
+                                        self.stack.tuya_legacy_identity_psk))
+                            except (TLSProtocolError, TypeError):
+                                self._tls_fail("TLS credential setup failed")
+                                return
+                        self.queue(reply)
+                        self.stack.log("[NET] TLS %s answered with %s, waiting for the key "
+                                       "identity" % (self.log_prefix, TLS_PSK_SUITES[suite]))
+                    elif msg[0] == 0x10:
+                        try:
+                            if self.tls is not None:
+                                ident = self.tls.add_client_key_exchange(msg)
+                            else:
+                                synthetic = (b"\x16" + version
+                                             + struct.pack("!H", len(msg)) + msg)
+                                ident = tls_psk_identity(synthetic)
+                                if ident is None:
+                                    raise TLSProtocolError("malformed TLS PSK identity")
+                        except TLSProtocolError:
+                            self._tls_fail("malformed ClientKeyExchange")
+                            return
+                        self._tls_note_identity(ident)
+                    elif self.tls is not None:
+                        self._tls_fail("unexpected clear handshake message")
+                        return
+                continue
+
+            if content_type == 0x14:
+                if self.tls is not None:
+                    try:
+                        self.tls.change_cipher_spec(fragment)
+                    except TLSProtocolError:
+                        self._tls_fail("unexpected ChangeCipherSpec")
+                        return
+                    self.stack.log("[NET] TLS %s switched to encryption (ChangeCipherSpec); "
+                                   "authenticating the client Finished" % self.log_prefix)
+                    continue
+                # Inspection-only mode has no traffic keys and deliberately
+                # stops before interpreting the encrypted Finished.
                 self.proto = "raw"
                 self.stack.log("[NET] TLS %s switched to encryption (ChangeCipherSpec); "
                                "everything after this needs the device's own secret to read"
                                % self.log_prefix)
                 return
-            if rec[0] == 0x15:
+            if content_type == 0x15:
                 self.proto = "raw"
                 self.stack.log("[NET] TLS %s alert, the device gave up on the handshake"
                                % self.log_prefix)
                 return
-            if rec[0] == 0x17:
+            if content_type == 0x17:
                 self.proto = "raw"
                 self.stack.log("[NET] TLS %s is encrypted from here on (%d bytes), which needs "
-                               "the device's own secret to read" % (self.log_prefix, len(rec) - 5))
+                               "the device's own secret to read" % (self.log_prefix, len(fragment)))
                 return
 
-    # Extensions echoed back when the client offers them. A client built to
-    # require these refuses a server that ignores them, and echoing costs
-    # nothing here: they change how keys would be derived, and no key is ever
-    # derived on this side.
+    def _tls_note_identity(self, ident):
+        # The identity is credential-adjacent and can itself carry private
+        # account/device material.  Retain it for internal inspection, but
+        # expose only its shape in logs.
+        self.stack.log("[NET] TLS %s pre-shared key identity: %d bytes"
+                       % (self.log_prefix, len(ident)))
+        self.stack.tls_identities.append((self.log_prefix, ident))
+
+    def _tls_fail(self, reason):
+        """Stop TLS parsing with a key-agnostic diagnostic."""
+        self.proto = "raw"
+        self.stack.log("[NET] TLS %s %s" % (self.log_prefix, reason))
+
+    # Extensions echoed back when the client offers them.  In particular,
+    # 0x0017 commits both peers to the Extended Master Secret derivation used
+    # by TLS12PSKGCMServer.
     TLS_ECHO_EXTENSIONS = (0x0001,      # max_fragment_length, echoed with its value
                            0x0016,      # encrypt_then_mac
                            0x0017)      # extended_master_secret
@@ -1040,6 +1462,11 @@ class TcpConn:
         for et in self.TLS_ECHO_EXTENSIONS:
             if et in client_exts:
                 val = client_exts[et] if et == 0x0001 else b""
+                if et == 0x0001 and (len(val) != 1
+                                     or val[0] not in TLS_MAX_FRAGMENT_LENGTHS):
+                    continue
+                if et in (0x0016, 0x0017) and client_exts[et] != b"":
+                    continue
                 ext += struct.pack("!HH", et, len(val)) + val
         body = struct.pack("!H", 0x0303) + rnd + b"\x00" + struct.pack("!H", suite) + b"\x00"
         if ext:
@@ -1049,7 +1476,7 @@ class TcpConn:
         payload = hello + done
         return b"\x16\x03\x03" + struct.pack("!H", len(payload)) + payload
 
-    def _mqtt_deliver(self):
+    def _mqtt_deliver(self, over_tls=False):
         """Send the device any --mqtt-publish message it has now subscribed to.
 
         A real broker only forwards what a client asked for, so each message
@@ -1061,7 +1488,7 @@ class TcpConn:
             if not any(mqtt_topic_matches(f, topic) for f in self.subscribed):
                 continue
             self.stack.mqtt_pubs.remove(item)
-            self.queue(mqtt_publish_packet(topic.encode("utf-8"), payload))
+            self._mqtt_send(mqtt_publish_packet(topic.encode("utf-8"), payload), over_tls)
             self.stack.log("[NET] MQTT -> device PUBLISH %s = %s"
                            % (topic, payload.decode("utf-8", "replace")))
 
@@ -1089,8 +1516,11 @@ class TcpConn:
         elif self.kind == "capture":
             # An MQTT session stays open as long as the firmware keeps it:
             # it goes quiet between keep-alives, which is not the end of it.
+            mqtt_session = (self.proto == "mqtt"
+                            or (self.proto == "tls" and self.tls is not None
+                                and self.tls.established and self.tls_app_proto == "mqtt"))
             if (self.state in ("ESTABLISHED", "CLOSE_WAIT") and not self.close_after_flush
-                    and self.proto != "mqtt"
+                    and not mqtt_session
                     and now_us - self.last_activity_us > CAPTURE_IDLE_US):
                 if self.captured and not self.described:
                     self.described = True
@@ -1114,7 +1544,8 @@ class TcpConn:
 # ------------------------------------------------------------------ the stack
 class NetStack:
     def __init__(self, mac, log=None, gateway=True, ip=None, netmask=b"\xff\xff\xff\x00",
-                 net_out=False, forwards=(), device_ip=None, http_gets=(), mqtt_pubs=()):
+                 net_out=False, forwards=(), device_ip=None, http_gets=(), mqtt_pubs=(),
+                 tls_psks=(), tuya_legacy_identity_psk=False):
         self.mac = mac
         self.log = log or (lambda *a: None)
         self.gateway = gateway          # True: we are the router/DHCP server; False: DHCP client
@@ -1166,14 +1597,44 @@ class NetStack:
         self.http_replies = []
         self.mqtt_publishes = []        # (topic, payload) seen by the offline broker
         self.tls_identities = []        # (connection, identity bytes) from TLS-PSK handshakes
+        if isinstance(tls_psks, (bytes, bytearray, memoryview)):
+            tls_psks = (tls_psks,)
+        candidates = []
+        for psk in tls_psks:
+            if not isinstance(psk, (bytes, bytearray, memoryview)):
+                raise TypeError("TLS PSK candidates must be byte strings")
+            candidates.append(bytes(psk))
+        # Kept at stack scope so a firmware cloud reconnect can authenticate
+        # too.  Each TLS12PSKGCMServer receives a private copy and discards its
+        # candidate tuple immediately after Finished succeeds or fails.
+        self.tls_psks = tuple(candidates)
+        self.tuya_legacy_identity_psk = bool(tuya_legacy_identity_psk)
         # (topic, payload) the offline broker should push TO the device, each
         # sent once the device subscribes to a filter that matches it.
         self.mqtt_pubs = list(mqtt_pubs)
         self._http_next_us = 0
+        if self.net_out:
+            self.log("[NET] REAL INTERNET enabled: device DNS/TCP/UDP can leave this machine")
 
     def close(self):
-        """Release the host side: forward listeners, relayed sockets, the thread."""
+        """Release host resources and forget all TLS credential material."""
         self.io.shutdown()
+        self.tls_psks = ()
+        self.tuya_legacy_identity_psk = False
+        self.tls_identities.clear()
+        for conn in tuple(self.conns.values()):
+            if conn.tls is not None:
+                conn.tls.clear_secrets()
+                conn.tls = None
+            # These capture the clear ClientKeyExchange (including its
+            # identity) and decrypted application records while a run is live.
+            conn.captured = b""
+            conn.rx_buf = b""
+            conn.tls_handshake_buf = b""
+            conn.tls_plain_buf = b""
+        self.conns.clear()
+        self.output = None
+        self.on_frame = None
 
     # --------------------------------------------------------------- output
     def send_eth(self, dst_mac, ethertype, payload):
@@ -2073,6 +2534,14 @@ def _run_selftests():
     ip = fs.device_ip
     check(describe_frame(inframe) == "ICMP echo request 192.168.1.100 to 192.168.1.1",
           "an echo request is named with both addresses")
+    check(ipv4_endpoints(inframe) == (str2ip("192.168.1.100"), str2ip("192.168.1.1")),
+          "raw IPv4 endpoints are extracted exactly for packet-list filtering")
+    malformed_ip = bytearray(ipv4_packet(ip, fs.ip, IP_ICMP, ping))
+    malformed_ip[2:4] = struct.pack("!H", len(malformed_ip) + 1)
+    check(ipv4_endpoints(eth_frame(fs.mac, dev_mac, ETH_ARP, bytes(malformed_ip))) is None
+          and ipv4_endpoints(eth_frame(fs.mac, dev_mac, ETH_IP, bytes(malformed_ip))) is None
+          and ipv4_endpoints(b"short") is None,
+          "endpoint extraction rejects non-IPv4, truncated and inconsistent frames safely")
     syn = tcp_segment(ip, str2ip("10.200.0.1"), 40127, 1883, 1, 0, TCP_SYN, 8192)
     check(summ(syn) == "TCP 192.168.1.100:40127 to 10.200.0.1:1883 [SYN]", "a SYN names its ports and flag")
     data = tcp_segment(ip, str2ip("10.200.0.1"), 40127, 1883, 2, 1, TCP_ACK | TCP_PSH, 8192, b"hello there")
@@ -2128,6 +2597,111 @@ def _run_selftests():
     check(two.count("\n") == 1 and two.splitlines()[1].startswith("00000010  00 00 00 00  "),
           "a second row starts at the right offset and is padded so the text column lines up")
 
+    print("== TLS 1.2 PSK/GCM/EMS crypto engine ==")
+    # Published TLS 1.2 SHA-256 PRF vector (100-byte vector, first 32 bytes).
+    prf_vector = tls12_prf(
+        bytes.fromhex("9bbe436ba940f017b17652849a71db35"), b"test label",
+        bytes.fromhex("a0ba9f936cda311827a6f796ffd5198c"), 32)
+    check(prf_vector.hex() ==
+          "e3f229ba727be17b8d122620557cd453c2aab21d07c3d495329b52d4e61edb5a",
+          "TLS 1.2 P_SHA256 matches its published deterministic vector")
+    check(tls_psk_premaster(b"abc") == b"\x00\x03\x00\x00\x00\x00\x03abc",
+          "plain PSK premaster encodes an equal-length all-zero other_secret")
+
+    # A fixed synthetic transcript pins EMS, Finished, GCM nonce/AAD/tag and
+    # both traffic directions without carrying any real device credential.
+    fx_ch = bytes.fromhex(
+        "0100002f0303000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        "00000200a80100000400170000")
+    fx_server = bytes.fromhex(
+        "0200002c0303202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
+        "0000a8000004001700000e000000")
+    fx_cke = bytes.fromhex("10000010000e666978747572652d636c69656e74")
+    fx_client_finished = bytes.fromhex(
+        "16030300280000000000000000dd86ff0778b91eebcf1068a28cbe65d34ce39485bdb25ac6c5f9"
+        "41df023e7520")
+    fx_server_flight = bytes.fromhex(
+        "14030300010116030300280000000000000000c2ab5020ab616191d1e89dbb55870f79df90619e99"
+        "d92d9dd97cc43a81ac7557")
+    fx_app_record = bytes.fromhex(
+        "170303002c0000000000000001dc9548dca48a3d054700292fe30be85d011960ff23ca3d85f04835"
+        "6eaa524b568806b8f4")
+    fx_app = bytes.fromhex("101200044d5154540402003c0006636c69656e74")
+    fx = TLS12PSKGCMServer(
+        (b"incorrect synthetic candidate", b"synthetic tls psk fixture"),
+        bytes(range(32)), bytes(range(32, 64)), fx_ch, fx_server)
+    check(hashlib.sha256(fx.transcript + fx_cke).hexdigest() ==
+          "9b53d23c0caa1f9f1ccf93274bfe8ec7f22a6193c5ad83e81ef93ad0fe147836",
+          "ClientHello, ServerHello/Done and ClientKeyExchange form the EMS transcript")
+    check(fx.add_client_key_exchange(fx_cke) == b"fixture-client",
+          "ClientKeyExchange contributes its identity and complete handshake framing")
+    fx.change_cipher_spec(b"\x01")
+    check(fx.finish(TLS12, fx_client_finished[5:]) == fx_server_flight,
+          "authenticated client Finished selects the right candidate and yields CCS + server Finished")
+    check(fx.established and fx.client_seq == 1 and fx.server_seq == 1,
+          "record epochs start at sequence zero for Finished, then advance independently")
+    check(fx.decrypt_record(0x17, TLS12, fx_app_record[5:]) == fx_app,
+          "AES-GCM application record decrypts with explicit nonce, sequence AAD and tag")
+    check(fx.encrypt_record(0x17, b"\x20\x02\x00\x00").hex() ==
+          "170303001c0000000000000001cafd534ff055bbc5fd23d7c9e74fbf9103d90558",
+          "server application record uses its own sequence, nonce, AAD and authentication tag")
+    try:
+        fx.decrypt_record(0x17, TLS12, fx_app_record[5:])
+        replay_rejected = False
+    except TLSProtocolError:
+        replay_rejected = True
+    check(replay_rejected, "replaying a valid GCM record at the next sequence number is rejected")
+
+    # TuyaOS 3.3's legacy bootstrap mode passes one embedded 32-byte token to
+    # mbedTLS as both the public identity and the PSK.  Use a wholly synthetic
+    # token to pin that compatibility path, including the Finished proof that
+    # prevents an arbitrary identity from being accepted on shape alone.
+    legacy_identity = b"legacyIdentityActsAsPskValue0001"
+    legacy_body = struct.pack("!H", len(legacy_identity)) + legacy_identity
+    legacy_cke = b"\x10" + len(legacy_body).to_bytes(3, "big") + legacy_body
+    legacy = TLS12PSKGCMServer(
+        (b"wrong stored legacy candidate",), bytes(range(32)), bytes(range(32, 64)),
+        fx_ch, fx_server, tuya_legacy_identity_psk=True)
+    check(legacy.add_client_key_exchange(legacy_cke) == legacy_identity
+          and legacy._psks[-1] == legacy_identity,
+          "enabled Tuya legacy mode trials an exact 32-byte alphanumeric identity as PSK")
+    legacy.change_cipher_spec(b"\x01")
+    legacy_hash = hashlib.sha256(legacy.transcript).digest()
+    legacy_master = tls12_prf(
+        tls_psk_premaster(legacy_identity), b"extended master secret", legacy_hash, 48)
+    legacy_block = tls12_prf(
+        legacy_master, b"key expansion", bytes(range(32, 64)) + bytes(range(32)), 40)
+    legacy_finished_plain = (b"\x14\x00\x00\x0c"
+                             + tls12_prf(legacy_master, b"client finished",
+                                         legacy_hash, 12))
+    legacy_finished = TLS12PSKGCMServer._encrypt(
+        legacy_block[:16], legacy_block[32:36], 0, 0x16, TLS12,
+        legacy_finished_plain)
+    legacy.finish(TLS12, legacy_finished[5:])
+    check(legacy.established and legacy._psks == (),
+          "the identity key is admitted only after its encrypted Finished authenticates")
+
+    legacy_off = TLS12PSKGCMServer(
+        (b"wrong stored legacy candidate",), bytes(range(32)), bytes(range(32, 64)),
+        fx_ch, fx_server, tuya_legacy_identity_psk=False)
+    legacy_off.add_client_key_exchange(legacy_cke)
+    legacy_off.change_cipher_spec(b"\x01")
+    try:
+        legacy_off.finish(TLS12, legacy_finished[5:])
+        legacy_disabled_rejected = False
+    except TLSProtocolError:
+        legacy_disabled_rejected = True
+    malformed_identity = b"not-a-32-byte-alphanumeric-token"
+    malformed_body = struct.pack("!H", len(malformed_identity)) + malformed_identity
+    malformed_cke = b"\x10" + len(malformed_body).to_bytes(3, "big") + malformed_body
+    legacy_shaped = TLS12PSKGCMServer(
+        (b"wrong stored legacy candidate",), bytes(range(32)), bytes(range(32, 64)),
+        fx_ch, fx_server, tuya_legacy_identity_psk=True)
+    legacy_shaped.add_client_key_exchange(malformed_cke)
+    check(legacy_disabled_rejected
+          and legacy_shaped._psks == (b"wrong stored legacy candidate",),
+          "disabled mode and a non-matching identity shape never become PSK candidates")
+
     print("== TLS-PSK: reading who is calling the cloud ==")
     # The exact ClientHello a BK7231N 3-phase meter dump sent to its Tuya cloud
     # in this emulator: TLS 1.2, four suites, three of them pre-shared-key, no
@@ -2147,6 +2721,18 @@ def _run_selftests():
     check(tls_client_hello(b"GET / HTTP/1.1\r\n\r\n") is None
           and tls_client_hello(real_hello[:20]) is None,
           "something that is not a complete hello is not read as one")
+    hello_base = fx_ch[4:-6]  # body before extensions_length + the one EMS extension
+
+    def hello_with_extensions(ext_blob):
+        body = hello_base + struct.pack("!H", len(ext_blob)) + ext_blob
+        msg = b"\x01" + len(body).to_bytes(3, "big") + body
+        return b"\x16\x03\x03" + struct.pack("!H", len(msg)) + msg
+
+    duplicate_ems = hello_with_extensions(b"\x00\x17\x00\x00\x00\x17\x00\x00")
+    trailing_ext_byte = hello_with_extensions(b"\x00\x17\x00\x00\xff")
+    check(tls_client_hello(duplicate_ems) is None
+          and tls_client_hello(trailing_ext_byte) is None,
+          "duplicate extensions and trailing bytes in the extension block reject a ClientHello")
 
     logsT2, outT2 = [], []
     ts3 = NetStack(bytes.fromhex("020000000001"), log=logsT2.append, gateway=True)
@@ -2173,8 +2759,9 @@ def _run_selftests():
     sq = dev_send(ts3, tc, cloud, 8886, 6700, sq,
                   b"\x16\x03\x03" + struct.pack("!H", len(cke)) + cke)
     ts3.tick(1_100_000)
-    check(any("pre-shared key identity: bf0e0f689d000d56656gmp" in l for l in logsT2),
-          "the identity the device claims is read out of the exchange")
+    check(any("pre-shared key identity: %d bytes" % len(ident) in l for l in logsT2)
+          and not any(ident.decode() in l for l in logsT2),
+          "the identity is retained without exposing its bytes in the log")
     check(ts3.tls_identities and ts3.tls_identities[-1][1] == ident,
           "and kept, so a front end can show which device called")
     n_logs = len(logsT2)
@@ -2221,6 +2808,180 @@ def _run_selftests():
           "a certificate-based hello is reported and left alone")
     check(not [p for _, _, _, p, sp, _ in segs(outT3, 6701) if sp == 443 and p],
           "...with no ServerHello sent back, because there is nothing honest to send")
+
+    print("== TLS keyed-mode admission and record limits ==")
+    logsG, outG = [], []
+    gated = NetStack(bytes.fromhex("020000000001"), log=logsG.append, gateway=True,
+                     tls_psks=(b"synthetic gate key",))
+    gated.output = outG.append
+    gated.device_ip, gated.device_mac = str2ip("192.168.1.100"), dev_mac
+    gated.arp[gated.device_ip] = dev_mac
+    # EMS is an empty extension by definition.  A non-empty encoding may be
+    # inspected, but must never activate credential-backed completion.
+    nonempty_ems = hello_with_extensions(b"\x00\x17\x00\x01\x00")
+    gc1, gs1 = open_capture(gated, outG, cloud, 8883, 6702, isn=33500)
+    dev_send(gated, gc1, cloud, 8883, 6702, gs1, nonempty_ems)
+    gated.tick(1_000_000)
+    # Likewise, suite 0x00A8 does not turn a TLS 1.1 ClientHello into a TLS 1.2
+    # exchange merely because the record-layer version looks familiar.
+    tls11_hello = bytearray(hello_with_extensions(b"\x00\x17\x00\x00"))
+    tls11_hello[9:11] = b"\x03\x02"
+    gc2, gs2 = open_capture(gated, outG, cloud, 8883, 6703, isn=34000)
+    dev_send(gated, gc2, cloud, 8883, 6703, gs2, bytes(tls11_hello))
+    gated.tick(1_100_000)
+    check(gc1.tls is None and gc2.tls is None,
+          "keyed completion requires TLS 1.2 and an exactly empty EMS extension")
+    gc3, gs3 = open_capture(gated, outG, cloud, 8883, 6704, isn=34500)
+    oversize_header = (b"\x16\x03\x03"
+                       + struct.pack("!H", TLS_MAX_PLAINTEXT + 1))
+    dev_send(gated, gc3, cloud, 8883, 6704, gs3, oversize_header)
+    check(gc3.proto == "raw" and any("record exceeds the TLS length limit" in line
+                                      for line in logsG),
+          "an oversized clear TLS record is rejected from its header without buffering its body")
+
+    print("== keyed TLS-PSK record flow reaches the offline MQTT broker ==")
+    tls_secret = b"synthetic integration psk, never a device key"
+    large_push = b"x" * 2300
+    logsK, outK = [], []
+    keyed = NetStack(bytes.fromhex("020000000001"), log=logsK.append, gateway=True,
+                     tls_psks=(b"wrong synthetic candidate", tls_secret),
+                     mqtt_pubs=(("cmnd/large", large_push),))
+    keyed.output = outK.append
+    keyed.device_ip, keyed.device_mac = str2ip("192.168.1.100"), dev_mac
+    keyed.arp[keyed.device_ip] = dev_mac
+    kc, kseq = open_capture(keyed, outK, cloud, 8883, 6710, isn=35000)
+
+    # Split the ClientHello after its TLS header.  Protocol recognition and
+    # record buffering must not depend on how TCP happened to segment it.
+    keyed_hello_record = hello_with_extensions(
+        b"\x00\x01\x00\x01\x02"       # max_fragment_length = 1024
+        b"\x00\x17\x00\x00")          # extended_master_secret
+    keyed_ch = keyed_hello_record[5:]
+    client_hello_record = keyed_hello_record
+    kseq = dev_send(keyed, kc, cloud, 8883, 6710, kseq, client_hello_record[:7])
+    check(kc.proto == "tls" and not kc.answered,
+          "a split TLS record is recognised from its header and waits for the complete ClientHello")
+    hello_out_from = len(outK)
+    kseq = dev_send(keyed, kc, cloud, 8883, 6710, kseq, client_hello_record[7:])
+    keyed.tick(1_000_000)
+    hello_reply = b"".join(p for _, _, _, p, sp, _ in segs(outK[hello_out_from:])
+                           if sp == 8883 and p)
+    check(hello_reply.startswith(b"\x16\x03\x03") and hello_reply[5] == 0x02
+          and b"\x00\x01\x00\x01\x02" in hello_reply
+          and hello_reply[-4:] == b"\x0e\x00\x00\x00",
+          "keyed ServerHello selects AES-128-GCM, EMS and the offered 1024-byte fragment limit")
+
+    server_random = hello_reply[11:43]
+    transcript = keyed_ch + hello_reply[5:] + fx_cke
+    master = tls12_prf(tls_psk_premaster(tls_secret), b"extended master secret",
+                       hashlib.sha256(transcript).digest(), 48)
+    key_block = tls12_prf(master, b"key expansion", server_random + bytes(range(32)), 40)
+    client_key, server_key = key_block[:16], key_block[16:32]
+    client_iv, server_iv = key_block[32:36], key_block[36:40]
+    client_finished_plain = (b"\x14\x00\x00\x0c"
+                             + tls12_prf(master, b"client finished",
+                                         hashlib.sha256(transcript).digest(), 12))
+    client_finished_record = TLS12PSKGCMServer._encrypt(
+        client_key, client_iv, 0, 0x16, TLS12, client_finished_plain)
+    cke_record = b"\x16\x03\x03" + struct.pack("!H", len(fx_cke)) + fx_cke
+    client_handshake_flight = (cke_record + b"\x14\x03\x03\x00\x01\x01"
+                               + client_finished_record)
+    finished_out_from = len(outK)
+    kseq = dev_send(keyed, kc, cloud, 8883, 6710, kseq, client_handshake_flight)
+    keyed.tick(1_100_000)
+    server_finished_flight = b"".join(
+        p for _, _, _, p, sp, _ in segs(outK[finished_out_from:]) if sp == 8883 and p)
+    check(server_finished_flight.startswith(b"\x14\x03\x03\x00\x01\x01\x16\x03\x03"),
+          "verified client Finished produces server ChangeCipherSpec and encrypted Finished")
+    check(kc.tls is not None and kc.tls.max_plaintext == 1024 and kc.tls._psks == (),
+          "the session installs the negotiated fragment limit and discards its PSK candidates")
+    server_finished_record = server_finished_flight[6:]
+    server_finished_plain = TLS12PSKGCMServer._decrypt(
+        server_key, server_iv, 0, 0x16, TLS12, server_finished_record[5:])
+    expected_server_finished = (b"\x14\x00\x00\x0c"
+                                + tls12_prf(master, b"server finished",
+                                            hashlib.sha256(transcript
+                                                           + client_finished_plain).digest(), 12))
+    check(hmac.compare_digest(server_finished_plain, expected_server_finished),
+          "server Finished authenticates the transcript including the client's Finished")
+
+    connect = fx_app
+    sub_body = b"\x12\x34" + struct.pack("!H", len(b"cmnd/#")) + b"cmnd/#\x00"
+    subscribe = b"\x82" + mqtt_varint(len(sub_body)) + sub_body
+    pub_body = struct.pack("!H", len(b"dev/state")) + b"dev/state" + b"online"
+    publish = b"\x30" + mqtt_varint(len(pub_body)) + pub_body
+    mqtt_flight = connect + subscribe + publish
+    client_app_record = TLS12PSKGCMServer._encrypt(
+        client_key, client_iv, 1, 0x17, TLS12, mqtt_flight)
+    app_out_from = len(outK)
+    # Split the protected application record too; neither GCM nor MQTT sees a
+    # partial unit until the complete TLS record has arrived.
+    cut = len(client_app_record) // 2
+    kseq = dev_send(keyed, kc, cloud, 8883, 6710, kseq, client_app_record[:cut])
+    check(not keyed.mqtt_publishes, "a partial encrypted application record is not decrypted early")
+    kseq = dev_send(keyed, kc, cloud, 8883, 6710, kseq, client_app_record[cut:])
+    keyed.tick(1_200_000)
+    mqtt_reply_stream = b"".join(
+        p for _, _, _, p, sp, _ in segs(outK[app_out_from:]) if sp == 8883 and p)
+
+    def tls_records(stream):
+        records = []
+        while stream:
+            if len(stream) < 5:
+                return []
+            length = struct.unpack("!H", stream[3:5])[0]
+            if len(stream) < 5 + length:
+                return []
+            records.append(stream[:5 + length])
+            stream = stream[5 + length:]
+        return records
+
+    mqtt_reply_records = tls_records(mqtt_reply_stream)
+    mqtt_replies = [TLS12PSKGCMServer._decrypt(
+        server_key, server_iv, seq, rec[0], rec[1:3], rec[5:])
+        for seq, rec in enumerate(mqtt_reply_records, 1)]
+    check(mqtt_replies[:2] == [b"\x20\x02\x00\x00", b"\x90\x03\x12\x34\x00"],
+          "decrypted CONNECT and SUBSCRIBE reach the existing broker and return encrypted CONNACK/SUBACK")
+    expected_push = mqtt_publish_packet(b"cmnd/large", large_push)
+    push_chunks = mqtt_replies[2:]
+    check(len(push_chunks) == 3 and all(len(chunk) <= 1024 for chunk in push_chunks)
+          and b"".join(push_chunks) == expected_push,
+          "a large broker PUBLISH is split into sequenced TLS records at max_fragment_length")
+    check(keyed.mqtt_publishes == [("dev/state", b"online")]
+          and any("MQTT PUBLISH dev/state = online" in line for line in logsK),
+          "a decrypted application PUBLISH reaches the existing MQTT capture path")
+
+    ping_record = TLS12PSKGCMServer._encrypt(
+        client_key, client_iv, 2, 0x17, TLS12, b"\xc0\x00")
+    ping_out_from = len(outK)
+    kseq = dev_send(keyed, kc, cloud, 8883, 6710, kseq, ping_record)
+    keyed.tick(1_300_000)
+    ping_reply = b"".join(
+        p for _, _, _, p, sp, _ in segs(outK[ping_out_from:]) if sp == 8883 and p)
+    ping_records = tls_records(ping_reply)
+    next_server_seq = 1 + len(mqtt_reply_records)
+    check(len(ping_records) == 1 and TLS12PSKGCMServer._decrypt(
+        server_key, server_iv, next_server_seq, 0x17, TLS12,
+        ping_records[0][5:]) == b"\xd0\x00",
+          "later encrypted PINGREQ/PINGRESP records advance each direction's sequence correctly")
+    keyed.tick(5_000_000)
+    check(kc.state == "ESTABLISHED" and not kc.close_after_flush,
+          "an authenticated MQTT-over-TLS connection stays open between keep-alives")
+    check(tls_secret.decode() not in "\n".join(logsK)
+          and "wrong synthetic candidate" not in "\n".join(logsK)
+          and "fixture-client" not in "\n".join(logsK),
+          "TLS diagnostics log neither candidate key nor PSK identity bytes")
+    keyed.on_frame = lambda *_args: None
+    check(bool(keyed.tls_psks) and bool(keyed.tls_identities)
+          and kc.tls is not None and kc.tls.client_key is not None,
+          "the live stack retains only the credentials and traffic keys needed for reconnects")
+    keyed.close()
+    check(keyed.tls_psks == () and keyed.tls_identities == []
+          and keyed.tuya_legacy_identity_psk is False
+          and not keyed.conns and keyed.output is None and keyed.on_frame is None
+          and kc.tls is None and kc.captured == b"" and kc.rx_buf == b""
+          and kc.tls_handshake_buf == b"" and kc.tls_plain_buf == b"",
+          "close drops PSKs, identities, TLS sessions, buffers and callback references")
 
     print("== Tuya LAN discovery broadcast decoded ==")
     def tuya_packet(payload, cmd=0x13, retcode=True):

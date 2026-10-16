@@ -38,13 +38,23 @@ jobs:
       run: python src/tuyamcu.py
 
     - name: Tuya flash config parser self-tests (no firmware)
-      run: python src/tuya_config.py
+      run: |
+        python src/tuya_config.py
+        python tests/tuya_config.py
 
     - name: Firmware image loader self-tests
       run: python tests/image_loader.py
 
     - name: BLE core register model self-tests (no firmware)
       run: python src/blecore.py
+
+    - name: GPIO input and interrupt model self-tests (no firmware)
+      run: |
+        python src/gpio.py
+        python tests/gpio_emulator.py
+
+    - name: GPIO button-to-relay firmware regression
+      run: python tests/gpio_button.py
 
     - name: Wi-Fi MAC hardware model self-tests (no firmware)
       run: python src/wifimac.py
