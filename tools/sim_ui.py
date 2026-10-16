@@ -37,6 +37,7 @@ import tempfile
 import threading
 import time
 import traceback
+import webbrowser
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -119,7 +120,7 @@ NET_TITLE = "network - virtual Wi-Fi and IP bridge"
 MAX_FRAMES = 20000
 # How to switch the bridge on, said by both the network pane and the
 # captured-traffic window while they are empty.
-WIFI_HOWTO = "Tick \"Wi-Fi peer\" on the Config tab before Run"
+WIFI_HOWTO = "Enable \"Wi-Fi peer\" on the Config tab before Run"
 NET_IDLE_HINT = ("Nothing on air yet. %s to attach the virtual radio and the IP bridge; this "
                  "pane then shows every frame and connection, and what the device sent "
                  "inside them." % WIFI_HOWTO)
@@ -128,12 +129,12 @@ NET_IDLE_HINT = ("Nothing on air yet. %s to attach the virtual radio and the IP 
 # convenience only: a missing or unreadable file just means the defaults.
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".bekensim_ui.json")
 
-# Every Config-tab option and its default. The defaults match the command
-# line's, so an untouched Config tab runs exactly what `main.py <image>` does.
+# Every Config-tab option and its default. The GUI attaches its safe, offline
+# virtual Wi-Fi peer by default; the command line remains explicitly opt-in.
 OPTION_DEFAULTS = {
     "boot": False, "xvr_selfclear": False, "blecore": False,
     "tuyamcu": False, "tuyamcu_pid": "", "tuyamcu_raw": False,
-    "wifi": False, "wifi_role": "auto", "wifi_ssid": "", "wifi_pass": "",
+    "wifi": True, "wifi_role": "auto", "wifi_ssid": "", "wifi_pass": "",
     "fwd_local": "8080", "fwd_device": "80",
     "pcap": False, "pcap_path": "",
     "http_gets": "", "mqtt_pubs": "",
@@ -175,6 +176,7 @@ class SimulatorUI:
         self.started_at = None
         self.finished = None          # message from the worker when it ends
         self.error = None             # exception text from the worker
+        self._active_forward_url = None  # the current run's browser endpoint
 
         # Bytes the firmware has transmitted, per port, waiting to be shown.
         # The worker appends under the lock; the UI thread swaps and clears.
@@ -619,8 +621,12 @@ class SimulatorUI:
         ttk.Label(fwd, text=" to device:").pack(side="left")
         f_dev = ttk.Entry(fwd, textvariable=self.opt["fwd_device"], width=5)
         f_dev.pack(side="left")
+        self.btn_open_forward = ttk.Button(fwd, text="Open in browser",
+                                           command=self._open_forward,
+                                           state="disabled")
+        self.btn_open_forward.pack(side="left", padx=(8, 0))
         note(net, 4, "A local port forwarded to a device port, e.g. its web panel. Clear both "
-                     "to turn it off.")
+                     "to turn it off. Open works while that forward is running.")
         pcap = ttk.Checkbutton(net, text="radio capture", variable=self.opt["pcap"])
         pcap.grid(row=5, column=0, sticky="w", padx=(18, 0), pady=3)
         pfile = ttk.Frame(net)
@@ -775,6 +781,34 @@ class SimulatorUI:
                                             filetypes=[("pcap", "*.pcap"), ("All", "*.*")])
         if path:
             self.opt["pcap_path"].set(path)
+
+    def _update_open_forward(self):
+        """The URL belongs to the active run, not fields edited for the next one."""
+        on = self._forward_is_open()
+        self.btn_open_forward.config(state="normal" if on else "disabled")
+
+    def _forward_is_open(self):
+        """True only when this run owns a successfully-bound host listener."""
+        if (self._active_forward_url is None or not self._running()
+                or self._stop_requested):
+            return False
+        peer = getattr(self.emu, "wifi_peer", None)
+        net = getattr(peer, "net", None)
+        io = getattr(net, "io", None)
+        return bool(getattr(io, "listeners", {}))
+
+    def _open_forward(self):
+        """Open the active loopback port without letting a browser error stop the UI."""
+        if not self._forward_is_open():
+            return
+        try:
+            opened = webbrowser.open(self._active_forward_url, new=2)
+        except Exception as exc:
+            messagebox.showerror("BekenSimulator", "Could not open the browser: %s" % exc)
+            return
+        if not opened:
+            messagebox.showerror("BekenSimulator", "Could not find a browser to open %s"
+                                 % self._active_forward_url)
 
     def _set_text_option(self, name, value):
         """Replace a multi-line option's text. A disabled Text ignores edits,
@@ -1324,6 +1358,11 @@ class SimulatorUI:
             self.tabs.select(self.config_tab)
             messagebox.showerror("BekenSimulator", str(e))
             return
+        self._active_forward_url = ("http://127.0.0.1:%d/" % cfg["forwards"][0][0]
+                                    if cfg.get("forwards") else None)
+        # Loading and setup happen on the worker. The button is enabled from
+        # _update_state only after the peer has actually opened the forward.
+        self._update_open_forward()
         self._save_settings()
 
         self._clear()
@@ -1424,6 +1463,7 @@ class SimulatorUI:
             self.emu.stop()
         self.btn_stop.config(state="disabled")
         self.btn_pause.config(state="disabled", text="Pause")
+        self.btn_open_forward.config(state="disabled")
 
     def _on_close(self):
         self._save_settings()
@@ -1594,7 +1634,10 @@ class SimulatorUI:
             self._finish()
             return
         if self.emu is None:
+            self._update_open_forward()
             return
+
+        self._update_open_forward()
 
         insns = self.emu.state.insn_count
         now = time.time()
@@ -1640,6 +1683,8 @@ class SimulatorUI:
         self.btn_run.config(state="normal")
         self.btn_stop.config(state="disabled")
         self.btn_pause.config(state="disabled", text="Pause")
+        self.btn_open_forward.config(state="disabled")
+        self._active_forward_url = None
         self._set_send_enabled(False)
         if self._pending_run:           # an image was dropped while this run ended
             self._pending_run = False
@@ -1843,26 +1888,28 @@ def _run_selftests():
     # --- Config tab -------------------------------------------------------
     ui._reset_options()
     cfg = ui._collect_cfg()
-    check(cfg["wifi"] is False and cfg["tuyamcu"] is False and cfg["boot"] is False
+    check(cfg["wifi"] is True and cfg["tuyamcu"] is False and cfg["boot"] is False
           and cfg["xvr_selfclear"] is False and cfg["blecore"] is False
           and cfg["tuyamcu_pid"] is None and cfg["tuyamcu_raw"] is False
-          and "forwards" not in cfg,
-          "an untouched Config tab asks for nothing beyond a plain run")
-    check(str(ui.opt_text["http_gets"].cget("state")) == "disabled"
+          and cfg["forwards"] == [(8080, 80)],
+          "the Config defaults attach the Wi-Fi peer and leave other peers off")
+    check(str(ui.opt_text["http_gets"].cget("state")) == "normal"
+          and str(ui.opt_widgets["pcap"][0].cget("state")) == "disabled"
           and str(ui.opt_widgets["tuyamcu"][0].cget("state")) == "disabled",
-          "fields that depend on an unticked option are disabled")
-    check(ui.var_summary.get() == "options: none (Config tab)",
-          "the summary line says when no option is set")
+          "default Wi-Fi fields are active while capture and TuyaMCU fields stay gated")
+    check(str(ui.btn_open_forward.cget("state")) == "disabled",
+          "Open in browser waits until a configured forward is actually running")
+    check(ui.var_summary.get() == "options: Wi-Fi peer (auto, open, :8080 to :80)",
+          "the summary line shows the default Wi-Fi peer")
 
-    ui.opt["wifi"].set(True)
     cfg = ui._collect_cfg()
     check(cfg["wifi_role"] == "auto" and cfg["forwards"] == [(8080, 80)]
           and cfg["wifi_ssid"] is None and cfg["wifi_pass"] is None and cfg["pcap"] is None
           and cfg["http_gets"] == [] and cfg["mqtt_pubs"] == [],
-          "Wi-Fi peer alone gives what the old checkbox did: auto role, 8080 to 80")
+          "the default Wi-Fi peer uses auto role and forwards 8080 to 80")
     check(str(ui.opt_text["http_gets"].cget("state")) == "normal"
           and str(ui.opt_widgets["pcap"][0].cget("state")) == "disabled",
-          "ticking Wi-Fi opens its fields, but the capture file waits for its own tick")
+          "default Wi-Fi opens its fields, but the capture file waits for its own tick")
 
     ui._set_text_option("mqtt_pubs", "cmnd/obk/POWER=ON\n\n  stat/obk/x=a=b  \n")
     ui._set_text_option("http_gets", "/cm?cmnd=POWER%20ON\n \n/index\n")
@@ -2025,6 +2072,8 @@ def _run_selftests():
         check(calls["order"] == ["setup", "run"] and ui._stop_requested is False,
               "Run clears a Stop left over from the previous run")
         check(ui._pending_run is False, "...and uses up a dropped image that was waiting")
+        check(ui._active_forward_url == "http://127.0.0.1:9090/",
+              "Run binds Open in browser to that run's validated local port")
 
         ui.finished = ui.error = None
         calls["run_error"] = "UC_ERR_FETCH_UNMAPPED at pc 0x00000000"
@@ -2045,6 +2094,8 @@ def _run_selftests():
         ui.thread = None
         ui.finished = ui.error = None
         ui._stop_requested = ui._pending_run = False
+        ui._active_forward_url = None
+        ui.btn_open_forward.config(state="disabled")
         os.remove(img)
 
     # Enter in the send box runs _on_send whatever the button says, so the run
@@ -2073,10 +2124,42 @@ def _run_selftests():
             return True
 
     ui.thread = Alive()
-    ui.emu = SimpleNamespace(uart1_rx_delay=0, state=SimpleNamespace(insn_count=10))
+    listening = SimpleNamespace(
+        net=SimpleNamespace(io=SimpleNamespace(listeners={object(): 80})))
+    ui.emu = SimpleNamespace(uart1_rx_delay=0, state=SimpleNamespace(insn_count=10),
+                             wifi_peer=listening)
     check(ui._console_ready(), "with no RX hold-off (TuyaMCU) the console is ready at once")
-    ui.emu = SimpleNamespace(uart1_rx_delay=2_000_000, state=SimpleNamespace(insn_count=10))
+    ui.emu = SimpleNamespace(uart1_rx_delay=2_000_000, state=SimpleNamespace(insn_count=10),
+                             wifi_peer=listening)
     check(not ui._console_ready(), "...and with OpenBeken's hold-off it waits for it")
+
+    opened = []
+    real_browser_open = webbrowser.open
+    try:
+        webbrowser.open = lambda url, new=0: opened.append((url, new)) or True
+        ui._active_forward_url = "http://127.0.0.1:9090/"
+        ui._stop_requested = False
+        ui.emu.wifi_peer.net.io.listeners.clear()
+        ui._update_open_forward()
+        ui._open_forward()
+        check(str(ui.btn_open_forward.cget("state")) == "disabled" and not opened,
+              "Open in browser stays disabled when the requested port did not bind")
+        ui.emu.wifi_peer.net.io.listeners[object()] = 80
+        ui._update_open_forward()
+        check(str(ui.btn_open_forward.cget("state")) == "normal",
+              "Open in browser becomes available once the forward is running")
+        ui._open_forward()
+        check(opened == [("http://127.0.0.1:9090/", 2)],
+              "Open in browser sends the active loopback URL to the default browser")
+        ui._stop_requested = True
+        ui._update_open_forward()
+        ui._open_forward()
+        check(str(ui.btn_open_forward.cget("state")) == "disabled" and len(opened) == 1,
+              "Stop disables the browser action and a stale click opens nothing")
+    finally:
+        webbrowser.open = real_browser_open
+        ui._active_forward_url = None
+        ui._stop_requested = False
     ui.emu = ui.thread = None
 
     # Saved settings round-trip through a file, minus the passphrase. The
@@ -2188,12 +2271,12 @@ def _run_selftests():
             with open(spath, "w", encoding="utf-8") as f:
                 f.write('{"wifi": "yes", "wifi_role": "mesh", "fwd_local": 8080, "boot": true')
             win3, ui3 = window(settings_path=spath)
-            check(ui3.opt["wifi"].get() is False and ui3.opt["boot"].get() is False,
+            check(ui3.opt["wifi"].get() is True and ui3.opt["boot"].get() is False,
                   "a corrupt settings file means defaults, not a crash")
             with open(spath, "w", encoding="utf-8") as f:
                 json.dump({"wifi": "yes", "wifi_role": "mesh", "fwd_local": 8080, "boot": True}, f)
             ui3._apply_settings(ui3._load_settings())
-            check(ui3.opt["wifi"].get() is False and ui3.opt["wifi_role"].get() == "auto"
+            check(ui3.opt["wifi"].get() is True and ui3.opt["wifi_role"].get() == "auto"
                   and ui3.opt["fwd_local"].get() == "8080" and ui3.opt["boot"].get() is True,
                   "saved values of the wrong type or out of range are ignored one by one")
             ui3._apply_settings({"wifi_role": "sta", "wifi_pass": "password1"})
@@ -2216,8 +2299,8 @@ def _run_selftests():
 
     ui._reset_options()
     check(ui.opt_text["mqtt_pubs"].get("1.0", "end-1c") == ""
-          and ui.opt["wifi"].get() is False and ui.opt["wifi_pass"].get() == "",
-          "Reset to defaults clears every option, disabled text boxes too")
+          and ui.opt["wifi"].get() is True and ui.opt["wifi_pass"].get() == "",
+          "Reset to defaults restores Wi-Fi on and clears the optional values")
 
     # Dropping a file: during a run it stops that run and waits for it to end,
     # then starts; while idle it starts at once.

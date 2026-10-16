@@ -856,10 +856,16 @@ class BekenEmulator:
                 if ((state.gpio_dirty or state.pwm_dirty or state.uart1_events)
                         and state.uart_at_line_start):
                     buf = sys.__stdout__.buffer
+                    periph_changed = bool(state.gpio_dirty or state.pwm_dirty)
                     for pin in sorted(state.gpio_dirty):
                         buf.write(b"[EMU_GPIO] %d %08x\n" % (pin, state.gpio_cfg[pin]))
                     for off in sorted(state.pwm_dirty):
                         buf.write(b"[EMU_PWM] %03x %08x\n" % (off, state.pwm_regs[off]))
+                    # Delimit the writes from one slow tick. The test harness
+                    # judges a state here, never midway through a multi-register
+                    # update that only happens to match by combining old/new data.
+                    if periph_changed:
+                        buf.write(b"[EMU_PERIPH]\n")
                     # One line per UART1 byte: insn timestamp, direction, value.
                     # The report coalesces consecutive same-direction bytes into
                     # Sent:/Recv: frames; keeping raw bytes here means no framing

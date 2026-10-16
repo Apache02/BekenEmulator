@@ -4072,8 +4072,9 @@ def run_test(test_config):
     child_env = dict(os.environ)
     child_env["EMU_REPORT"] = "1"
 
-    # Stream the child's output and stop as soon as every expected string has
-    # been seen. The emulator never exits on its own, so the old
+    # Stream the child's output and stop as soon as every expected string and
+    # declared peripheral state has been seen. The emulator never exits on its
+    # own, so the old
     # run-until-timeout approach cost each boot case its full timeout - and made
     # the suite fragile, because a case that reached its markers late (heavy
     # chip, or a busy machine) would be killed by the deadline before finishing.
@@ -4096,16 +4097,42 @@ def run_test(test_config):
     periph_lines = []
     uart1_lines = []
     lock = threading.Lock()
+    test_chip = chip_of(test_config)
+    has_periph_expectations = bool(test_config.get("expected_pins")
+                                   or test_config.get("expected_pwm"))
+    assertion_periph_lines = None
+
+    def complete_periph_boundary():
+        """Freeze the first atomic state after all text markers are complete.
+
+        The state is captured whether or not it matches. A later animation must
+        not turn a wrong completion state into a pass, and CI linger remains
+        log-only rather than rewriting the verdict.
+        """
+        nonlocal assertion_periph_lines
+        if (has_periph_expectations and assertion_periph_lines is None
+                and not remaining):
+            assertion_periph_lines = list(periph_lines)
 
     def reader():
         for line in proc.stdout:
             if line.startswith("[EMU_GPIO]") or line.startswith("[EMU_PWM]"):
-                periph_lines.append(line.strip())
+                with lock:
+                    periph_lines.append(line.strip())
+                continue
+            if line.startswith("[EMU_PERIPH]"):
+                with lock:
+                    complete_periph_boundary()
                 continue
             if line.startswith("[EMU_INSNS]"):
                 parts = line.split()
                 if len(parts) >= 2 and parts[1].isdigit():
                     insns_holder[0] = int(parts[1])
+                # An instruction report is also a quiescent boundary: this
+                # slow tick emitted and cleared every pending GPIO/PWM write
+                # immediately before this line, even if there were none.
+                with lock:
+                    complete_periph_boundary()
                 continue
             if line.startswith("[EMU_UART1]"):
                 uart1_lines.append(line.strip())
@@ -4138,7 +4165,9 @@ def run_test(test_config):
     done_at = None          # when every marker was first satisfied
     while True:
         with lock:
-            done = not remaining
+            done = (not remaining
+                    and (not has_periph_expectations
+                         or assertion_periph_lines is not None))
         if done:
             if proc.poll() is not None:
                 break       # nothing left to capture - process already gone
@@ -4148,7 +4177,8 @@ def run_test(test_config):
             # verdict is already settled; this only enriches the log.
             if done_at is None:
                 done_at = time.time()
-                print(f"  ... all markers met, lingering {LINGER:.0f}s for a fuller log")
+                print(f"  ... all completion conditions met, lingering {LINGER:.0f}s "
+                      "for a fuller log")
             elif time.time() - done_at >= LINGER:
                 break
         elif proc.poll() is not None:
@@ -4219,7 +4249,14 @@ def run_test(test_config):
         except OSError:
             pass
 
-    periph_data = _periph(periph_lines, chip_of(test_config))
+    # Assert the first complete peripheral batch after the final text marker,
+    # not whatever an animation changes during CI's optional log-only linger.
+    # Failed/time-out cases still show their final state in the report, but a
+    # missing completion snapshot cannot make an assertion pass.
+    snapshot_captured = (not has_periph_expectations
+                         or assertion_periph_lines is not None)
+    periph_data = _periph(assertion_periph_lines if assertion_periph_lines is not None
+                          else periph_lines, test_chip)
 
     # Pin assertions, when a case declares "expected_pins". This is what turns
     # the GPIO capture from a display into a tested invariant: the expected
@@ -4229,10 +4266,10 @@ def run_test(test_config):
     for pin, want in sorted((test_config.get("expected_pins") or {}).items(),
                             key=lambda kv: kv[0]):
         got = (periph_data or {}).get("raw", {}).get(pin)
-        ok = got == want
-        # want=None asserts the pin was NEVER written. That is the negative
-        # half of the check: it proves the captured pin actually follows the
-        # command rather than the emulator writing some fixed pin regardless.
+        ok = snapshot_captured and periph_data is not None and got == want
+        # want=None asserts that the pin was not written through the test's
+        # completion point. That is the negative half of the check: it proves
+        # the captured pin follows the command rather than a fixed pin.
         if want is None:
             label = "GPIO P%d untouched" % pin
         else:
@@ -4255,7 +4292,7 @@ def run_test(test_config):
         # during light init, so it is not a stable invariant at the moment the
         # harness stops; pinning one would make the test fail on timing rather
         # than on decoding.
-        ok = (got is not None and got[1] == want_period
+        ok = (snapshot_captured and got is not None and got[1] == want_period
               and (want_duty is None or got[2] == want_duty))
         if want_duty is None:
             label = "PWM%d period = 0x%04X (duty varies, not asserted)" % (ch, want_period)
