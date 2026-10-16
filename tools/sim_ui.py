@@ -42,7 +42,15 @@ import webbrowser
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+# PyInstaller flattens the entry script into its bundle root.  In a frozen
+# build ``dirname(__file__)/..`` would therefore escape the bundle and make the
+# built-in firmware buttons point at files that do not exist.  _MEIPASS is the
+# root holding data collected with --add-data in both one-file and one-dir
+# builds; source runs keep the repository-root calculation.
+if getattr(sys, "frozen", False):
+    ROOT_DIR = os.path.abspath(getattr(sys, "_MEIPASS", os.path.dirname(sys.executable)))
+else:
+    ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT_DIR)
 
 from src import netstack, tuya_config
@@ -260,6 +268,7 @@ class SimulatorUI:
         self.tuya_config = None
 
         self._last_insns = 0
+        self._last_reset_count = 0
         self._last_rate_at = None
         self._rate = 0.0
 
@@ -1754,6 +1763,7 @@ class SimulatorUI:
         self._periph_key = None
         self._tx_count = {1: 0, 2: 0}
         self._last_insns = 0
+        self._last_reset_count = 0
         self._rate = 0.0
         self._last_rate_at = None
         self.finished = self.error = None
@@ -2032,7 +2042,15 @@ class SimulatorUI:
         self._update_open_forward()
 
         insns = self.emu.state.insn_count
+        resets = getattr(self.emu, "reset_count", 0)
         now = time.time()
+        if resets != self._last_reset_count:
+            # The device clock starts again at zero after a hardware reset;
+            # do not briefly display a large negative execution rate.
+            self._last_reset_count = resets
+            self._last_insns = insns
+            self._last_rate_at = now
+            self._rate = 0.0
         if self._last_rate_at is not None:
             dt = now - self._last_rate_at
             if dt >= 0.5:
@@ -2053,10 +2071,10 @@ class SimulatorUI:
             what = "running"
 
         self.var_state.set(
-            "%s   %s insns (%.0fk/s)   ~%.1f s guest   %.0f s wall   "
+            "%s   %s insns (%.0fk/s)   ~%.1f s guest   WDT resets %d   %.0f s wall   "
             "PC 0x%08x   TX u1 %d / u2 %d   RX queued %d   console %s"
             % (what, self._fmt_insns(), self._rate / 1000.0,
-               insns / float(GUEST_SECOND_INSNS), now - self.started_at,
+               insns / float(GUEST_SECOND_INSNS), resets, now - self.started_at,
                self.emu.state.last_pc, self._tx_count[1], self._tx_count[2],
                len(self.emu.uart1_rx), "ready" if ready else "not listening yet"))
         self._update_gpio_control()
@@ -2358,6 +2376,21 @@ def _run_selftests():
               and (p["key"] == "(none)" or p["key"] in KNOWN_KEYS)
               for p in INTERESTING_DUMPS),
           "every quick-run profile names a bundled image and a valid chip/key combination")
+    # Release builds deliberately contain only what the launcher needs rather
+    # than every large regression fixture.  Keep that explicit manifest in
+    # lockstep with the default image and quick-run profiles; the packaged
+    # smoke test below then proves PyInstaller actually collected every entry.
+    release_manifest = os.path.join(ROOT_DIR, "tools", "release_firmwares.txt")
+    if os.path.isfile(release_manifest):
+        with open(release_manifest, encoding="utf-8") as manifest_file:
+            release_files = {
+                line.strip() for line in manifest_file
+                if line.strip() and not line.lstrip().startswith("#")
+            }
+        expected_release_files = ({os.path.basename(DEFAULT_IMAGE)}
+                                  | {p["file"] for p in INTERESTING_DUMPS})
+        check(release_files == expected_release_files,
+              "the Windows release firmware manifest exactly matches the launcher")
     old_image, old_chip, old_key = (ui.var_image.get(), ui.var_chip.get(), ui.var_key.get())
     old_wifi = {name: ui.opt[name].get()
                 for name in ("wifi", "net_out", "wifi_role", "wifi_ssid", "wifi_pass")}
@@ -3023,7 +3056,47 @@ def _run_selftests():
     return n
 
 
+def _run_package_smoke():
+    """Exercise the two failure modes unique to a frozen Windows build.
+
+    A normal PyInstaller Windows bootloader enables Control Flow Guard, while
+    Unicorn's generated control flow requires it disabled.  Returning from a
+    code hook is enough to expose that incompatibility as process status
+    0xC0000409.  The file checks catch a wrong frozen resource root or an
+    incomplete --add-data manifest before an executable reaches a release.
+    """
+    from unicorn import Uc, UC_ARCH_ARM, UC_HOOK_CODE, UC_MODE_ARM
+
+    base = 0x1000
+    code = b"\x00\x00\xa0\xe1" * 3       # ARM: mov r0, r0 (three times)
+    seen = []
+    uc = Uc(UC_ARCH_ARM, UC_MODE_ARM)
+    uc.mem_map(base, 0x1000)
+    uc.mem_write(base, code)
+
+    def on_code(_uc, address, size, _user):
+        seen.append((address, size))
+
+    uc.hook_add(UC_HOOK_CODE, on_code)
+    uc.emu_start(base, base + len(code), count=3)
+    if len(seen) != 3:
+        raise AssertionError("Unicorn hook smoke test ran %d of 3 instructions" % len(seen))
+
+    required = [DEFAULT_IMAGE]
+    required.extend(os.path.join(FIRMWARE_DIR, profile["file"])
+                    for profile in INTERESTING_DUMPS)
+    missing = [os.path.basename(path) for path in required if not os.path.isfile(path)]
+    if missing:
+        raise AssertionError("release firmware is missing: %s" % ", ".join(missing))
+
+    print("Packaged runtime smoke test passed: Unicorn hooks and %d firmware images."
+          % len(set(required)))
+
+
 def main():
+    if "--package-smoke" in sys.argv[1:]:
+        _run_package_smoke()
+        return
     if "--selftest" in sys.argv[1:]:
         _run_selftests()
         return

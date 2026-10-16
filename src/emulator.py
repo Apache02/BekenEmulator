@@ -240,6 +240,14 @@ class SimulatorState:
         # signal is ever driven onto a capture pin), so they only get cleared.
         self.pwmn_seen = False
         self.pwmn_stat = 0
+        # Watchdog controller.  The Beken block accepts a period only after
+        # the 0x5a/0xa5 key pair has been written to WDT_CTRL.  Its clock is
+        # gated by ICU_PERI_CLK_PWD bit 8; while gated, a programmed period is
+        # retained but cannot expire.
+        self.wdt_first_period = None
+        self.wdt_period_ms = 0
+        self.wdt_clock_enabled = True
+        self.wdt_deadline = None
 
 class FlashState:
     def __init__(self):
@@ -312,6 +320,15 @@ class BekenEmulator:
     ICU_INT_RAW_STATUS = 0x00802048
     ICU_INT_ENABLE = 0x00802040  # ICU_INTERRUPT_ENABLE (0x802050 is ICU_ARM_WAKEUP_EN)
     ICU_GLOBAL_INT_EN = 0x00802044
+    ICU_PERI_CLK_PWD = 0x00802008
+    ICU_WDT_CLK_PWD = 1 << 8
+
+    # Watchdog: wdt.h defines an 8-bit key at bit 16 and a 16-bit period.
+    # The SDK passes milliseconds (and uses period 5 for bk_reboot()).
+    WDT_CTRL = 0x00802900
+    WDT_FIRST_KEY = 0x5A
+    WDT_SECOND_KEY = 0xA5
+    WDT_INSNS_PER_MS = SLOW_TICK_INSNS // SLOW_TICK_MS
 
     def __init__(self, raw_flash, bootloader, app, with_boot=False, only_uart=False, chip_identity=None, uart1_hex=False, physical_flash=None, uart1_rx=b"", uart1_rx_delay=CONSOLE_RX_HOLDOFF_INSNS, tuyamcu_enabled=False, tuyamcu_pid=None, tuyamcu_raw=False, xvr_selfclear=False, tuyamcu_dps=None, tuyamcu_injects=None, uart_sink=None, ble_core=None, wifi=False, exception_vector_base=0, chip_variant=None):
         self.raw_flash = raw_flash
@@ -356,6 +373,7 @@ class BekenEmulator:
         self.blecore = None
         chip_id = (chip_identity or CHIP_FAMILIES["BK7231"])[0]
         layout = BLE_CORE_LAYOUTS.get(chip_id)
+        self._ble_layout = layout
         if ble_core is True and (layout is None or self.chip_variant == "BK7231U"):
             raise ValueError("--ble-core models the BLE 5.x core of BK7231N/M (5.1) and "
                              "BK7238 (5.2); this chip has no such core.")
@@ -469,6 +487,12 @@ class BekenEmulator:
         self._resume = threading.Event()
         self._resume.set()
         self.stopping = False
+        # A watchdog expiry ends the current Unicorn run, but unlike stop() it
+        # immediately starts a fresh device boot.  reset_count is intentionally
+        # public: the GUI exposes it so a reboot cannot look like a frozen PC.
+        self._watchdog_reset_pending = False
+        self.reset_count = 0
+        self._power_on_context = None
         # Snapshot request (see arm_snapshot); None until asked for.
         self._snapshot_path = None
         self._snapshot_at_insns = None
@@ -726,6 +750,95 @@ class BekenEmulator:
             self.mu.emu_stop()
         except Exception:
             pass
+
+    def _arm_watchdog(self):
+        """Start/reload the watchdog after a valid key pair or clock enable."""
+        state = self.state
+        if not state.wdt_clock_enabled or not state.wdt_period_ms:
+            state.wdt_deadline = None
+            return
+        state.wdt_deadline = (state.insn_count
+                              + state.wdt_period_ms * self.WDT_INSNS_PER_MS)
+
+    def _watchdog_expired(self, state):
+        """Stop the current CPU slice when the watchdog reaches its deadline."""
+        deadline = state.wdt_deadline
+        if deadline is None or state.insn_count < deadline:
+            return False
+        # Disarm before emu_stop: block-paced execution can otherwise revisit
+        # this boundary while Unicorn unwinds and report the same expiry twice.
+        state.wdt_deadline = None
+        self._watchdog_reset_pending = True
+        try:
+            self.mu.emu_stop()
+        except Exception:
+            pass
+        return True
+
+    def _reset_peripheral_models(self):
+        """Reset on-chip radio engines while retaining their external peers."""
+        if self.wifimac is not None:
+            peer = self.wifi_peer
+            self.wifimac = _wifimac.MacHw(
+                SLOW_TICK_INSNS // (SLOW_TICK_MS * 1000), log=self.net_log)
+            self.wifimac.mem = (
+                lambda addr, size: self.mu.mem_read(addr, size),
+                lambda addr, data: self.mu.mem_write(addr, bytes(data)))
+            if peer is not None:
+                # The access point/router is outside the emulated chip, so it
+                # survives the reset.  Only the MAC endpoint is replaced.
+                self.wifimac.on_tx = peer.on_device_tx
+                peer.inject = lambda f, decr=None: self.wifimac.inject(
+                    f, self.state.insn_count, decr=decr)
+                peer.now_us = lambda: self.wifimac.now_us(self.state.insn_count)
+        if self.blecore is not None:
+            self.blecore = _blecore.BleCore(
+                self.XVR_BASE, SLOW_TICK_INSNS * 1000 // SLOW_TICK_MS,
+                layout=self._ble_layout)
+            self.blecore.mem = (
+                lambda addr, size: self.mu.mem_read(addr, size),
+                lambda addr, data: self.mu.mem_write(addr, bytes(data)))
+
+    def _watchdog_reset(self):
+        """Apply a chip reset and leave the emulator ready for a fresh boot."""
+        if self._power_on_context is None:
+            raise RuntimeError("watchdog reset requested before emulator setup")
+
+        # A button held across reset is still electrically held afterwards.
+        # Preserve only those external pad drives; controller configuration,
+        # pending interrupts, RAM, and on-chip peripheral engines reset.
+        gpio_inputs = dict(self.state.gpio_hw.inputs)
+
+        self.mu.mem_write(self.RAM_BASE, b"\x00" * self.RAM_SIZE)
+        self.mu.mem_write(self.MMIO_BASE, b"\x00" * self.MMIO_SIZE)
+        self.mu.mem_write(self.PERIPH_BASE, b"\x00" * self.PERIPH_SIZE)
+        self.mu.mem_write(self.XVR_BASE,
+                          b"\x00" * (0x40000 if self.is_bk7252 else 0x1000))
+        self.mu.mem_write(self.ACCEL_BASE, b"\x00" * 0x1000)
+        self.mu.mem_write(self.UART1_FIFO_STATUS,
+                          struct.pack("<I", 1 << 17 | 1 << 19 | 1 << 20))
+        self.mu.mem_write(self.UART2_FIFO_STATUS,
+                          struct.pack("<I", 1 << 17 | 1 << 19 | 1 << 20))
+        self.mu.mem_write(0x00802c00, struct.pack("<I", 1 << 28 | 1 << 30))
+        self.mu.mem_write(self.WDT_CTRL, struct.pack("<I", 0))
+        self.mu.context_restore(self._power_on_context)
+
+        self.state = SimulatorState()
+        if self.gpio_pin_count != self.state.gpio_hw.pin_count:
+            self.state.gpio_hw = _gpio.GpioModel(self.gpio_pin_count)
+        self.state.gpio_hw.inputs.update(gpio_inputs)
+        self.flash_state = FlashState()
+        self._uart_src = None
+        self._resume_at = None
+        self._ble_adv_seen.clear()
+        self._watchdog_reset_pending = False
+        self.run_error = None
+        if self.wifimac is not None:
+            self.trng_state = 0x2545F491
+        self._reset_peripheral_models()
+        self.reset_count += 1
+        self._exc_epoch += 1
+        self.net_log("[WDT] watchdog expired; device reset #%d" % self.reset_count)
 
     def net_log(self, msg):
         """Print a [WIFI]/[NET] line of our own without splitting a UART line.
@@ -988,6 +1101,9 @@ class BekenEmulator:
         # the GIL so the UI thread gets it all.
         if self._paused:
             self._resume.wait()
+
+        if self._watchdog_expired(state):
+            return
 
         # External GPIO changes are queued by a GUI/host thread and become
         # hardware state only here, between guest instructions.  Resampling
@@ -1256,6 +1372,28 @@ class BekenEmulator:
             self.state.icu_int_enable = value
             self._print(f"[DEBUG] ICU_INT_ENABLE set to: 0x{value:08x}")
         if address == self.ICU_GLOBAL_INT_EN: self.state.icu_global_int_en = value
+        if address == self.ICU_PERI_CLK_PWD:
+            enabled = not bool(value & self.ICU_WDT_CLK_PWD)
+            if enabled != self.state.wdt_clock_enabled:
+                self.state.wdt_clock_enabled = enabled
+                if enabled:
+                    self._arm_watchdog()
+                else:
+                    self.state.wdt_deadline = None
+        if address == self.WDT_CTRL:
+            key = (value >> 16) & 0xFF
+            period = value & 0xFFFF
+            if key == self.WDT_FIRST_KEY:
+                self.state.wdt_first_period = period
+            elif (key == self.WDT_SECOND_KEY
+                  and self.state.wdt_first_period == period):
+                self.state.wdt_first_period = None
+                self.state.wdt_period_ms = period
+                self._arm_watchdog()
+            else:
+                # An incomplete or mismatched unlock sequence has no effect on
+                # the running timer and cannot be completed by a later key.
+                self.state.wdt_first_period = None
         if address == self.ICU_INT_STATUS:
             self.state.pending_irqs &= ~value
             # The MAC FIQ lines are levels: an ICU clear does not take them
@@ -1838,7 +1976,7 @@ class BekenEmulator:
 
         SARADC_ADC_CONFIG = 0x00802c00
         self.mu.mem_write(SARADC_ADC_CONFIG, struct.pack("<I", 1 << 28 | 1 << 30))
-        self.mu.mem_write(0x00802900, struct.pack("<I", 0))
+        self.mu.mem_write(self.WDT_CTRL, struct.pack("<I", 0))
 
         # Mirror the raw flash at the SPI-flash window. Cap the size so it can
         # never run into the RAM region: dumps larger than 2MB (e.g. 4MB BK7238
@@ -1880,6 +2018,10 @@ class BekenEmulator:
         self._tick_hook = (self.mu.hook_add(UC_HOOK_BLOCK, self.hook_block)
                            if self._block_pacing else None)
         self.mu.hook_add(UC_HOOK_INTR, self.hook_intr)
+        # A watchdog reset restores every banked CPU register, not just PC.
+        # Unicorn contexts include those banked registers, so the pristine
+        # post-setup context is the exact reset value and is reusable.
+        self._power_on_context = self.mu.context_save()
 
     # ------------------------------------------------------------ snapshots
     # A boot to the point where a firmware's Wi-Fi is up costs minutes of wall
@@ -1983,6 +2125,12 @@ class BekenEmulator:
         self.state = snap["state"]
         if not hasattr(self.state, "idle_task"):
             self.state.idle_task = None     # a snapshot from before idle skipping
+        # BKSNAP01 is intentionally forward-readable.  Snapshots created before
+        # the watchdog model simply resume with a reset-value, idle watchdog.
+        for name, value in (("wdt_first_period", None), ("wdt_period_ms", 0),
+                            ("wdt_clock_enabled", True), ("wdt_deadline", None)):
+            if not hasattr(self.state, name):
+                setattr(self.state, name, value)
         if not hasattr(self.state, "gpio_hw"):
             # BKSNAP01 predates the GPIO model.  Preserve its register state as
             # far as that format permits: INTEN/INTLV were formerly ordinary
@@ -2107,7 +2255,7 @@ class BekenEmulator:
             epoch = self._exc_epoch
             armed = self._snapshot_path is not None
             pacing(state)
-            if self.stopping:
+            if self.stopping or self._watchdog_reset_pending:
                 break
             if self._exc_epoch != epoch:
                 # The pacing work took an IRQ or FIQ: PC is now the vector and
@@ -2198,7 +2346,7 @@ class BekenEmulator:
         # moves, or a pending timer tick would wait for the next one and the
         # two merge, losing the guest RTOS a tick.
         pacing(state)
-        if self.stopping:
+        if self.stopping or self._watchdog_reset_pending:
             return True
         if self._exc_epoch != epoch:
             return False
@@ -2220,7 +2368,7 @@ class BekenEmulator:
             left -= n
             self.idle_chunks_skipped += n
             pacing(state)
-            if self.stopping:
+            if self.stopping or self._watchdog_reset_pending:
                 return True
             if self._exc_epoch != epoch:
                 break
@@ -2258,22 +2406,28 @@ class BekenEmulator:
                 at = ram.find(name, at + 1)
         return None
 
+    def _cold_vector_base(self):
+        if self.with_boot:
+            return 0x00000000
+        vector_base = 0x00010000
+        try:
+            val = struct.unpack("<I", self.mu.mem_read(vector_base, 4))[0]
+            if val == 0xFFFFFFFF or val == 0x94b5072f:
+                vector_base = 0x00011000
+        except Exception:
+            pass
+        return vector_base
+
     def run(self):
         if getattr(self, "_resume_at", None) is not None:
             vector_base = self._resume_at
             self._print(f"Resuming snapshot at: 0x{vector_base:08x}")
-        elif self.with_boot:
-            vector_base = 0x00000000
-            self._print(f"Booting from bootloader at: 0x{vector_base:08x}")
         else:
-            vector_base = 0x00010000
-            try:
-                val = struct.unpack("<I", self.mu.mem_read(vector_base, 4))[0]
-                if val == 0xFFFFFFFF or val == 0x94b5072f: 
-                    vector_base = 0x00011000
-            except Exception:
-                pass
-            self._print(f"Detected app vector table at: 0x{vector_base:08x}")
+            vector_base = self._cold_vector_base()
+            if self.with_boot:
+                self._print(f"Booting from bootloader at: 0x{vector_base:08x}")
+            else:
+                self._print(f"Detected app vector table at: 0x{vector_base:08x}")
 
         if self.app:
             self._print("App header:", self.app[:32].hex())
@@ -2281,10 +2435,18 @@ class BekenEmulator:
         self._print(f"Starting emulation at 0x{vector_base:08x}...")
         start_time = time.time()
         try:
-            if self._block_pacing:
-                self.mu.emu_start(vector_base, 0xFFFFFFFF, count=1000000000)
-            else:
-                self._run_chunked(vector_base)
+            while True:
+                if self._block_pacing:
+                    self.mu.emu_start(vector_base, 0xFFFFFFFF, count=1000000000)
+                else:
+                    self._run_chunked(vector_base)
+                if not self._watchdog_reset_pending or self.stopping:
+                    break
+                self._watchdog_reset()
+                if self.stopping:
+                    break
+                vector_base = self._cold_vector_base()
+                self._print(f"Restarting emulation at 0x{vector_base:08x}...")
         except UcError as e:
             pc = self.mu.reg_read(UC_ARM_REG_PC)
             cpsr = self.mu.reg_read(UC_ARM_REG_CPSR)

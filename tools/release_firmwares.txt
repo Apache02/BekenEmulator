@@ -1,0 +1,12 @@
+# Firmware embedded in the standalone Windows executable.
+# Keep this equal to DEFAULT_IMAGE plus every INTERESTING_DUMPS entry in sim_ui.py.
+OpenBK7231T_QIO_1.18.300_mathDemo_obkStartupCommand_uartConsole.bin
+OpenBK7231T_QIO_1.18.300.bin
+OpenBK7231N_QIO_1.18.300.bin
+OpenBK7238_QIO_1.18.300.bin
+OpenBK7252_QIO_1.18.300.bin
+BK7231T_Tuya_1G_Switch_WB3S-IPEX_1.0.4.bin
+BK7231Q_Tuya_MOES_Relay_WA2_1.1.3.bin
+BK7238_GBDQA_63V_16A.bin
+BK7238_Tuya_IHSENO_HAZ_IR_V3_T1-3S_0.0.5.bin
+BK7231N_Tuya_LSC_GLS_A60_CBLC5_1.6.0.bin

@@ -1,0 +1,96 @@
+name: Beken Simulator Windows Release
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+# The test/Pages workflow remains read-only. Only this release-specific job may
+# replace an asset on a release the repository owner has already published.
+permissions:
+  contents: write
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+    - name: Checkout release source
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.release.tag_name || github.ref }}
+
+    - name: Set up Python 3.10 x64
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.10"
+        architecture: "x64"
+        cache: pip
+
+    - name: Install emulator dependencies
+      run: python -m pip install -r requirements.txt
+
+    # Unicorn's generated control flow is incompatible with the CFG-enabled
+    # Windows bootloader shipped in PyInstaller wheels. Build the documented
+    # no-CFG bootloader from source; the packaged Unicorn smoke test below
+    # fails with 0xC0000409 if this ever regresses.
+    - name: Install PyInstaller with a no-CFG bootloader
+      shell: pwsh
+      run: |
+        $env:PYINSTALLER_COMPILE_BOOTLOADER = "1"
+        $env:PYINSTALLER_BOOTLOADER_WAF_ARGS = "--no-cfg"
+        python -m pip install --no-cache-dir --no-binary=PyInstaller "PyInstaller==6.22.3"
+
+    - name: Build standalone Windows executable
+      shell: pwsh
+      run: .\tools\build_windows_release.ps1
+
+    - name: Smoke-test packaged Unicorn runtime and firmware resources
+      shell: pwsh
+      run: |
+        $process = Start-Process `
+          -FilePath ".\dist\BekenSimulator.exe" `
+          -ArgumentList "--package-smoke" `
+          -Wait -PassThru -NoNewWindow
+        if ($process.ExitCode -ne 0) {
+          throw "Packaged runtime smoke test failed with exit code $($process.ExitCode)"
+        }
+
+    - name: Run packaged GUI self-tests
+      shell: pwsh
+      run: |
+        $process = Start-Process `
+          -FilePath ".\dist\BekenSimulator.exe" `
+          -ArgumentList "--selftest" `
+          -Wait -PassThru -NoNewWindow
+        if ($process.ExitCode -ne 0) {
+          throw "Packaged UI self-test failed with exit code $($process.ExitCode)"
+        }
+
+    - name: Write SHA-256 checksum
+      shell: pwsh
+      run: |
+        $hash = (Get-FileHash ".\dist\BekenSimulator.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+        "$hash  BekenSimulator.exe" | Set-Content ".\dist\BekenSimulator.exe.sha256" -NoNewline
+
+    - name: Preserve workflow artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: BekenSimulator-windows-x64
+        path: |
+          dist/BekenSimulator.exe
+          dist/BekenSimulator.exe.sha256
+        if-no-files-found: error
+
+    - name: Attach executable to GitHub release
+      if: ${{ github.event_name == 'release' }}
+      env:
+        GH_TOKEN: ${{ github.token }}
+      shell: pwsh
+      run: |
+        gh release upload `
+          "${{ github.event.release.tag_name }}" `
+          ".\dist\BekenSimulator.exe" `
+          ".\dist\BekenSimulator.exe.sha256" `
+          --clobber

@@ -5,3 +5,6 @@ app_decrypted*
 bootloader_decrypted*
 scratch/
 report/
+build/
+dist/
+*.spec
