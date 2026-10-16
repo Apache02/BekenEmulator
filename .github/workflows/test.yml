@@ -37,6 +37,12 @@ jobs:
     - name: TuyaMCU protocol unit self-tests (no firmware)
       run: python src/tuyamcu.py
 
+    - name: Tuya flash config parser self-tests (no firmware)
+      run: python src/tuya_config.py
+
+    - name: Firmware image loader self-tests
+      run: python tests/image_loader.py
+
     - name: BLE core register model self-tests (no firmware)
       run: python src/blecore.py
 

@@ -42,16 +42,22 @@ CHIP_FAMILIES = {
     "BK7252N": (0x0007252A, 0x23A18000),  # accepts dev 0x23A1xxxx or 0x2431xxxx
 }
 
-# BLE core generation per chip id, for --ble-core (CFG_BLE_VERSION in each
-# chip's sys_config_*.h). The BK7231 identity covers T/U too, which carry the
-# older 4.2 IP - but only N-family images (N, M, BL2028N) have a BLE core that
-# needs --ble-core, so 5.1 is the layout that identity means in practice.
-# BK7252/BK7252N have no 5.x core, and on BK7252 0x900000 is SDRAM.
+# BLE core generation per chip id (CFG_BLE_VERSION in each chip's
+# sys_config_*.h).  The generic BK7231 identity is deliberately present for
+# the legacy --ble-core override: it is shared by T/U firmware (BLE 4.2, not
+# modelled) and many N/M/BL2028N images (BLE 5.1), so the identity alone cannot
+# safely turn the 5.1 model on.  The distinct BK7231N and BK7238 identities are
+# unambiguous and get their real BLE 5.x hardware automatically. BK7252 and
+# BK7252N have no modelled 5.x core; on BK7252 0x900000 is SDRAM.
 BLE_CORE_LAYOUTS = {
     CHIP_FAMILIES["BK7231"][0]: "5.1",
     CHIP_FAMILIES["BK7231N"][0]: "5.1",
     CHIP_FAMILIES["BK7238"][0]: "5.2",
 }
+AUTO_BLE_CORE_CHIP_IDS = frozenset((
+    CHIP_FAMILIES["BK7231N"][0],
+    CHIP_FAMILIES["BK7238"][0],
+))
 
 # Chip ids that are the BK7231 die (T/U/N/M): same SARADC layout, and the
 # pwm_new block on N/M.
@@ -286,7 +292,7 @@ class BekenEmulator:
     ICU_INT_ENABLE = 0x00802040  # ICU_INTERRUPT_ENABLE (0x802050 is ICU_ARM_WAKEUP_EN)
     ICU_GLOBAL_INT_EN = 0x00802044
 
-    def __init__(self, raw_flash, bootloader, app, with_boot=False, only_uart=False, chip_identity=None, uart1_hex=False, physical_flash=None, uart1_rx=b"", uart1_rx_delay=CONSOLE_RX_HOLDOFF_INSNS, tuyamcu_enabled=False, tuyamcu_pid=None, tuyamcu_raw=False, xvr_selfclear=False, tuyamcu_dps=None, tuyamcu_injects=None, uart_sink=None, ble_core=False, wifi=False):
+    def __init__(self, raw_flash, bootloader, app, with_boot=False, only_uart=False, chip_identity=None, uart1_hex=False, physical_flash=None, uart1_rx=b"", uart1_rx_delay=CONSOLE_RX_HOLDOFF_INSNS, tuyamcu_enabled=False, tuyamcu_pid=None, tuyamcu_raw=False, xvr_selfclear=False, tuyamcu_dps=None, tuyamcu_injects=None, uart_sink=None, ble_core=None, wifi=False, exception_vector_base=0):
         self.raw_flash = raw_flash
         self.xvr_selfclear = xvr_selfclear
         # Opt-in RivieraWaves Wi-Fi MAC model over 0xC0000000 (src/wifimac.py).
@@ -318,15 +324,25 @@ class BekenEmulator:
             self.wifimac.mem = (lambda addr, size: self.mu.mem_read(addr, size),
                                 lambda addr, data: self.mu.mem_write(addr, bytes(data)))
             self.trng_state = 0x2545F491
-        # Opt-in RivieraWaves BLE core model over the 0x900000 block (see
-        # src/blecore.py). Off, that block stays plain memory plus the
-        # --xvr-selfclear bit tricks; on, the controller gets a slot clock,
-        # deep-sleep wake-ups and interrupt registers - and the FIQ lines
-        # (ICU bits 29/30) that this emulator never raised before.
+        # RivieraWaves BLE core model over the 0x900000 block (src/blecore.py).
+        # Real BLE 5.x silicon selected by an unambiguous chip identity gets
+        # this hardware automatically.  None means that automatic policy,
+        # True is the legacy forced mode for N/M firmware run with the generic
+        # BK7231 identity, and False is an explicit programmatic opt-out useful
+        # for diagnostics.  A modelled controller gets a slot clock, wake-ups,
+        # interrupt registers and the BLE/BTDM FIQ lines (ICU bits 29/30).
         self.blecore = None
-        if ble_core:
-            chip_id = (chip_identity or CHIP_FAMILIES["BK7231"])[0]
-            layout = BLE_CORE_LAYOUTS.get(chip_id)
+        chip_id = (chip_identity or CHIP_FAMILIES["BK7231"])[0]
+        layout = BLE_CORE_LAYOUTS.get(chip_id)
+        if ble_core is True and layout is None:
+            raise ValueError("--ble-core models the BLE 5.x core of BK7231N/M (5.1) and "
+                             "BK7238 (5.2); this chip has no such core.")
+        want_ble_core = (ble_core is True or
+                         (ble_core is None and chip_id in AUTO_BLE_CORE_CHIP_IDS))
+        if want_ble_core:
+            # The auto set is a strict subset of BLE_CORE_LAYOUTS; keep this
+            # assertion close to selection so a future chip addition cannot
+            # accidentally instantiate a layout-less core.
             if layout is None:
                 raise ValueError("--ble-core models the BLE 5.x core of BK7231N/M (5.1) and "
                                  "BK7238 (5.2); this chip has no such core.")
@@ -338,6 +354,10 @@ class BekenEmulator:
         self.bootloader = bootloader
         self.app = app
         self.with_boot = with_boot
+        # ARM968E-S firmware can relocate its exception table.  Unicorn does
+        # not deliver the emulator's synthetic IRQ/FIQ lines for us, so the
+        # manual exception entry below must apply the same base explicitly.
+        self.exception_vector_base = exception_vector_base
         self.only_uart = only_uart
         self.uart1_hex = uart1_hex
         # Bytes to feed into UART1's receive FIFO, as if a host typed them. The
@@ -400,6 +420,12 @@ class BekenEmulator:
         # Optional callback(direction, frame_bytes, now_us) for every frame the
         # IP bridge carried, so a front end can show the bytes themselves.
         self.net_frame_sink = None
+        # Optional exact-PC diagnostics installed by trace_pc().  Narrow
+        # Unicorn code hooks are effectively free compared with the old
+        # all-code pacing hook, and each address is reported only once.
+        self._pc_trace_addresses = set()
+        self._pc_trace_seen = set()
+        self._pc_trace_hooks = []
         # Appends to uart1_rx may come from another thread (a GUI typing into
         # the console) while the emulation thread pops from it. Only appends
         # are locked: the emulator is the sole consumer, and an append can only
@@ -597,6 +623,30 @@ class BekenEmulator:
         out.flush()
         self.state.uart_at_line_start = True
 
+    def trace_pc(self, address):
+        """Report the first execution of an exact guest PC.
+
+        This is a diagnostic/coverage primitive for opaque firmware where the
+        last UART message is not the last code that ran.  Bit zero is accepted
+        as a Thumb-state tag but Unicorn's code-hook address is always even.
+        Call after setup(), before run().
+        """
+        address = int(address) & 0xFFFFFFFE
+        if address in self._pc_trace_addresses:
+            return
+        self._pc_trace_addresses.add(address)
+
+        def reached(mu, pc, size, user_data):
+            if address in self._pc_trace_seen:
+                return
+            self._pc_trace_seen.add(address)
+            self.net_log("[EMU_PC] reached 0x%08x at %d instructions"
+                         % (address, self.state.insn_count))
+
+        handle = self.mu.hook_add(UC_HOOK_CODE, reached,
+                                  begin=address, end=address)
+        self._pc_trace_hooks.append(handle)
+
     def attach_wifi_peer(self, role="auto", ssid=None, channel=1, peer_mac=None,
                          forwards=(), net_out=False, pcap=None, http_gets=(), mqtt_pubs=(),
                          passphrase=None):
@@ -695,7 +745,7 @@ class BekenEmulator:
             write(UC_ARM_REG_CPSR, new_cpsr)
             write(UC_ARM_REG_SPSR, cpsr)
             write(UC_ARM_REG_LR, pc + 4)
-            write(UC_ARM_REG_PC, 0x00000018)
+            write(UC_ARM_REG_PC, self.exception_vector_base + 0x18)
             # Tells _run_chunked that PC/CPSR moved under it, so the next
             # chunk must start from the vector rather than where the guest
             # was. Cheaper than re-reading both registers every chunk.
@@ -721,7 +771,7 @@ class BekenEmulator:
         write(UC_ARM_REG_CPSR, new_cpsr)
         write(UC_ARM_REG_SPSR, cpsr)
         write(UC_ARM_REG_LR, pc + 4)
-        write(UC_ARM_REG_PC, 0x0000001C)
+        write(UC_ARM_REG_PC, self.exception_vector_base + 0x1C)
         self._exc_epoch += 1            # see trigger_irq
 
     def hook_intr(self, mu, intno, user_data):
@@ -732,7 +782,7 @@ class BekenEmulator:
             mu.reg_write(UC_ARM_REG_CPSR, new_cpsr)
             mu.reg_write(UC_ARM_REG_SPSR, cpsr)
             mu.reg_write(UC_ARM_REG_LR, pc)
-            mu.reg_write(UC_ARM_REG_PC, 0x00000008)
+            mu.reg_write(UC_ARM_REG_PC, self.exception_vector_base + 0x08)
 
     # Interrupt/pacing bookkeeping does NOT run per instruction. A
     # per-instruction UC_HOOK_CODE callback dominated runtime (measured ~3.7x
@@ -789,14 +839,6 @@ class BekenEmulator:
         # the GIL so the UI thread gets it all.
         if self._paused:
             self._resume.wait()
-
-        # Snapshot request: taken here, between two instructions, never from
-        # inside a memory hook where an instruction is half done.
-        if self._snapshot_path is not None:
-            if self._snapshot_due or (self._snapshot_at_insns is not None
-                                      and state.insn_count >= self._snapshot_at_insns):
-                path, self._snapshot_path = self._snapshot_path, None
-                self.save_snapshot(path)
 
         # Slow tick: raise the periodic sources' pending.
         if state.insn_count - state.last_slow >= SLOW_TICK_INSNS:
@@ -913,6 +955,18 @@ class BekenEmulator:
             if uart2_due:
                 state.pending_irqs |= (1 << 1)
                 self.trigger_irq()
+
+        # Snapshot request: take it only after every periodic action due at
+        # this device-time boundary has completed.  Saving before the slow and
+        # fast ticks made the continued run perform work that was absent from
+        # the image; a restored run then executed its next chunk first and ran
+        # that work one boundary late.  We are still between guest
+        # instructions here, never inside a memory hook where one is half done.
+        if self._snapshot_path is not None:
+            if self._snapshot_due or (self._snapshot_at_insns is not None
+                                      and state.insn_count >= self._snapshot_at_insns):
+                path, self._snapshot_path = self._snapshot_path, None
+                self.save_snapshot(path)
 
     def _uart_irqs_due(self, state):
         """(UART1, UART2): whether the fast tick raises each UART's interrupt.

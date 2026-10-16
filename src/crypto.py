@@ -2,18 +2,23 @@ import struct
 
 # --- BK7231 CRYPTO AND EXTRACTION LOGIC ---
 
+def _make_crc16_table():
+    table = []
+    for value in range(256):
+        reg = value << 8
+        for _ in range(8):
+            reg = ((reg << 1) ^ (0x8005 if reg & 0x8000 else 0)) & 0xFFFF
+        table.append(reg)
+    return tuple(table)
+
+
+_CRC16_TABLE = _make_crc16_table()
+
 def crc16(data: bytes, initial_value: int = 0x0000) -> int:
-    reg = initial_value
-    poly = 0x8005
+    """Beken's MSB-first CRC16, using a byte table for image-sized inputs."""
+    reg = initial_value & 0xFFFF
     for octet in data:
-        for i in range(8):
-            topbit = reg & 0x8000
-            if octet & (0x80 >> i):
-                topbit ^= 0x8000
-            reg <<= 1
-            if topbit:
-                reg ^= poly
-        reg &= 0xFFFF
+        reg = ((reg << 8) & 0xFFFF) ^ _CRC16_TABLE[((reg >> 8) ^ octet) & 0xFF]
     return reg
 
 def block_crc_check(block: bytes, crc_bytes: bytes) -> bool:
@@ -36,6 +41,35 @@ def strip_crcs(data: bytes) -> bytes:
     for i in range(offset, len(data), 34):
         out.extend(data[i:i+32])
     return bytes(out)
+
+
+def decode_crc_prefix(data: bytes, offset: int = 0, max_blocks=None):
+    """Decode the contiguous valid Beken 32+2 CRC run at ``offset``.
+
+    A flash dump is not necessarily CRC-framed from beginning to end.  In
+    particular, BK7252 camera reads may contain a CRC-wrapped application
+    followed by raw filesystem/config sectors.  ``strip_crcs()`` intentionally
+    retains its historical whole-image behaviour; this helper stops at the
+    first invalid block and also reports how many encoded bytes were consumed.
+    ``max_blocks`` bounds probes that need only a header rather than the whole
+    executable prefix.
+    """
+    if offset < 0:
+        raise ValueError("CRC prefix offset must be non-negative")
+
+    out = bytearray()
+    cursor = offset
+    blocks = 0
+    while (cursor + 34 <= len(data)
+           and (max_blocks is None or blocks < max_blocks)):
+        block = data[cursor:cursor + 32]
+        crc = data[cursor + 32:cursor + 34]
+        if not block_crc_check(block, crc):
+            break
+        out.extend(block)
+        cursor += 34
+        blocks += 1
+    return bytes(out), cursor - offset
 
 def uint8(x): return x & 0xFF
 def uint16(x): return x & 0xFFFF
@@ -214,6 +248,72 @@ def _looks_like_arm_vectors(data: bytes, offset: int = 0) -> bool:
         if (word >> 24) == 0xEA or (word >> 16) == 0xE59F:
             good += 1
     return good >= 6
+
+
+def _arm_vector_destinations(data: bytes, offset: int = 0,
+                             load_address: int = 0):
+    """Resolve the direct ARM B/LDR-PC destinations in an exception table."""
+    if len(data) < offset + 32:
+        return ()
+
+    destinations = []
+    for i in range(8):
+        insn_offset = offset + i * 4
+        insn_address = load_address + i * 4
+        word = struct.unpack_from("<I", data, insn_offset)[0]
+
+        if (word >> 24) == 0xEA:  # B <relative>
+            imm24 = word & 0x00FFFFFF
+            if imm24 & 0x00800000:
+                imm24 -= 0x01000000
+            destinations.append((insn_address + 8 + (imm24 << 2)) & 0xFFFFFFFF)
+            continue
+
+        # LDR pc, [pc, #+/-imm12].  The literal's position within the image is
+        # independent of the address at which the table is loaded.
+        opcode = word & 0xFFFFF000
+        if opcode not in (0xE59FF000, 0xE51FF000):
+            continue
+        displacement = word & 0xFFF
+        literal_offset = insn_offset + 8
+        literal_offset += displacement if (word & (1 << 23)) else -displacement
+        if offset <= literal_offset and literal_offset + 4 <= len(data):
+            destinations.append(struct.unpack_from("<I", data, literal_offset)[0])
+    return tuple(destinations)
+
+
+def _looks_like_linked_app_vectors(data: bytes, offset: int = 0,
+                                   load_address: int = 0x10000) -> bool:
+    """Recognise vectors whose handlers are linked into the BK app window."""
+    if not _looks_like_arm_vectors(data, offset):
+        return False
+    destinations = _arm_vector_destinations(data, offset, load_address)
+    return sum(0x10000 <= target < 0x200000 for target in destinations) >= 6
+
+
+def detect_bk7252_app_only(data: bytes):
+    """Return ``(decoded_app, encoded_size)`` for a BK7252 app-window dump.
+
+    UART readers commonly save a 2 MiB read beginning at *physical* flash
+    0x11000 as file offset zero.  That byte is CPU/XIP address 0x10000 after
+    the controller removes each block's two CRC bytes.  Such a file therefore
+    starts with app-linked vectors, while a normal full dump starts with
+    bootloader-linked vectors and has its app at physical 0x11000.
+
+    The full-image check deliberately comes first so existing BK7252 images
+    keep the established bootloader/app extraction path.
+    """
+    # 0x1040 decoded bytes cover the table plus the furthest literal reachable
+    # by an ARM LDR-PC imm12 vector.  Do not CRC-scan a megabyte merely to
+    # decide precedence.
+    full_app, _ = decode_crc_prefix(data, 0x11000, max_blocks=130)
+    if _looks_like_linked_app_vectors(full_app):
+        return None
+
+    app, encoded_size = decode_crc_prefix(data)
+    if len(app) < 0x10000 or not _looks_like_linked_app_vectors(app):
+        return None
+    return app, encoded_size
 
 def extract_and_decrypt(data: bytes, target_name: str = "bootloader", coefs=None):
     """Extract the bootloader/app slice, decrypting it with `coefs` if given.

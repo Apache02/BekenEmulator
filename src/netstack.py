@@ -855,8 +855,9 @@ class TcpConn:
     # packet: an HTTP client waits for a status line, an MQTT client only
     # publishes once the broker has accepted it. These answer just enough of
     # each protocol for the firmware to carry on, so what it sends AFTER the
-    # handshake is caught too. TLS cannot be answered (no certificate the
-    # firmware would trust), so encrypted flows stay capture-only.
+    # handshake is caught too. TLS-PSK can be answered through ServerHello and
+    # ServerHelloDone, far enough for a device to reveal its pre-shared-key
+    # identity; completing the encrypted session still requires its secret.
 
     def _http_serve(self):
         """Answer one plain-HTTP request with a short 200 and close."""

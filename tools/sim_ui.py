@@ -44,7 +44,7 @@ from tkinter import filedialog, messagebox, ttk
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT_DIR)
 
-from src import netstack
+from src import netstack, tuya_config
 from src.crypto import KNOWN_KEYS, parse_key
 from src.emulator import CHIP_FAMILIES, SLOW_TICK_INSNS, SLOW_TICK_MS
 from src.main import (WIFI_ROLES, build_emulator, check_tuyamcu_pid, check_wifi_pass,
@@ -198,6 +198,8 @@ class SimulatorUI:
         self._u2_partial = ""
         self.quick_buttons = []
         self._periph_key = None       # last GPIO/PWM snapshot drawn
+        self._tuya_key = None         # (path, size, mtime) of config currently drawn
+        self.tuya_config = None
 
         self._last_insns = 0
         self._last_rate_at = None
@@ -221,6 +223,7 @@ class SimulatorUI:
         # The remembered chip and key belong to the remembered image, so they
         # only come back along with it - however the same file is spelled.
         self._apply_settings(settings, same_image=(saved is not None and _same_file(start, saved)))
+        self._refresh_tuya_config()
         self.drop_enabled = self._enable_drop()
         self._options_changed()
         self.root.after(POLL_MS, self._poll)
@@ -234,7 +237,13 @@ class SimulatorUI:
         cfg.pack(fill="x", padx=6, pady=(6, 3))
 
         self.var_image = tk.StringVar(value=initial_image if os.path.exists(initial_image) else "")
-        ttk.Entry(cfg, textvariable=self.var_image).pack(side="left", fill="x", expand=True)
+        self.image_entry = ttk.Entry(cfg, textvariable=self.var_image)
+        self.image_entry.pack(side="left", fill="x", expand=True)
+        # Typing a path by hand is deliberately not traced per keystroke: a
+        # config scan decrypts about 256 KiB.  Enter / leaving the field, the
+        # Tuya tab, Browse, Drop and Run are the useful refresh boundaries.
+        self.image_entry.bind("<Return>", lambda _e: self._refresh_tuya_config(force=True))
+        self.image_entry.bind("<FocusOut>", lambda _e: self._refresh_tuya_config())
         ttk.Button(cfg, text="Browse...", command=self._browse, width=10).pack(side="left", padx=(4, 10))
 
         ttk.Label(cfg, text="chip").pack(side="left")
@@ -288,14 +297,16 @@ class SimulatorUI:
         # a full-width strip under them, in a draggable split. Its lines are
         # long (a decoded Tuya announcement is a whole JSON object), so width
         # matters more to it than height.
-        # Two tabs: Run holds everything that shows a run; Config holds every
-        # choice that shapes the next one.
+        # Run holds everything that shows a run; Config shapes the next one;
+        # Tuya config decodes the selected image's stored device/wiring data.
         self.tabs = ttk.Notebook(self.root)
         self.tabs.pack(fill="both", expand=True, padx=6)
         self.run_tab = ttk.Frame(self.tabs)
         self.config_tab = ttk.Frame(self.tabs, padding=8)
+        self.tuya_tab = ttk.Frame(self.tabs, padding=8)
         self.tabs.add(self.run_tab, text="Run")
         self.tabs.add(self.config_tab, text="Config")
+        self.tabs.add(self.tuya_tab, text="Tuya config")
 
         split = ttk.PanedWindow(self.run_tab, orient="vertical")
         split.pack(fill="both", expand=True)
@@ -426,8 +437,113 @@ class SimulatorUI:
 
         self._ui_ready = False
         self._build_config(self.config_tab, mono)
+        self._build_tuya_config(self.tuya_tab, mono)
         self._ui_ready = True
         self._options_changed()
+        self.tabs.bind("<<NotebookTabChanged>>", self._tab_changed)
+
+    # -------------------------------------------------------- Tuya config tab
+    def _build_tuya_config(self, tab, mono):
+        """Static, masked configuration recovered from the selected flash."""
+        top = ttk.Frame(tab)
+        top.pack(fill="x", pady=(0, 6))
+        self.var_tuya_status = tk.StringVar(value="No image scanned yet.")
+        ttk.Label(top, textvariable=self.var_tuya_status, anchor="w").pack(
+            side="left", fill="x", expand=True)
+        ttk.Button(top, text="Refresh", width=10,
+                   command=lambda: self._refresh_tuya_config(force=True)).pack(side="right")
+
+        panes = ttk.PanedWindow(tab, orient="horizontal")
+        panes.pack(fill="both", expand=True)
+
+        summary = ttk.LabelFrame(panes, text="Decoded summary (credentials masked)", padding=4)
+        sf = ttk.Frame(summary)
+        sf.pack(fill="both", expand=True)
+        sbar = ttk.Scrollbar(sf, orient="vertical")
+        self.tuya_tree = ttk.Treeview(sf, columns=("field", "value"), show="headings",
+                                      yscrollcommand=sbar.set)
+        self.tuya_tree.heading("field", text="Field")
+        self.tuya_tree.heading("value", text="Value")
+        self.tuya_tree.column("field", width=180, anchor="w")
+        self.tuya_tree.column("value", width=390, anchor="w")
+        sbar.config(command=self.tuya_tree.yview)
+        sbar.pack(side="right", fill="y")
+        self.tuya_tree.pack(side="left", fill="both", expand=True)
+        panes.add(summary, weight=1)
+
+        raw = ttk.LabelFrame(panes, text="Decoded user_param_key JSON (no credentials)", padding=4)
+        self.txt_tuya_json = self._console(raw, mono, height=22)
+        panes.add(raw, weight=1)
+
+    def _tab_changed(self, _event=None):
+        if self.tabs.select() == str(self.tuya_tab):
+            self._refresh_tuya_config()
+
+    @staticmethod
+    def _tuya_json_value(value):
+        """Restore obvious JSON scalars; loose Tuya strings remain strings."""
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            return value
+
+    def _refresh_tuya_config(self, force=False, path=None):
+        """Decode once per selected file revision and redraw the Tuya tab.
+
+        Only the already-redacted human summary and user_param_key pairs are
+        rendered.  The raw storage records may contain an owner's SSID,
+        password, tokens and PSKs, so they intentionally never reach a widget.
+        """
+        path = (path or self.var_image.get()).strip()
+        try:
+            st = os.stat(path)
+            key = (os.path.normcase(os.path.abspath(path)), st.st_size,
+                   getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+        except OSError:
+            key = None
+        if not force and key is not None and key == self._tuya_key:
+            return self.tuya_config
+        self._tuya_key = key
+        self.tuya_config = None
+
+        self.tuya_tree.delete(*self.tuya_tree.get_children())
+        self.txt_tuya_json.configure(state="normal")
+        self.txt_tuya_json.delete("1.0", "end")
+        self.txt_tuya_json.configure(state="disabled")
+        if key is None:
+            self.var_tuya_status.set("Pick an existing flash dump to decode.")
+            return None
+
+        try:
+            decoded = tuya_config.extract(path)
+        except Exception as exc:
+            self.var_tuya_status.set("Tuya config decode failed: %s: %s"
+                                     % (type(exc).__name__, exc))
+            return None
+        self.tuya_config = decoded
+        if not decoded:
+            if tuya_config.AES is None:
+                note = "Tuya config unavailable: install pycryptodome to decrypt storage."
+            else:
+                note = "No recoverable Tuya configuration found in this image."
+            self.var_tuya_status.set(note)
+            return None
+
+        for label, value in decoded.get("human", []):
+            self.tuya_tree.insert("", "end", values=(label, value))
+        safe_pairs = {name: self._tuya_json_value(value)
+                      for name, value in decoded.get("pairs", [])}
+        body = json.dumps(safe_pairs, indent=2, ensure_ascii=False)
+        self.txt_tuya_json.configure(state="normal")
+        self.txt_tuya_json.insert("1.0", body + "\n")
+        self.txt_tuya_json.configure(state="disabled")
+
+        storage = "encrypted" if decoded.get("encrypted") else "plaintext"
+        self.var_tuya_status.set(
+            "%s storage at 0x%06X — %d config fields, %d datapoints"
+            % (storage, decoded.get("offset", 0), len(safe_pairs),
+               len(decoded.get("dps", []))))
+        return decoded
 
     # ------------------------------------------------------------ Config tab
     def _build_config(self, tab, mono):
@@ -466,8 +582,9 @@ class SimulatorUI:
         check(dev, 1, "xvr_selfclear", "RF calibration self-clear",
               "Clear the radio calibration bit at 0x9000f8. Many stock dumps stall "
               "early without it.")
-        check(dev, 2, "blecore", "BLE core",
-              "Model the Bluetooth controller, for dumps whose Bluetooth starts at boot.")
+        check(dev, 2, "blecore", "force BLE core",
+              "Legacy override for N/M dumps using generic BK7231. BK7231N and BK7238 "
+              "select their Bluetooth hardware automatically.")
         check(dev, 3, "tuyamcu", "TuyaMCU peer",
               "Answer the TuyaMCU serial protocol on UART1, as the device's MCU would.")
         pid = entry(dev, 4, "tuyamcu_pid", "product ID",
@@ -775,6 +892,7 @@ class SimulatorUI:
         in progress first, so a drop always means 'run this one now'."""
         self.var_image.set(path)
         self.var_chip.set(guess_chip(path))
+        self._refresh_tuya_config(path=path)
         self.tabs.select(self.run_tab)
         if not run:
             return
@@ -1197,6 +1315,7 @@ class SimulatorUI:
         if not path or not os.path.isfile(path):
             messagebox.showerror("BekenSimulator", "Pick a flash dump first.")
             return
+        self._refresh_tuya_config(path=path)
         # Read every Tk variable HERE, on the main thread. Tkinter is not
         # thread-safe, so the worker gets plain values, never widgets.
         try:
@@ -1250,7 +1369,7 @@ class SimulatorUI:
                 tuyamcu_pid=cfg["tuyamcu_pid"],
                 tuyamcu_raw=cfg["tuyamcu_raw"],
                 xvr_selfclear=cfg["xvr_selfclear"],
-                ble_core=cfg["blecore"],
+                ble_core=True if cfg["blecore"] else None,
                 wifi=cfg["wifi"],
                 uart_sink=self._sink,
                 # Writing app_decrypted.bin into the working directory is a
@@ -1881,8 +2000,9 @@ def _run_selftests():
         ui._worker("image.bin", cfg)
         b, p = calls["build"], calls["peer"]
         check(b["xvr_selfclear"] is True and b["tuyamcu_pid"] == "abcdefghijklmnop"
-              and b["tuyamcu_raw"] is True and b["wifi"] is True and b["only_uart"] is True,
-              "the worker passes the device options to build_emulator")
+              and b["tuyamcu_raw"] is True and b["wifi"] is True and b["only_uart"] is True
+              and b["ble_core"] is None,
+              "the worker passes device options and leaves BLE hardware selection automatic")
         check(p == {"role": "ap", "ssid": "HomeNet", "passphrase": "password1",
                     "forwards": [(9090, 80)], "pcap": "cap.pcap", "http_gets": ["/cm?cmnd=POWER%20ON",
                     "/index"], "mqtt_pubs": [("cmnd/obk/POWER", b"OFF")]},
@@ -1972,6 +2092,52 @@ def _run_selftests():
         for path in (dump, other):
             with open(path, "wb") as f:
                 f.write(bytes(16))
+
+        # Tuya config tab: extraction is cached per file revision, only the
+        # redacted summary and user_param_key map reach widgets, and changing
+        # images replaces (rather than mixes) the result.
+        real_extract = tuya_config.extract
+        decoded_calls = []
+
+        def fake_extract(path):
+            decoded_calls.append(path)
+            if _same_file(path, dump):
+                return {"offset": 0x1EE000, "encrypted": True,
+                        "raw": '{"passwd":"must-not-reach-the-widget"}',
+                        "pairs": [("rl1_pin", "6"), ("module", "CB2S")],
+                        "network": {"ssid": "must-not-reach-the-widget"},
+                        "dps": [{"id": 1}], "ids": {"auth_key": "secret"},
+                        "human": [("Storage", "encrypted (decrypted with device key)"),
+                                  ("Device key", "12****************************34"),
+                                  ("Paired WiFi SSID", "Ho****et"),
+                                  ("-", "Relay (channel 1) on P6")]}
+            return None
+
+        try:
+            tuya_config.extract = fake_extract
+            ui._tuya_key = None
+            ui.var_image.set(dump)
+            ui._refresh_tuya_config(force=True)
+            rows = [ui.tuya_tree.item(i, "values") for i in ui.tuya_tree.get_children()]
+            cfg_json = ui.txt_tuya_json.get("1.0", "end-1c")
+            check(any(r[0] == "Paired WiFi SSID" and r[1] == "Ho****et" for r in rows)
+                  and "12****************************34" in str(rows),
+                  "the Tuya tab shows the decoder's masked summary")
+            check('"rl1_pin": 6' in cfg_json and '"module": "CB2S"' in cfg_json,
+                  "the Tuya tab formats user_param_key as decoded JSON")
+            check("must-not-reach-the-widget" not in cfg_json + str(rows),
+                  "raw network credentials never reach the Tuya tab")
+            before = len(decoded_calls)
+            ui._refresh_tuya_config()
+            check(len(decoded_calls) == before,
+                  "the Tuya decoder is cached while the selected file is unchanged")
+            ui._load_image(other)
+            check(ui.tuya_config is None and not ui.tuya_tree.get_children()
+                  and "No recoverable" in ui.var_tuya_status.get(),
+                  "loading another image clears stale Tuya config")
+        finally:
+            tuya_config.extract = real_extract
+
         ui.settings_path = spath
         try:
             ui.var_image.set(dump)
@@ -2003,7 +2169,13 @@ def _run_selftests():
                   "Ctrl+Z cannot take a restored text box back to empty")
             win2.destroy()
 
-            win2, ui2 = window(initial_image=dump.replace("\\", "/").upper(), settings_path=spath)
+            # A redundant dot component is another spelling of the same file
+            # on every platform. Case and slash changes are equivalent only on
+            # Windows; uppercasing a POSIX path can name a different file.
+            same_dump = os.path.join(os.path.dirname(dump), ".", os.path.basename(dump))
+            if os.name == "nt":
+                same_dump = same_dump.replace("\\", "/").upper()
+            win2, ui2 = window(initial_image=same_dump, settings_path=spath)
             check(ui2.var_chip.get() == "BK7238" and ui2.var_key.get() == "(none)",
                   "the same image spelled differently still gets its chip and key back")
             win2.destroy()

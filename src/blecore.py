@@ -37,10 +37,13 @@ Two generations of the block are modelled, picked per chip (see LAYOUTS):
        fewer, so everything from +0xF8 moves up a word: SLOTCLK is at +0xF8
        (where 5.2 has CLKNTGT3) and FINETIMECNT at +0xFC. Its exchange memory
        sits at a fixed 0x910000 (EM_BASE_ADDR in ble_5_x_rw/.../em_map.h), so
-       there is no base register to read. From ble_5_1/.../ble_reg_ipcore.h,
-       identical in the OpenBK7231N SDK. A stock image with this layout polls
-       SLOTCLK's SAMP bit right after "rwble_hl_init ok" and, served as plain
-       memory, never gets past it.
+       there is no base register to read. The link-layer BLE registers are a
+       second copy at +0x800; in particular BLE_RWBLECNTL is +0x800 while the
+       common IP's RWDMCNTL remains at +0x000. From ble_5_1/.../ble_reg_ipcore.h
+       and ble_reg_blecore.h, identical in the OpenBK7231N SDK. A stock image
+       with this layout polls SLOTCLK's SAMP bit right after "rwble_hl_init ok"
+       and later polls BLE_RWBLECNTL.MASTER_SOFT_RST during link-layer init;
+       served as plain memory, either command bit never clears.
 
 BK7231T/U and BK7252N carry the older BLE 4.2 IP, which is not modelled.
 
@@ -84,10 +87,12 @@ VERSION_RESET = 0x0B001100               # BLE_VERSION_RESET, 5.2 blecore
 #                None for stay plain memory)
 #   ble_version  (offset, value) of a second version register the link layer
 #                checks, or None
+#   ble_control  offset of the separate link-layer RWBLECNTL, or None when the
+#                common control register at +0 is the only one
 LAYOUTS = {
     "5.2": {"slotclk": SLOTCLK, "finetimecnt": FINETIMECNT, "targets": 3,
             "version": VERSION_RESET, "em_fixed": None,
-            "window": SIZE, "ble_version": None},
+            "window": SIZE, "ble_version": None, "ble_control": None},
     "5.1": {"slotclk": 0x0F8, "finetimecnt": 0x0FC, "targets": 2,
             "version": 0x0A000700,          # IP_VERSION_RESET, 5.1 ipcore
             "em_fixed": 0x00910000,         # REG_EM_ET_BASE_ADDR
@@ -97,15 +102,18 @@ LAYOUTS = {
             # "param0 = 0, param1 = 167776000" with it unmodelled. The link
             # layer then runs uninitialised and the host never gets its
             # random numbers (gapm "wait GAPM_GEN_RAND_NB").
-            "window": 0x1000, "ble_version": (0x804, 0x0A000F00)},
+            "window": 0x1000, "ble_version": (0x804, 0x0A000F00),
+            "ble_control": 0x800},
 }
 
 # RWBLECNTL bits
 MASTER_SOFT_RST = 1 << 31
+MASTER_TGSOFT_RST = 1 << 30
 REG_SOFT_RST = 1 << 29
 RADIOCNTL_SOFT_RST = 1 << 28
 SWINT_REQ = 1 << 27
-SELF_CLEARING = MASTER_SOFT_RST | REG_SOFT_RST | RADIOCNTL_SOFT_RST | SWINT_REQ
+SOFT_RESETS = MASTER_SOFT_RST | MASTER_TGSOFT_RST | REG_SOFT_RST | RADIOCNTL_SOFT_RST
+SELF_CLEARING = SOFT_RESETS | SWINT_REQ
 
 # Core-side interrupt bits: INTSTAT1 / INTCNTL1 / INTACK1 (+0x18/+0x1c/+0x20)
 CLKNINT, SLPINT, CRYPTINT, SWINT, FINETGTINT = 1 << 0, 1 << 1, 1 << 2, 1 << 3, 1 << 4
@@ -150,6 +158,7 @@ class BleCore:
         self.em_fixed = lay["em_fixed"]
         self.window = lay["window"]
         self.ble_version = lay["ble_version"]
+        self.ble_control = lay["ble_control"]
         # Timestamp targets this IP has; on 5.1 the third pair's offsets are
         # SLOTCLK/FINETIMECNT, so they must not be treated as targets there.
         self.clkntgt = CLKNTGT[:lay["targets"]]
@@ -207,7 +216,7 @@ class BleCore:
             return self.slot_latch & SLOT_MASK
         if off == self.finetimecnt:
             return self.fine(insns) & FINE_MASK
-        if off in (RWBLECNTL, DEEPSLSTAT):
+        if off in (RWBLECNTL, DEEPSLSTAT) or off == self.ble_control:
             return self.regs.get(off, 0)
         if off == AESCNTL:
             # AES_START self-clears: the block is encrypted by the time the
@@ -224,6 +233,14 @@ class BleCore:
                 self.raw_core |= SWINT
             # Reset requests complete instantly; the firmware polls for them
             # to clear before it goes on.
+            self.regs[off] = value & ~SELF_CLEARING
+            return
+        if off == self.ble_control:
+            # BK7231N/M's link-layer core is a second register block at
+            # +0x800.  Reset fields here are commands just like those in the
+            # common +0 control register: hardware completes them and reads
+            # them back clear.  Keeping the non-command configuration bits is
+            # important; lld_init disables RWBLE_EN, resets, then re-enables it.
             self.regs[off] = value & ~SELF_CLEARING
             return
         if off == INTACK0:
@@ -552,6 +569,12 @@ def _run_selftests():
           "BLE-block VERSION at +0x804 reads 0x0A000F00 (lld.c:404 asserts it)")
     check(c5.window == 0x1000 and BleCore(b, 5_000_000).window == SIZE,
           "5.1 claims the whole page (BLE block at +0x800); 5.2 keeps its window")
+    c5.write(b + 0x800, MASTER_SOFT_RST | MASTER_TGSOFT_RST | REG_SOFT_RST |
+             RADIOCNTL_SOFT_RST | 0x00100607, 0)
+    check(c5.read(b + 0x800, 0) == 0x00100607,
+          "5.1 BLE-block RWBLECNTL at +0x800 self-clears all reset commands")
+    check(BleCore(b, 5_000_000).read(b + 0x800, 0) is None,
+          "5.2 does not claim a second RWBLECNTL at +0x800")
     c5.write(b + 0x0F8, SAMP, 3 * 3125)
     check(c5.read(b + 0x0F8, 3 * 3125) == 3, "SLOTCLK lives at +0xF8: SAMP latches the slot there")
     check(c5.read(b + 0x100, 0) is None, "+0x100 is not SLOTCLK on 5.1 (plain memory)")

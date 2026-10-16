@@ -5,7 +5,8 @@ import os
 # Add root directory to sys.path so we can import src.*
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from src.crypto import extract_and_decrypt, strip_crcs, parse_key, KNOWN_KEYS
+from src.crypto import (extract_and_decrypt, strip_crcs, parse_key, KNOWN_KEYS,
+                        detect_bk7252_app_only)
 from src.emulator import BekenEmulator, CHIP_FAMILIES, CONSOLE_RX_HOLDOFF_INSNS
 from src import tuyamcu
 from src.wifipeer import WIFI_ROLES
@@ -111,10 +112,26 @@ def parse_mac(text):
         raise ValueError("bad --wifi-mac %r (want aa:bb:cc:dd:ee:ff)" % text)
 
 
+def parse_pc(text):
+    """Parse one ARM/Thumb code address for --trace-pc."""
+    try:
+        address = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError("want an address such as 0x1234")
+    if not 0 <= address <= 0xFFFFFFFF:
+        raise argparse.ArgumentTypeError("address must fit in 32 bits")
+    return address
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="BK7231T/N Emulator")
     parser.add_argument("dump_file", help="Path to the raw BK7231 flash dump")
     parser.add_argument("--only-uart", action="store_true", help="Only print UART output (suppress MMIO/Trace/Info logs)")
+    parser.add_argument("--trace-pc", dest="trace_pcs", action="append", default=[],
+                        type=parse_pc, metavar="ADDRESS",
+                        help="Report the first execution of this exact guest code address as an "
+                             "[EMU_PC] line. Repeatable; useful when firmware keeps running after "
+                             "its UART log goes quiet. Bit 0 may mark a Thumb address.")
     parser.add_argument("--with-boot", action="store_true", help="Start execution from bootloader (0x00000000) instead of app (0x10000)")
     parser.add_argument("--uart1-hex", action="store_true", help="Show UART1 (TuyaMCU link) as tagged hex; UART2 stays text log")
     parser.add_argument("--uart1-rx", dest="uart1_rx", default=None, metavar="TEXT",
@@ -159,15 +176,13 @@ def parse_args():
                              "as self-clearing, so stock Tuya SDK 2.x dumps (ATORCH 2.1.17, PC321 "
                              "2.0.2, ...) boot past their RF and BLE init spins to the TuyaMCU link. "
                              "Opt-in: it breaks dumps that do real BLE init, so only enable per dump.")
-    parser.add_argument("--ble-core", dest="ble_core", action="store_true",
-                        help="Model the RivieraWaves BLE core registers at 0x900000 (slot clock, "
-                             "deep-sleep wake-up, interrupt status/ack, timer targets, AES engine) "
-                             "and deliver the BLE/BTDM FIQs, so a stock BLE+Wi-Fi image's controller "
-                             "keeps running and answers the host instead of the host timing out. "
-                             "The register layout follows -chip: BLE 5.1 for BK7231 (N/M/BL2028N "
-                             "images), 5.2 for BK7238. Advertising payloads the controller stages "
-                             "are printed as [BLE_ADV] lines. No radio is modelled: nothing goes "
-                             "on air. Opt-in.")
+    parser.add_argument("--ble-core", dest="ble_core", action="store_true", default=None,
+                        help="Force the RivieraWaves BLE 5.x core model for an N/M/BL2028N image "
+                             "being run under the ambiguous legacy -chip BK7231 identity. "
+                             "-chip BK7231N and BK7238 select their real BLE 5.1/5.2 hardware "
+                             "automatically. The model supplies clocks, interrupts, timers and "
+                             "AES; staged advertisements are printed as [BLE_ADV] lines. No BLE "
+                             "radio is modelled. Rejected on chips without a modelled 5.x core.")
     parser.add_argument("--wifi", dest="wifi", action="store_true",
                         help="Model the RivieraWaves Wi-Fi MAC hardware at 0xC0000000 (TX/RX "
                              "descriptor DMA, the 1 MHz MAC clock, ABS timers, TBTT and the "
@@ -254,7 +269,7 @@ def build_emulator(dump_path, key=None, chip="BK7231", with_boot=False, only_uar
                    uart1_hex=False, uart1_rx=b"", uart1_rx_delay=None, tuyamcu=False,
                    tuyamcu_pid=None, tuyamcu_raw=False, tuyamcu_dps=None,
                    tuyamcu_injects=None, xvr_selfclear=False, uart_sink=None,
-                   save_decrypted=True, log=None, ble_core=False, wifi=False):
+                   save_decrypted=True, log=None, ble_core=None, wifi=False):
     """Load a dump and return a configured, not-yet-started BekenEmulator.
 
     Everything between "here is an image and some options" and "start running"
@@ -263,7 +278,10 @@ def build_emulator(dump_path, key=None, chip="BK7231", with_boot=False, only_uar
     Rejects bad options with ValueError carrying the message the CLI prints.
 
     `key`, `tuyamcu_dps` and `tuyamcu_injects` are the parsed forms; the CLI
-    string parsers above turn command-line text into them first.
+    string parsers above turn command-line text into them first. `ble_core`
+    is tri-state: None selects hardware from the unambiguous chip identity,
+    True forces the legacy generic-BK7231 mapping, and False explicitly turns
+    it off for diagnostic callers.
     """
     if log is None:
         log = (lambda *a: None) if only_uart else print
@@ -276,15 +294,51 @@ def build_emulator(dump_path, key=None, chip="BK7231", with_boot=False, only_uar
     with open(dump_path, "rb") as f:
         raw_data = f.read()
 
-    flash_data = strip_crcs(raw_data)
-    bootloader = extract_and_decrypt(flash_data, "bootloader", key)
-    app = extract_and_decrypt(flash_data, "app", key)
+    # Some BK7252 UART tools read from physical flash 0x11000 and save that
+    # window at file offset zero.  The flash controller's 32-data + 2-CRC
+    # mapping makes this CPU/XIP address 0x10000: it is an app-only image, not
+    # a full dump whose first bytes belong at address zero.
+    app_window = detect_bk7252_app_only(raw_data) if chip_name == "BK7252" else None
+    if app_window is not None:
+        if key is not None:
+            raise ValueError("Detected a plaintext BK7252 app-only dump; do not pass -key.")
+        if with_boot:
+            raise ValueError("This BK7252 dump starts at physical flash 0x11000 and has no "
+                             "bootloader; remove --with-boot.")
+
+        app, encoded_size = app_window
+        bootloader = None
+
+        # Keep the application at its linked address.  The ARM968E-S vector
+        # base is 0x10000 in this direct-app configuration, so the omitted low
+        # bootloader region remains erased rather than containing a fake copy.
+        if 0x10000 + len(app) > BekenEmulator.FLASH_SIZE:
+            raise ValueError("Decoded BK7252 application does not fit the 2 MiB XIP window.")
+        logical_flash = bytearray(b"\xff" * BekenEmulator.FLASH_SIZE)
+        logical_flash[0x10000:0x10000 + len(app)] = app
+        flash_data = bytes(logical_flash)
+
+        # Software flash-controller operations use physical addresses.  File
+        # offset zero came from 0x11000, so represent the omitted low region as
+        # erased rather than shifting config/filesystem reads down by 0x11000.
+        physical_data = (b"\xff" * 0x11000) + raw_data
+        log("Detected BK7252 app-only dump: file offset 0 is physical 0x11000 / "
+            "CPU 0x10000.")
+        log("Decoded CRC-framed app prefix: %d bytes from %d encoded bytes."
+            % (len(app), encoded_size))
+    else:
+        flash_data = strip_crcs(raw_data)
+        bootloader = extract_and_decrypt(flash_data, "bootloader", key)
+        app = extract_and_decrypt(flash_data, "app", key)
+        physical_data = raw_data
 
     if app and save_decrypted:
         with open("app_decrypted.bin", "wb") as f:
             f.write(app)
 
-    if bootloader is None:
+    if app_window is not None:
+        log("Bootloader region is absent; starting the app directly at 0x10000.")
+    elif bootloader is None:
         log("Warning: Could not find 'bootloader' RBL container. Booting from 0x10000.")
     else:
         log(f"Loaded 'bootloader' payload, size: {len(bootloader)} bytes")
@@ -303,12 +357,13 @@ def build_emulator(dump_path, key=None, chip="BK7231", with_boot=False, only_uar
     return BekenEmulator(raw_flash=flash_data, bootloader=bootloader, app=app,
                          with_boot=with_boot, only_uart=only_uart,
                          chip_identity=CHIP_FAMILIES[chip_name], uart1_hex=uart1_hex,
-                         physical_flash=raw_data, uart1_rx=uart1_rx,
+                         physical_flash=physical_data, uart1_rx=uart1_rx,
                          uart1_rx_delay=uart1_rx_delay, tuyamcu_enabled=tuyamcu,
                          tuyamcu_pid=tuyamcu_pid, tuyamcu_raw=tuyamcu_raw,
                          xvr_selfclear=xvr_selfclear, tuyamcu_dps=tuyamcu_dps,
                          tuyamcu_injects=tuyamcu_injects, uart_sink=uart_sink,
-                         ble_core=ble_core, wifi=wifi)
+                         ble_core=ble_core, wifi=wifi,
+                         exception_vector_base=0x10000 if app_window is not None else 0)
 
 
 def main():
@@ -365,6 +420,8 @@ def main():
         sys.exit(1)
 
     emu.setup()
+    for address in args.trace_pcs:
+        emu.trace_pc(address)
     if args.snapshot_load:
         try:
             emu.load_snapshot(args.snapshot_load)

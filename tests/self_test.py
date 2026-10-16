@@ -1037,11 +1037,18 @@ TEST_CASES = [
     {
         # BK7231Q original Tuya firmware (MOES 1-gang relay). Plaintext image,
         # no key. Runs the full Tuya IoT SDK v2.3.1 - unlike the OpenBeken
-        # builds this is stock vendor firmware, and it boots far enough to
-        # enumerate the device's own GPIO/datapoint map, then init TCP/IP.
+        # builds this is stock vendor firmware. Its UART log goes quiet at the
+        # TCP/IP banner, so exact-PC checkpoints prove what the log cannot:
+        # tcpip_init returns, then the Wi-Fi supplicant and core tasks run.
+        # After that this factory-state unit waits normally for external
+        # manufacturing/provisioning input.
         "name": "BK7231Q Tuya MOES Relay Boot",
         "binary": os.path.join(ROOT_DIR, "firmwares", "BK7231Q_Tuya_MOES_Relay_WA2_1.1.3.bin"),
-        "args": ["--only-uart"],
+        "args": ["--only-uart",
+                 # Instruction immediately after tcpip_init().
+                 "--trace-pc", "0x52c48",
+                 # Entry points passed to xTaskCreate for wpas/core_thread.
+                 "--trace-pc", "0x4b0b8", "--trace-pc", "0x1283c"],
         "timeout": 120,
         "expected_strings": [
             "TUYA IOT SDK V:2.3.1",
@@ -1049,29 +1056,52 @@ TEST_CASES = [
             "oem_bk7321_bk_1_switch:1.1.3",
             # Device brings up its pin map (relay on pin 18, button on pin 6).
             "IO - relay[0]:",
-            "Initializing TCP/IP stack"
+            "Initializing TCP/IP stack",
+            # These are all past the final UART line. They distinguish a
+            # healthy external-input wait from a hang inside tcpip_init.
+            "[EMU_PC] reached 0x00052c48",
+            "[EMU_PC] reached 0x0004b0b8",
+            "[EMU_PC] reached 0x0001283c",
         ]
     },
     {
         # BL2028N is BK7231N silicon rebadged: this dump self-reports
         # "chip id=7231a device id=18520001" - the exact BK7231 default identity
-        # - so it runs with no -key and the default -chip. It is the ONLY test
-        # that reaches BLE/HCI bring-up, so it also guards the XVR fix on the
-        # BLE path. (Ordinary Tuya BL2028N dumps are plaintext; the Uascent
+        # - so it runs with no -key and the default -chip. The old version of
+        # this case stopped at rwble_hl_init: that is the hand-off to the
+        # RivieraWaves controller, not a completed boot. With --ble-core the
+        # controller supplies its FIQs and HCI completions, so the real fan app
+        # starts, publishes its BLE name and raises its Wi-Fi pairing AP. A
+        # virtual station joins that AP and proves the device's DHCP/IP side is
+        # alive too. (Ordinary Tuya BL2028N dumps are plaintext; the Uascent
         # Matter builds are custom-keyed and are intentionally not used here.)
-        "name": "BL2028N (=BK7231N) Boots to BLE init",
+        "name": "BL2028N Dreo fan clears BLE gate and serves its pairing AP",
         "binary": os.path.join(ROOT_DIR, "firmwares", "BL2028N_Dreo_DR-HTF004S_Fan_PAI-053.bin"),
-        "args": ["--only-uart"],
-        "timeout": 120,
+        "args": ["--only-uart", "--ble-core", "--wifi-peer", "auto",
+                 "--pcap", "{pcap}"],
+        "timeout": 180,
+        "tags": ["BLE", "BLE core", "FIQ"],
         "expected_strings": [
             # Proves BL2028N presents as BK7231N.
             "chip id=7231a device id=18520001",
             "calibration_main over",
-            # Reaches BLE host-stack init - deeper than any other case, and only
-            # possible because the XVR transaction register is modelled.
+            # The old endpoint. Everything below is on the far side of it.
             "rwble_hl_init ok",
-            "Initializing TCP/IP"
-        ]
+            "BLE Rev: B5-3.0.46-P0",
+            "gapm_cmp_evt:BLE_STACK_OK",
+            # The product application is alive and stages its own BLE identity.
+            "[BLE_ADV]   Complete Name",
+            "DREOtf04sbe",
+            "iot_uart_read begin",
+            # It then starts AP-mode provisioning; the virtual phone-side peer
+            # joins, receives a lease from the firmware and reaches its IP stack.
+            "[WIFI] device acts as an access point (it sends beacons): peer takes the station role",
+            "[WIFI] associated with 'DREOtf04sbe' (AID 1)",
+            "[NET] DHCP: we got 192.168.0.100/255.255.255.0 from the device (router 192.168.0.1)",
+            "[NET] ping reply from 192.168.0.1 (seq 1)",
+        ],
+        "pcap_expect": ["beacon", "authentication", "association request",
+                        "association response", "data", "DREOtf04sbe"],
     },
     {
         # Original Tuya TuyaMCU firmware (BLE+WiFi fan switch). This dump's
@@ -1367,41 +1397,56 @@ TEST_CASES = [
         # its being an unpaired dump parked in manufacturing test. That was
         # wrong: it was spinning on the RF-calibration register at 0x9000f8,
         # whose bit 31 the firmware sets and waits for the hardware to clear.
-        # With --xvr-selfclear it runs on - still in mf_test, but now actually
-        # driving its TuyaMCU link, which is what the last two markers show.
-        # The frame is Tuya's product-info query: 55 aa, version 00, command
-        # 01, zero length, checksum 00.
-        "name": "BK7231N Tuya TempHum Sensor Reads Protected Key and drives its TuyaMCU link",
+        # With --xvr-selfclear it reaches its TuyaMCU link.  It used to stop
+        # there repeatedly asking an absent MCU for product information.  The
+        # simulated MCU now answers with the exact 16-byte product id stored by
+        # this dump (the tempting 17-byte spelling printed by an older probe is
+        # rejected).  --ble-core then carries the accepted product through BLE
+        # service/advertisement setup, while the Wi-Fi peer supplies the MAC
+        # activity that advances the module to its working-mode query.
+        "name": "BK7231N Tuya TempHum Sensor accepts its MCU identity and starts BLE/Wi-Fi",
         "binary": os.path.join(ROOT_DIR, "firmwares",
                                "BK7231N_Tuya_TempHum_LCD_Sensor_TuyaMCU_2025-26-9.bin"),
-        "args": ["--only-uart", "--uart1-hex", "-key", "TUYA", "--xvr-selfclear"],
+        "args": ["--only-uart", "--uart1-hex", "-key", "TUYA", "--xvr-selfclear",
+                 "--ble-core", "--tuyamcu", "--tuyamcu-pid", "hwebffr1rcfvue3p",
+                 "--wifi-peer", "auto"],
         "timeout": 300,
+        "tags": ["BLE", "BLE core", "FIQ"],
         "expected_strings": [
             "key_addr: 0x1ee000",
             "get key:",
             "0x6b 0x24 0x0 0x73 0xf4 0x11 0x45 0xed 0x40 0xf1 0x9 0x9f 0x16 0xd3 0xb5 0xc0",
-            # Past the stall: the running app's periodic work, and real
-            # TuyaMCU bytes on UART1 (it sent 170 of these in one run).
-            "uart_wait_timeout_tm_cb",
-            ("[UART1/MCU] 55 aa 00 01 00 00 00", 3),
-        ]
+            "STACK INIT OK",
+            "[BLE_ADV]   Service Data",
+            "mf_init succ",
+            # The module asks, the peer answers, and the firmware validates the
+            # exact product id against protected storage.
+            "[UART1/MCU] 55 aa 00 01 00 00 00",
+            "wifi mcu init. pid:hwebffr1rcfvue3p",
+            "gw_cntl.gw_if.product_key:hwebffr1rcfvue3p, input:hwebffr1rcfvue3p",
+            "device_init succ",
+            "hwebffr1rcfvue3p  uuid=0xA201",
+            # Real forward progress beyond the old product-query retry loop.
+            "[UART1/MCU] 55 aa 00 02 00 01 00 02",
+        ],
+        "unexpected_strings": ["abi/pid/tp invalid", "len:33 err"],
     },
     {
-        # Stock Tuya smart plug (Tuya IoT SDK 2.3.3). A third, independent
-        # device covering the protected-key path at 0x1ee000 - it was picked at
-        # random from the dump corpus after that fix landed, so it checks the
-        # fix generalises rather than being tuned to the two devices that
-        # motivated it. Boots further than the sensor: reaches OEM config load
-        # and never drops into mf_test.
-        "name": "BK7231N Tuya Plug (SDK 2.3.3) Boots and Reads Protected Key",
+        # Stock BK7231N Tuya smart plug (SDK 2.3.3).  This used to run under the
+        # ambiguous BK7231T/U identity and hide a BLE lld.c:404 assertion behind
+        # shallow key/scan assertions. Selecting the real BK7231N silicon now
+        # instantiates its BLE 5.1 hardware automatically: no --ble-core or
+        # --xvr-selfclear escape hatch. The factory network is put on air so the
+        # real application proceeds through all five relay channels, metering,
+        # its scan result and production-mode entry.
+        "name": "BK7231N Tuya plug auto-models BLE and enters factory mode",
         "binary": os.path.join(ROOT_DIR, "firmwares",
                                "BK7231N_Tuya_Plug_TSL-PS-F4U-01-W_1.1.17.bin"),
-        # --xvr-selfclear: like the two above, this dump stopped at the
-        # RF-calibration spin at 0x9000f8 shortly after the key read. Past it
-        # the radio comes up and the firmware starts scanning, which the last
-        # marker shows.
-        "args": ["--only-uart", "--uart1-hex", "-key", "TUYA", "--xvr-selfclear"],
-        "timeout": 300,
+        "args": ["--only-uart", "--uart1-hex", "-key", "TUYA",
+                 "-chip", "BK7231N", "--wifi-peer", "auto",
+                 "--wifi-ssid", "tuya_mdev_test1", "--pcap", "{pcap}"],
+        "timeout": 120,
+        "tags": ["BLE", "BLE core", "FIQ"],
         "expected_strings": [
             "< TUYA IOT SDK V:2.3.3 BS:40.00_PT:2.2_LAN:3.4_CAD:1.0.5_CD:1.0.0 >",
             "IOT DEFS < WIFI_GW:1 DEBUG:1 KV_FILE:0 SHUTDOWN_MODE:0 LITTLE_END:1 TLS_MODE:2",
@@ -1414,8 +1459,27 @@ TEST_CASES = [
             "key_addr: 0x1ee000",
             "get key:",
             "0xe7 0x10 0xac 0x15 0x88 0x2b 0x38 0x50 0xb2 0x9a 0xd 0xfa 0x35 0xbe 0x99 0x37",
+            # Automatic hardware, not an opt-in workaround: HCI completes,
+            # the host creates its database and advertising reaches state 7.
+            "ble sdk re_inited",
+            "ty bt sdk init success finish",
+            "gapm_cmp_evt:BLE_STACK_OK",
+            "CREATE DB OK",
+            "adv_state:7",
+            # The actual plug application is alive beyond generic SDK setup.
+            "mf_init succ",
+            "channel 4 Init ok",
+            "tuya_ele_hw_init success",
+            "app_init finished",
+            # Seeing the factory SSID is the production-test trigger; this
+            # firmware intentionally does not associate with it.
+            "current product ssid name:tuya_mdev_test1",
             "scan_start_req_handler",
-        ]
+            "Scan completed in",
+            "enter prod mode",
+        ],
+        "unexpected_strings": ["lld.c:404", "ASSERTION FAILED"],
+        "pcap_expect": ["beacon", "probe request", "probe response", "tuya_mdev_test1"],
     },
     {
         # BK7231N "zmai90" energy meter built around an RN8209C metering chip on
@@ -2582,6 +2646,330 @@ TEST_CASES = [
                         "association response", "data", "DOM-1", "m3-eu"],
         "ip_pcap_expect": ["m3-eu", "lifeaiot"],
         "expected_pins": {0: 0x78, 1: 0x78, 8: 0x3C, 9: 0x3C, 10: 0x78, 11: 0x78, 26: 0x02},
+    },
+    {
+        # Stock BK7231T BN-LINK metering plug from FlashDumps.  This older
+        # application is useful because it exercises the 2.0.0 SDK line and
+        # initializes its own relay/energy-meter service after protected-flash
+        # recovery, rather than stopping at generic Tuya platform startup.
+        "name": "BK7231T Tuya BN-LINK WB2S metering plug boots its relay application",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231T_Tuya_BN-LINK_Plug_WB2S_1.0.3.bin"),
+        "args": ["--only-uart", "-key", "TUYA"],
+        "timeout": 180,
+        "expected_strings": [
+            "< TUYA IOT SDK V:2.0.0 BS:30.06_PT:2.2_LAN:3.3_CAD:1.0.2_CD:1.0.0 >",
+            "oem_bk7231s_dltj:1.0.3",
+            ",module: is WB2S",
+            "have actived over 15 min, not enter mf_init",
+            "mf_init succ",
+            "gw_cntl.gw_if.product_key:keym9qkuywghyrvs, input:keym9qkuywghyrvs",
+            "dltj_run_int",
+            "channel 0 Init ok",
+            "CREATE DB SUCCESS",
+        ],
+    },
+    {
+        # Stock one-gang WB3S-IPEX wall switch from FlashDumps.  Its SDK 1.0.1
+        # application exposes the board map in its own UART output, providing
+        # stable evidence that the recovered user configuration reaches the
+        # relay/button/Wi-Fi LED hardware table.
+        "name": "BK7231T Tuya one-gang WB3S-IPEX switch loads its hardware map",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231T_Tuya_1G_Switch_WB3S-IPEX_1.0.4.bin"),
+        "args": ["--only-uart", "-key", "TUYA"],
+        "timeout": 180,
+        "expected_strings": [
+            "< TUYA IOT SDK V:1.0.1 BS:40.00_PT:2.2_LAN:3.3_CAD:1.0.2_CD:1.0.0 >",
+            "oem_bk7231s_rnd_zero_dctrl_switch:1.0.4",
+            "module:WB3S-IPEX",
+            "gw_cntl.gw_if.product_key:key7axydcvmea3x9, input:key7axydcvmea3x9",
+            "Channel [0] config !!!",
+            "IO - relay[0]:\tpin-6\ttype high",
+            "IO - button[0]:\tpin-7\ttype low",
+            "IO - wifi_stat:\tpin-10\ttype high",
+            "CREATE DB SUCCESS",
+            "appm start advertising",
+        ],
+    },
+    {
+        # Stock LSC GLS A60 RGB+CCT bulb from FlashDumps.  It uses a recent
+        # BK7231N TuyaOS lighting stack and an external five-channel driver.
+        # --ble-core is justified by the observed gates: without it boot stops
+        # after printing the BLE MAC.  The first model reached Tuya's HCI
+        # callback registration but then spun on the separate link-layer
+        # RWBLECNTL at +0x800.  The 5.1 model now owns that register and clears
+        # its hardware-completed reset commands, allowing the second link-layer
+        # init, application startup, advertising and Wi-Fi scan to run.
+        "name": "BK7231N Tuya LSC GLS A60 CBLC5 clears BLE reset and starts its application",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231N_Tuya_LSC_GLS_A60_CBLC5_1.6.0.bin"),
+        "args": ["--only-uart", "-key", "TUYA", "--ble-core"],
+        "timeout": 180,
+        "tags": ["BLE", "BLE core", "FIQ"],
+        "expected_strings": [
+            "BleSwitch=1",
+            "first bright up",
+            "mf_init succ",
+            "< TuyaOS V:3.3.44 BS:40.00_PT:2.3_LAN:3.5_CAD:1.0.5_CD:1.0.0 >",
+            "oem_bk7231n_light_ty:1.6.0",
+            "wifi soc init. pid:key8u54q9dtru5jw firmwarekey:key8u54q9dtru5jw ver:1.6.0",
+            "gw_cntl->gw_if.product_key:key8u54q9dtru5jw, input:key8u54q9dtru5jw",
+            "enter success_proc",
+            "ffc remote OK",
+            "BLE IP Rev: 76f0dd2",
+            "tkl_hci_callback_register",
+            ("llm_init:312", 2),
+            "ble sdk re_inited",
+            "ty bt sdk init success finish",
+            "app_init finished",
+            "wpa_supplicant_req_scan",
+            "[BLE_ADV] EM 0x00910000",
+            "Start Adv",
+            "ble adv && resp changed",
+        ],
+    },
+    {
+        # A factory-state CB3S carrying Tuya's IR-box application.  This was
+        # originally classified as stuck at scan_start_req_handler and covered
+        # with two manual peripheral flags.  Under its real BK7231N identity,
+        # BLE hardware is selected automatically and the stock image proceeds
+        # through SoftAP setup into the MAC's monitor mode.  wifi_stat:1 is the
+        # final callback printed by this exact image on real hardware too; the
+        # capture additionally proves it keeps transmitting its unusual raw
+        # authentication frame with the vendor payload "filter" while it waits.
+        "name": "BK7231N Tuya CB3S IR module reaches production-monitor endpoint",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231N_Tuya_CB3S_Factory_Module.bin"),
+        "args": ["--only-uart", "-key", "TUYA", "-chip", "BK7231N",
+                 "--wifi-peer", "auto", "--wifi-ssid", "tuya_mdev_test1",
+                 "--pcap", "{pcap}"],
+        "timeout": 90,
+        "tags": ["BLE", "BLE core", "FIQ", "WiFi MAC"],
+        "expected_strings": [
+            "oem_bk7231n_irbox_mol_ty:1.2.1",
+            "rwble_hl_init ok",
+            ("gapm_cmp_evt:GAPM_GEN_RAND_NB", 2),
+            "gapm_cmp_evt:BLE_STACK_OK",
+            "CREATE DB SUCCESS",
+            "[BLE_ADV]   Service Data",
+            "uuid=0xA201",
+            "mf_init succ",
+            "ir_send =7",
+            "ir_recv =8",
+            "gw_cntl.gw_if.product_key:key54vrth5askhsj, input:key54vrth5askhsj",
+            "ty_uart_ir_main_components_version:1.0.9",
+            "app_init finished",
+            "scan_start_req_handler",
+            "Soft_AP_start",
+            "hal_machw_enter_monitor_mode",
+            "wifi_stat:1",
+        ],
+        "unexpected_strings": ["assert_param", "lld.c:404", "ASSERTION FAILED"],
+        "pcap_expect": ["beacon", "probe request", "probe response", "authentication",
+                        "tuya_mdev_test1", "filter"],
+    },
+    {
+        # Factory-state one-channel CB3S switch (board marking 72-087).  Like
+        # the preceding SDK 2.x image it needs both XVR busy-bit clearing and
+        # the BLE controller model.  Its old endpoint was only the scan request;
+        # putting the factory SSID on the emulated air makes the real firmware
+        # measure it and enter product-test mode.
+        "name": "BK7231N Tuya 72-087 CB3S switch finds factory network and enters product test",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231N_Tuya_72-087.bin"),
+        "args": ["--only-uart", "-key", "TUYA", "--xvr-selfclear", "--ble-core",
+                 "--wifi-peer", "auto", "--wifi-ssid", "tuya_mdev_test1",
+                 "--pcap", "{pcap}"],
+        "timeout": 90,
+        "tags": ["BLE", "BLE core", "FIQ"],
+        "expected_strings": [
+            "< TUYA IOT SDK V:2.3.3 BS:40.00_PT:2.2_LAN:3.4_CAD:1.0.5_CD:1.0.0 >",
+            "oem_bk7231n_dctrl_switch:1.3.5",
+            ("gapm_cmp_evt:GAPM_GEN_RAND_NB", 2),
+            "gapm_cmp_evt:BLE_STACK_OK",
+            "CREATE DB OK",
+            "[ble_appm_start_advertising]",
+            "mf_init succ",
+            "module:CB3S",
+            "channel init success",
+            "app_init finished",
+            "current product ssid name:tuya_mdev_test1",
+            "scan_start_req_handler",
+            "The current rssi is -45dB",
+            "product test mode",
+        ],
+        "unexpected_strings": ["assert_param"],
+        "pcap_expect": ["beacon", "probe request", "probe response", "tuya_mdev_test1"],
+    },
+    {
+        # Plaintext BK7238 dump from a GBDQA protection switch.  It carries a
+        # bistable relay (separate on/off coils) and metering configuration.
+        # The old case stopped at app_init immediately before the paired unit's
+        # network/BLE/application path.  The 5.2 controller and virtual network
+        # now take it through HCI sync, metering start, its stored-network join
+        # and the first TLS-PSK cloud handshake.
+        "name": "BK7238 Tuya GBDQA protection switch starts metering, BLE and cloud TLS",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7238_GBDQA_63V_16A.bin"),
+        "args": ["--only-uart", "-chip", "BK7238", "--ble-core",
+                 "--wifi-peer", "auto"],
+        "timeout": 240,
+        "tags": ["BLE", "BLE core", "FIQ"],
+        "expected_strings": [
+            "device_id=0x21128000",
+            "< TuyaOS V:3.11.16 BS:40.00_PT:2.3_LAN:3.5_CAD:1.0.5_CD:1.0.0 >",
+            "oem_t1_cutout_self_switch:1.1.0",
+            ",module: is T1-U",
+            ",over_cur: is 63000",
+            ",rl_on1_pin: is 8",
+            ",rl_off1_pin: is 6",
+            ",bt1_pin: is 17",
+            ",led1_pin: is 21",
+            "product have measure , chip is 3",
+            "key_addr: 0x1f5000",
+            "calibration_main over",
+            "app_init finished",
+            "mf_init succ",
+            "channel 0 Init ok",
+            "tuya_ele_hw_init success",
+            "initial BLE...",
+            "rwip_heap_env addr:",
+            "enter normal mode",
+            "ty bt sdk init success finish",
+            "dltj start success",
+            "tuya_measure_chip ok",
+            "connect to mqtt broker mqtts://m3.tuyacn.com:8886 port 8886",
+            "pre-shared key identity: 49 bytes",
+        ],
+    },
+    {
+        # Plaintext BK7238 dump from a three-channel PCIe remote-boot card.
+        # The old endpoint stopped after the board map.  With the 5.2
+        # controller and a station on the emulated air, the real firmware also
+        # starts its Tuya BLE service and open pairing AP, leases an address and
+        # answers the station's ping.
+        "name": "BK7238 Tuya T1-U PCIe card serves its BLE/Wi-Fi pairing interfaces",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7238_Tuya_T1U_PCIE_RemoteBoot.bin"),
+        "args": ["--only-uart", "-chip", "BK7238", "--ble-core",
+                 "--wifi-peer", "auto", "--pcap", "{pcap}"],
+        "timeout": 180,
+        "tags": ["BLE", "BLE core", "FIQ"],
+        "expected_strings": [
+            "device_id=0x21128000",
+            "< TuyaOS V:3.11.16 BS:40.00_PT:2.3_LAN:3.5_CAD:1.0.5_CD:1.0.0 >",
+            "name:t1_kaijika:1.0.4",
+            ",module: is CBU",
+            ",ch_num: is 3",
+            ",zero_io_pin: is 24",
+            ",bt1_pin: is 21",
+            ",bt2_pin: is 8",
+            "mf_init successfully",
+            "channel 0 Init ok",
+            "channel 1 Init ok",
+            "channel 2 Init ok",
+            "wifi soc init. pid:jlicasd8h9mzckrz firmwarekey:NULL ver:1.0.4",
+            "enter success_proc",
+            "device_init ok",
+            "ssid:SmartLife-D1BF, key:, channel: 6",
+            "BLE HCI Version = 11",
+            "Stack sync",
+            "[BLE_ADV]   Service Data",
+            "jlicasd8h9mzckrz  uuid=0xFD50",
+            "ble adv updated",
+            "[WIFI] associated with 'SmartLife-D1BF' (AID 1)",
+            "[NET] DHCP: we got 192.168.176.100/255.255.255.0 from the device (router 192.168.176.1)",
+            "[NET] ping reply from 192.168.176.1 (seq 1)",
+        ],
+        "pcap_expect": ["beacon", "authentication", "association request",
+                        "association response", "data", "SmartLife-D1BF"],
+    },
+    {
+        # Full 2 MiB BK7252N camera flash.  This third-party RT-Thread image
+        # brings up its Xiongmai camera application, restores device config,
+        # publishes its local status and finally takes the battery sleep path.
+        "name": "BK7252N Xiongmai camera restores config and enters deep sleep",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7252N_Camera_7252N.bin"),
+        "args": ["--only-uart", "-chip", "BK7252N"],
+        "timeout": 60,
+        "expected_strings": [
+            "RT-Thread Flash Abstraction Layer (V0.4.0) initialize success.",
+            "ROMFS File System initialized!",
+            "Enter normal mode...",
+            "bk_wlan_app_init finished",
+            "rf_thread_init ok",
+            "xc_main, sw_ver=3.00.21.01_250723!",
+            "button node have Button1",
+            "button node have Button2",
+            "---adc channel:0---",
+            "return xdev_opt, magic=11223344",
+            "IOTSDK Ver = 3.00.42.01_241230",
+            "power status is off, wait to power on",
+            "wake up time out to enter deep sleep",
+            "---enter_deep sleep",
+            "---enter deep sleep :wake up with gpio 0~31 ps: 0x2020 0x20",
+        ],
+    },
+    {
+        # Stock three-gang WB3S wall-switch image.  Besides exercising the
+        # older Tuya 1.0.x BLE path, this verifies every relay, button and LED
+        # in a multi-channel board map before the application begins scanning.
+        "name": "BK7231T Tuya three-gang WB3S switch initializes every channel",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231T_Tuya_3CH_Light_Switch_WB3S_1.0.7.bin"),
+        "args": ["--only-uart", "-key", "TUYA"],
+        "timeout": 90,
+        "expected_strings": [
+            "< TUYA IOT SDK V:1.0.2 BS:40.00_PT:2.2_LAN:3.3_CAD:1.0.2_CD:1.0.0 >",
+            "oem_bk7231s_rnd_zero_dctrl_switch:1.0.7",
+            "STACK INIT OK",
+            "CREATE DB SUCCESS",
+            "appm start advertising",
+            "mf_init succ",
+            "module:WB3S",
+            "ch_num:3",
+            "IO - relay[0]:\tpin-6\ttype high",
+            "IO - button[0]:\tpin-24\ttype low",
+            "IO - led[0]:\tpin-14\ttype high",
+            "IO - relay[1]:\tpin-9\ttype high",
+            "IO - button[1]:\tpin-10\ttype low",
+            "IO - led[1]:\tpin-26\ttype high",
+            "IO - relay[2]:\tpin-7\ttype high",
+            "IO - button[2]:\tpin-8\ttype low",
+            "IO - led[2]:\tpin-23\ttype high",
+            "device_init ok",
+            "scan_start_req_handler",
+        ],
+    },
+    {
+        # Plaintext BL2028N firmware from a Dogness D07 water fountain.  The
+        # BLE core is required for its host stack to publish the product name;
+        # the app then restores the pump, level and RGB controller state.
+        "name": "BL2028N Dogness D07 water fountain starts BLE and water controls",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BL2028N_Dogness_D07_WaterFountain_5.0.38.bin"),
+        "args": ["--only-uart", "--ble-core"],
+        "timeout": 60,
+        "tags": ["BLE", "BLE core", "FIQ"],
+        "expected_strings": [
+            "SDK Rev: 3.0.46",
+            "chip id=7231a device id=18520001",
+            "rwble_hl_init ok",
+            "gapm_cmp_evt:BLE_STACK_OK",
+            "[BLE_ADV]   Complete Name",
+            "DNS_D07_410B8E",
+            "5.0.38",
+            "ap_ssid:DNS_D07_410B8E",
+            "water_hight     1",
+            "water_mode      1",
+            "RGB mode        2",
+            "RGB color       00FF00",
+            "myconfig.water.water_sw  1",
+            "JK_GET_WATER_VALUE 0",
+        ],
+        "unexpected_strings": ["lld.c:404"],
     }
 ]
 
@@ -2590,6 +2978,51 @@ TEST_CASES = [
 # comments there document specific assertion strings for maintainers, while
 # these summarise each test for the HTML report's expandable description.
 DESCRIPTIONS = {
+    "BK7231T Tuya BN-LINK WB2S metering plug boots its relay application":
+        "A newly added stock BN-LINK WB2S metering-plug dump on Tuya SDK 2.0.0. It recovers its "
+        "protected configuration, validates the licensed product key, initializes the dltj energy-"
+        "meter service and relay channel, and brings the BLE database up successfully.",
+    "BK7231T Tuya one-gang WB3S-IPEX switch loads its hardware map":
+        "A newly added stock one-gang wall-switch dump on Tuya SDK 1.0.1. Its recovered board "
+        "configuration is consumed by the application and maps the relay, physical button and "
+        "Wi-Fi status LED to the expected pins before BLE advertising starts.",
+    "BK7231N Tuya LSC GLS A60 CBLC5 clears BLE reset and starts its application":
+        "A stock LSC RGB+CCT bulb on TuyaOS 3.3.44 that previously spun after HCI callback "
+        "registration on the BK7231N BLE 5.1 link-layer reset bit. The model now completes that "
+        "hardware reset, so the firmware reinitializes the BLE SDK, finishes its application, "
+        "starts advertising from exchange memory and begins Wi-Fi scanning.",
+    "BK7231N Tuya CB3S IR module reaches production-monitor endpoint":
+        "A factory CB3S dump carrying Tuya's IR-box application. Its real BK7231N identity "
+        "selects BLE hardware automatically, with no BLE/XVR workaround flags. The stock image "
+        "completes GAPM and advertising, initializes its IR services, starts its SoftAP, enters "
+        "the MAC's monitor mode and reaches the same wifi_stat:1 endpoint observed on hardware. "
+        "Its capture proves the production beacon/probe exchange and the firmware's periodic raw "
+        "authentication frame carrying the vendor payload 'filter'.",
+    "BK7231N Tuya 72-087 CB3S switch finds factory network and enters product test":
+        "A factory-state CB3S one-channel switch that previously stopped at its scan request. "
+        "The emulated air now supplies the exact Tuya manufacturing SSID; the stock firmware "
+        "measures its RSSI and takes the real product-test branch.",
+    "BK7238 Tuya GBDQA protection switch starts metering, BLE and cloud TLS":
+        "A paired BK7238 GBDQA protection switch that previously stopped at app_init. With its "
+        "BLE 5.2 controller and network peer active, it synchronizes the host stack, starts the "
+        "bistable relay and metering application, rejoins its stored network and emits the first "
+        "TLS-PSK cloud handshake.",
+    "BK7238 Tuya T1-U PCIe card serves its BLE/Wi-Fi pairing interfaces":
+        "A three-channel BK7238 PCIe remote-boot card that previously stopped after loading its "
+        "board map. It now completes BLE 5.2 startup, publishes its Tuya service, raises the open "
+        "SmartLife pairing AP, leases an address to the virtual station and answers its ping.",
+    "BK7252N Xiongmai camera restores config and enters deep sleep":
+        "A newly added full-flash BK7252N camera image running RT-Thread and Xiongmai's camera "
+        "stack. It initializes flash and ROMFS, brings up WLAN/RF, restores persisted device "
+        "configuration, starts both buttons and the battery ADC, then follows its timed deep-sleep path.",
+    "BK7231T Tuya three-gang WB3S switch initializes every channel":
+        "A newly added stock BK7231T three-gang WB3S wall-switch dump on Tuya SDK 1.0.2. It "
+        "completes the classic BLE database and advertising path, restores its three-channel board "
+        "map and verifies every relay, button and status LED before device and Wi-Fi initialization.",
+    "BL2028N Dogness D07 water fountain starts BLE and water controls":
+        "A newly added plaintext BL2028N Dogness D07 smart water-fountain dump. With the BLE core "
+        "modeled, it completes controller and host initialization, advertises its product name, "
+        "starts its local AP and restores the configured water-level, pump and RGB-control state.",
     "CLI: invalid -key is rejected":
         "A bad -key value must be rejected up front by parse_key(), with a message naming the "
         "accepted forms (a known key name, 32 hex chars, or base64 of 16 bytes), rather than "
@@ -2789,10 +3222,14 @@ DESCRIPTIONS = {
         "A real 4MB Sonoff flash dump on BK7238. Exercises the SPI flash mirror and the XVR "
         "peripheral through the vendor SDK boot to calibration / normal-mode markers.",
     "BK7231Q Tuya MOES Relay Boot":
-        "A Tuya BK7231Q relay dump booting the Tuya IoT SDK through TCP/IP stack initialisation.",
-    "BL2028N (=BK7231N) Boots to BLE init":
-        "A BL2028N (a BK7231N-class part) fan dump booting to BLE stack init (rwble_hl_init), "
-        "covering the BLE-capable boot path.",
+        "A Tuya BK7231Q relay dump that initializes its GPIO/datapoint map, returns from TCP/IP "
+        "stack initialization and actually schedules the Wi-Fi supplicant and core tasks before "
+        "waiting normally for external manufacturing/provisioning input.",
+    "BL2028N Dreo fan clears BLE gate and serves its pairing AP":
+        "A BL2028N (BK7231N-class) Dreo fan dump that used to stop at the BLE-controller "
+        "handoff. With the BLE core model enabled, the stock firmware completes HCI setup, "
+        "publishes its DREO BLE name, starts its open provisioning AP, leases an address to the "
+        "virtual station and answers its ping.",
     "Tuya TMWF02 TuyaMCU Boots past crypto accel":
         "A stock Tuya fan-switch dump. Boots past the 0x810000 crypto-accelerator stall into the "
         "BLE host stack and network-config advertising.",
@@ -2876,14 +3313,16 @@ DESCRIPTIONS = {
         "included to show the announcement is readable because every Tuya device encrypts it with "
         "the same key, not because of anything special about the meter. What it announces matches "
         "the product key passed on the command line, which rules out rubbish that merely parses.",
-    "BK7231N Tuya TempHum Sensor Reads Protected Key and drives its TuyaMCU link":
-        "The stock Tuya temp/humidity sensor that first exposed the protected-key bug. With blank "
-        "flash it failed the AES magic check and dropped to mf_test; serving the dump's real bytes "
-        "lets it decrypt its key (get key).",
-    "BK7231N Tuya Plug (SDK 2.3.3) Boots and Reads Protected Key":
-        "A stock Tuya smart plug (SDK 2.3.3), picked at random after the protected-key fix to check "
-        "it generalises. Boots past SDK init and OEM config, reading its protected key; never drops "
-        "into mf_test.",
+    "BK7231N Tuya TempHum Sensor accepts its MCU identity and starts BLE/Wi-Fi":
+        "The stock Tuya temp/humidity sensor that formerly looped forever on product-info queries "
+        "to its absent companion MCU. The simulated MCU supplies the exact product identity from "
+        "the dump; firmware validates it, initializes the device and BLE service, then advances to "
+        "its working-mode query while Wi-Fi MAC activity is present.",
+    "BK7231N Tuya plug auto-models BLE and enters factory mode":
+        "A stock five-channel Tuya plug on SDK 2.3.3. Selecting its real BK7231N silicon now "
+        "provides BLE 5.1 hardware automatically, without BLE/XVR workaround flags; the firmware "
+        "completes HCI, database and advertising setup, initializes every relay plus metering, "
+        "sees the emulated factory network and takes its production-mode branch.",
     "BK7231N Tuya BEOK Thermostat (TuyaOS 3.11.12) sends TuyaMCU heartbeats":
         "A paired BEOK TOL47WIFI-WP-WF thermostat running TuyaOS 3.11.12 - a newer SDK line than "
         "the Ettroit case, and one that never prints \"have actived\" yet still skips manufacturing "

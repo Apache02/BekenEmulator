@@ -69,9 +69,9 @@ def _tuya_html(r):
     """Two columns: the raw stored record, and a plain-language reading of it."""
     cfg = r.get("tuya_config")
     if not cfg:
-        return ('<p class="empty">No Tuya <code>user_param_key</code> record found in this dump. '
-                'Newer firmware encrypts its KV storage with a per-device key, so the block is '
-                'only recoverable from images that keep it in plaintext.</p>')
+        return ('<p class="empty">No recoverable Tuya configuration record was found in this '
+                'dump. It may not be a Tuya image, may omit the storage area, or may use an '
+                'unsupported storage format.</p>')
     rows = "".join(
         '<tr><td><code>%s</code></td><td><code>%s</code></td></tr>'
         % (html.escape(k), html.escape(v)) for k, v in cfg["pairs"])
