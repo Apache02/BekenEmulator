@@ -335,7 +335,7 @@ def build_emulator(dump_path, key=None, chip="BK7231", with_boot=False, only_uar
         app = extract_and_decrypt(flash_data, "app", key)
         physical_data = raw_data
 
-    if app and save_decrypted:
+    if app and save_decrypted and not os.environ.get("EMU_REPORT"):
         with open("app_decrypted.bin", "wb") as f:
             f.write(app)
 

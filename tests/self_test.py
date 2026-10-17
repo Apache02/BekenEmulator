@@ -3008,6 +3008,1300 @@ TEST_CASES = [
             "JK_GET_WATER_VALUE 0",
         ],
         "unexpected_strings": ["lld.c:404"],
+    },
+    {
+        # Plaintext BK7231M dump from a VeSync/Aubess BSD33 (BSDOG02) EU smart
+        # plug on SDK 3.0.56.  Checks SCTRL chip/device ID (requires BK7231N
+        # silicon identity) and uses SARADC_ADC_CTRL_CFG bit 8 during
+        # calibration_main before bringing up FlashDB, BLE 5.1 advertising,
+        # pwm_new metering capture and Wi-Fi scanning.
+        "name": "BK7231M VeSync Aubess BSD33 BSDOG02 plug (SDK 3.0.56) calibrates, advertises BLE and scans",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231M_VeSync_Aubess_BSD33_BSDOG02_Plug_1.0.01.bin"),
+        "args": ["--only-uart", "-chip", "BK7231N"],
+        "timeout": 90,
+        "tags": ["BLE", "BLE core", "FIQ"],
+        "expected_strings": [
+            "FlashDB V1.1.2 is initialize success",
+            "chip id=7231c device id=20521023",
+            "calibration_main over",
+            "rwble_hl_init ok",
+            ("gapm_cmp_evt:GAPM_GEN_RAND_NB", 2),
+            "gapm_cmp_evt:BLE_STACK_OK",
+            "[THD]ves_ble",
+            "company=0x06D0",
+            "ff d0 06 01 d3 cf b8 4a 58 fc",
+            "Device model: BSDOG02",
+            "Vesync SDK version: v1.2.1-1d1881fe",
+            "Firmware version: 1.0.01",
+            "REG_PWM_GROUP_CTRL= 0x1c14",
+            "[THD]ves_netcfg",
+            "wpa rx E SCAN_STARTED",
+        ],
+        "unexpected_strings": ["Unsupported chip or dev", "lld.c:404"],
+    },
+    {
+        # Newer 1.0.02 revision of the VeSync GreenSun WHOGPLUG EU smart plug
+        # on SDK 3.0.56 (afc66d1).  Unlike 1.0.01 (SDK 3.0.35), 1.0.02 enforces
+        # bk_check_chip_id for BK7231N silicon and runs the 0x802c08 SARADC
+        # trigger path in calibration_main.
+        "name": "BK7231M VeSync WHOGPLUG Plug 1.0.02 (SDK 3.0.56) calibrates, advertises BLE and scans",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231M_VeSync_GreenSun_WHOGPLUG_Plug_1.0.02.bin"),
+        "args": ["--only-uart", "-chip", "BK7231N"],
+        "timeout": 90,
+        "tags": ["BLE", "BLE core", "FIQ"],
+        "expected_strings": [
+            "SDK Rev: 3.0.56 afc66d1",
+            "FlashDB V1.1.2 is initialize success",
+            "chip id=7231c device id=20521023",
+            "calibration_main over",
+            "ble mac:fc-58-4a-a1-d3-c3",
+            "rwble_hl_init ok",
+            ("gapm_cmp_evt:GAPM_GEN_RAND_NB", 2),
+            "gapm_cmp_evt:BLE_STACK_OK",
+            "company=0x06D0",
+            "ff d0 06 01 c3 d3 a1 4a 58 fc",
+            "Device model: WHOGPLUG",
+            "Vesync SDK version: v1.2.1-03528e63",
+            "Firmware version: 1.0.02",
+            "REG_PWM_GROUP_CTRL= 0x1c14",
+            "[THD]ves_netcfg",
+            "wpa rx E SCAN_STARTED",
+        ],
+        "unexpected_strings": ["Unsupported chip or dev", "lld.c:404"],
+    },
+    {
+        # Plaintext BK7231M dump from a China Mobile HeJiaQin (HuiJu X1S) CB2S
+        # smart metering plug on SDK 3.0.56.  Enforces bk_check_chip_id for
+        # BK7231N, initializes BLE 5.1, loads its factory burninfo (CMEI/SN/MAC)
+        # and looks for the factory calibration AP 'JX-ChanCe-M2'; with that
+        # SSID on the emulated air it associates, gets DHCP and starts BL0937B
+        # energy-meter calibration.
+        "name": "BK7231M ChinaMobile HeJiaQin X1S plug joins JX-ChanCe-M2 and starts BL0937 calibration",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231M_ChinaMobile_HeJiaQin_HuiJu_X1S_Plug_CB2S_1.0.4.bin"),
+        "args": ["--only-uart", "-chip", "BK7231N",
+                 "--wifi-peer", "auto", "--wifi-ssid", "JX-ChanCe-M2"],
+        "timeout": 90,
+        "tags": ["BLE", "BLE core", "FIQ", "WiFi MAC"],
+        "expected_strings": [
+            "SDK Rev: 3.0.56 fa12785",
+            "chip id=7231c device id=20521023",
+            "calibration_main over",
+            "rwble_hl_init ok",
+            ("gapm_cmp_evt:GAPM_GEN_RAND_NB", 2),
+            "gapm_cmp_evt:BLE_STACK_OK",
+            "======>> INIT COMPLETE",
+            "Prod: 1, Version: 1.0.4",
+            "burninfo.cmei: 111092600037589",
+            "burninfo.sn: 1716059038400037588",
+            "burninfo.wifimac: bc-fd-0c-8e-3f-78",
+            "[WIFI] station bc:fd:0c:8e:3f:78 associated to 'JX-ChanCe-M2'",
+            "[NET] DHCP: device bc:fd:0c:8e:3f:78 got 192.168.1.100",
+            "connect JX-ChanCe-M2 success",
+            "find m2 ssid",
+            "do m2 cali",
+            "cali, p_ref: 870, v_ref: 2200, i_ref: 395, e_ref: 272",
+            "bl0937 cali start",
+        ],
+        "unexpected_strings": ["Unsupported chip or dev", "lld.c:404"],
+    },
+    {
+        # 4 MB BK7231M dump from a SparkleIoT XH-CB2S Mini Switch running a
+        # Quectel Matter application (svc_matter_main.cpp) on Beken SDK 3.0.56.
+        # Emits its Beken OS boot banner on UART1 and its Matter stack startup
+        # lines on UART2.
+        "name": "BK7231M SparkleIoT XH-CB2S Matter mini switch boots into Matter init",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231M_SparkleIoT_XH-CB2S_Mini_Switch.bin"),
+        "args": ["--only-uart", "-chip", "BK7231N"],
+        "timeout": 60,
+        "expected_strings": [
+            "SDK Rev: 3.0.56 ee14ae7f",
+            "OSK Rev: F-3.0.35 ee14ae7f",
+            "going Chip",
+            "chip[DL][svc_matter_main.cpp:403] ql_NetCfgInitAndCalcuate",
+            "chip[DL][svc_matter_main.cpp:406] ql_LoadLogFlag",
+            "init success",
+        ],
+        "unexpected_strings": ["Unsupported chip or dev"],
+    },
+    {
+        # Paired BK7231Q MOES 1-gang relay dump captured with fsw_cnt_key=2 in
+        # flash.  On first boot it increments to 3, triggers Tuya's 3x power-
+        # cycle factory reset via watchdog reboot, clears fsw_cnt_key to 0 in
+        # flash, and on the second boot completes SARADC temperature calibration
+        # (requiring SOC_BK7231 FIFO_EMPTY bit 28), starts its beacon/EZ monitor
+        # mode and reaches wifi_stat:1.
+        "name": "BK7231Q Tuya MOES Relay 1.1.3-2 completes 3x-reset WDT reboot and enters EZ pairing",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231Q_Tuya_MOES_Relay_WA2_1.1.3-2.bin"),
+        "args": ["--only-uart", "--wifi-peer", "auto"],
+        "timeout": 90,
+        "tags": ["WDT", "WiFi MAC"],
+        "expected_strings": [
+            "oem_bk7321_bk_1_switch:1.1.3",
+            'read uf buf {"fsw_cnt_key":2}',
+            "rst_cnt:[3]",
+            "onoff cnt is ok! reset device..",
+            "[WDT] watchdog expired; device reset #1",
+            'read uf buf {"fsw_cnt_key":0}',
+            "rst_cnt:[1]",
+            "serial_no:68572db62696",
+            "gw_cntl.gw_if.product_key:keys83qyuhuqrdn7, input:keys83qyuhuqrdn7",
+            "device_init ok",
+            "temp in flash is:315",
+            "scan_start_req_handler",
+            "hal_machw_enter_monitor_mode",
+            "wifi_stat:1",
+        ],
+    },
+    {
+        # Factory-state BK7231Q MOES WA2 1-gang relay on Tuya IoT SDK 2.0.0
+        # (firmware 1.0.6).  With SOC_BK7231 SARADC FIFO_EMPTY (bit 28) served
+        # on 0x802c00 and the factory SSID on the virtual air, it clears
+        # saradc_flush(), scans tuya_mdev_test1, measures RSSI -45 dB and enters
+        # product test mode.
+        "name": "BK7231Q Tuya MOES Relay 1.0.6 (SDK 2.0.0) scans factory SSID and enters product test",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231Q_Tuya_MOES_Relay_WA2_1.0.6.bin"),
+        "args": ["--only-uart", "--wifi-peer", "auto",
+                 "--wifi-ssid", "tuya_mdev_test1"],
+        "timeout": 90,
+        "tags": ["WiFi MAC"],
+        "expected_strings": [
+            "< TUYA IOT SDK V:2.0.0 BS:30.01_PT:2.2_LAN:3.3_CAD:1.0.1_CD:1.0.0 >",
+            "oem_bk7321_bk_1_switch:1.0.6",
+            "IO - relay[0]:\tpin-18\ttype high",
+            "IO - button[0]:\tpin-6\ttype low",
+            "IO - wifi_stat:\tpin-7\ttype low",
+            "hw_set_channel :1,channel_no :0",
+            "temp in flash is:315",
+            "[FUNC]func_init_extended OVER!!!",
+            "mf_init succ",
+            "current product ssid name:tuya_mdev_test1",
+            "scan_start_req_handler",
+            "flag:1,rssi:-45",
+            "product test mode",
+            "wifi_stat:1",
+        ],
+    },
+    {
+        # Factory-state BK7231Q MOES WA2 1-gang relay on Tuya IoT SDK 2.0.0
+        # (firmware 1.0.4, rst_cnt:1).  Configures P18 (relay high), P6 (button
+        # pull-up input) and P7 (Wi-Fi status LED), completes SARADC
+        # calibration and enters product test mode on tuya_mdev_test1.
+        "name": "BK7231Q Tuya MOES Relay 1.0.4 (SDK 2.0.0) maps GPIO and enters product test",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231Q_Tuya_MOES_Relay_WA2_1.0.4.bin"),
+        "args": ["--only-uart", "--wifi-peer", "auto",
+                 "--wifi-ssid", "tuya_mdev_test1"],
+        "timeout": 90,
+        "tags": ["WiFi MAC"],
+        "expected_strings": [
+            "< TUYA IOT SDK V:2.0.0 BS:30.01_PT:2.2_LAN:3.3_CAD:1.0.1_CD:1.0.0 >",
+            "oem_bk7321_bk_1_switch:1.0.4",
+            "IO - relay[0]:\tpin-18\ttype high",
+            "IO - button[0]:\tpin-6\ttype low",
+            "IO - wifi_stat:\tpin-7\ttype low",
+            "hw_set_channel :1,channel_no :0",
+            "temp in flash is:315",
+            "rst_cnt:1",
+            "current product ssid name:tuya_mdev_test1",
+            "scan_start_req_handler",
+            "flag:1,rssi:-45",
+            "product test mode",
+            "wifi_stat:1",
+        ],
+        "expected_pins": {6: 0x3C, 18: 0x00},
+    },
+    {
+        # Second BK7231Q MOES WA2 1.0.4 unit dump (rst_cnt:2).  Without the
+        # factory SSID on air, its default power-on state drives the relay P18
+        # high (0x02), configures the button P6 as pull-up input (0x3C) and LED
+        # P7 low (0x00), then starts scanning.
+        "name": "BK7231Q Tuya MOES Relay 1.0.4-2 (rst_cnt:2) drives relay high and scans",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231Q_Tuya_MOES_Relay_WA2_1.0.4-2.bin"),
+        "args": ["--only-uart"],
+        "timeout": 90,
+        "expected_strings": [
+            "< TUYA IOT SDK V:2.0.0 BS:30.01_PT:2.2_LAN:3.3_CAD:1.0.1_CD:1.0.0 >",
+            "oem_bk7321_bk_1_switch:1.0.4",
+            "IO - relay[0]:\tpin-18\ttype high",
+            "IO - button[0]:\tpin-6\ttype low",
+            "IO - wifi_stat:\tpin-7\ttype low",
+            "relay_stat:1",
+            "hw_set_channel :1,channel_no :0",
+            "temp in flash is:315",
+            "[FUNC]func_init_extended OVER!!!",
+            "mf_init succ",
+            "rst_cnt:2",
+            "current product ssid name:tuya_mdev_test1",
+            "scan_start_req_handler",
+        ],
+        "expected_pins": {6: 0x3C, 7: 0x00, 18: 0x02},
+    },
+    {
+        # First BK7231U dump in the suite: a C-Chip C-8133U RGB+CCT LED driver
+        # running AliOS Things.  Loads RGBLight_Param from flash, configures
+        # five PWM pins (P7/P8/P9/P24/P26) in second-function mode (0x48),
+        # starts a Wi-Fi scan and triggers its 3x power-cycle reset handler.
+        "name": "BK7231U C-Chip C-8133U AliOS LED driver (reset_counts:3) configures 5ch PWM and activates reset",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231U_C-Chip_C-8133U_LED_Driver_AliOS_Reset3.bin"),
+        "args": ["--only-uart", "-chip", "BK7231U"],
+        "timeout": 90,
+        "expected_strings": [
+            "Welcome to AliOS Things",
+            "reset_counts get from flash:3",
+            "RGBLight_Param.LightSwitch:1",
+            "RGBLight_Param.Brightness:50",
+            "RGBLight_Param.ColorTemperature:4500",
+            "RGBLight_Param.Red:255",
+            "init pwm pin !",
+            "scan_start_req_handler",
+            "[ResetCounts] reset_counts:3",
+            "[ResetCounts] active the reset function",
+        ],
+        "expected_pins": {7: 0x48, 8: 0x48, 9: 0x48, 24: 0x48, 26: 0x48},
+    },
+    {
+        # Companion BK7231U C-Chip C-8133U AliOS Things dump captured at
+        # reset_counts:1.  Configures all five PWM pins (P7/P8/P9/P24/P26) and
+        # sets PWM0 to 500 Hz (period 0xCB20 = 52000 ticks at 26 MHz), starts
+        # scanning and keeps normal state without triggering the 3x reset.
+        "name": "BK7231U C-Chip C-8133U AliOS LED driver (reset_counts:1) configures 500 Hz PWM without resetting",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231U_C-Chip_C-8133U_LED_Driver_AliOS_Reset1.bin"),
+        "args": ["--only-uart", "-chip", "BK7231U"],
+        "timeout": 90,
+        "expected_strings": [
+            "Welcome to AliOS Things",
+            "reset_counts get from flash:1",
+            "RGBLight_Param.LightSwitch:1",
+            "RGBLight_Param.Brightness:50",
+            "RGBLight_Param.ColorTemperature:4500",
+            "init pwm pin !",
+            "scan_start_req_handler",
+            "[ResetCounts] reset_counts:1",
+        ],
+        "unexpected_strings": ["[ResetCounts] active the reset function"],
+        "expected_pins": {7: 0x48, 8: 0x48, 9: 0x48, 24: 0x48, 26: 0x48},
+        "expected_pwm": {0: (0xCB20, 0x0)},
+    },
+    {
+        # Alternate BK7231U dump from the C-Chip C-8133U LED driver running
+        # RT-Thread 3.1.0 instead of AliOS Things.  Calibrates RF, initializes
+        # lwIP 2.0.2, registers station and soft-AP WLAN devices, and mounts
+        # the FAL partition table (bootloader/app/download/param1..4).
+        "name": "BK7231U C-Chip C-8133U RT-Thread 3.1.0 firmware mounts FAL partitions",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231U_C-Chip_C-8133U_LED_Driver_RTThread.bin"),
+        "args": ["--only-uart", "-chip", "BK7231U"],
+        "timeout": 90,
+        "expected_strings": [
+            "Thread Operating System",
+            "3.1.0 build Apr  8 2021",
+            "lwIP-2.0.2 initialized!",
+            "register station wlan device sucess!",
+            "register soft-ap wlan device sucess!",
+            "beken wlan hw init",
+            "| bootloader | beken_onchip_crc | 0x00000000 | 0x00010000 |",
+            "| app        | beken_onchip_crc | 0x00010000 | 0x00110000 |",
+            "RT-Thread Flash Abstraction Layer (V0.4.0) initialize success.",
+        ],
+    },
+    {
+        # Plaintext BK7231U dump from a C-Chip CC8000 / Hi-Link HLK-B30
+        # development board running RT-Thread 3.1.0.  Completes RF calibration
+        # from flash (temp 280, xtal 48, pwr_gain 12), initializes lwIP 2.0.2,
+        # registers station and soft-AP WLAN devices, and mounts its FAL
+        # partition table.
+        "name": "BK7231U C-Chip CC8000 HLK-B30 dev board boots RT-Thread 3.1.0 and FAL partitions",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231U_C-Chip_CC8000_HLK-B30_DevBoard.bin"),
+        "args": ["--only-uart", "-chip", "BK7231U"],
+        "timeout": 90,
+        "expected_strings": [
+            "Thread Operating System",
+            "3.1.0 build Apr  8 2021",
+            "read txpwr tab from flash success",
+            "temp in flash is:280",
+            "xtal inital:280, 70, 16",
+            "lwIP-2.0.2 initialized!",
+            "register station wlan device sucess!",
+            "register soft-ap wlan device sucess!",
+            "| download   | beken_onchip     | 0x00132000 | 0x000c4000 |",
+            "RT-Thread Flash Abstraction Layer (V0.4.0) initialize success.",
+        ],
+    },
+    {
+        # Plaintext BK7231U dump from an Arnoo AiDot RGBW A19 (2nd Gen,
+        # light.A001126) smart bulb built on a Leedarson CC8000 module
+        # (firmware V2.3.72::V2.04.51).  Opens the Wi-Fi MAC RX filter
+        # (0x7fffffde) into monitor/sniffing mode, configures P2/P3/P20/P21
+        # (0x3C) and brings up rw_main.
+        "name": "BK7231U Arnoo AiDot RGBW A19 bulb (Leedarson CC8000 2.0.4.51) enters Wi-Fi monitor pairing",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231U_Arnoo_AiDot_RGBW_A19_Leedarson_CC8000_2.0.4.51.bin"),
+        "args": ["--only-uart", "-chip", "BK7231U", "--wifi"],
+        "timeout": 90,
+        "tags": ["WiFi MAC"],
+        "expected_strings": [
+            "[WIFI] device RX filter 0x7fffffde: monitor mode",
+            "enter [cc8000::V2.3.72::V2.04.51] main ok ; tick=172",
+            "-----rw_main task init----",
+            "-----rw_main  start----",
+        ],
+        "expected_pins": {2: 0x3C, 3: 0x3C, 20: 0x3C, 21: 0x3C},
+    },
+    {
+        # Earlier V2.2.18::V2.03.47 revision of the Arnoo Winees WS010078261
+        # AiDot RGBW A60 (2nd Gen, light.A001139) smart bulb on Leedarson
+        # CC8000 (BK7231U).  Brings up its pairing Soft-AP 'SmartLight-5783' on
+        # channel 7 (192.168.10.1), hands out 192.168.10.2 over DHCP to the
+        # emulated station and answers ICMP echo.
+        "name": "BK7231U Arnoo Winees AiDot RGBW A60 bulb (Leedarson CC8000 2.0.3.47) hosts SmartLight-5783 AP and answers ping",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231U_Arnoo_Winees_AiDot_RGBW_A60_Leedarson_CC8000_2.0.3.47.bin"),
+        "args": ["--only-uart", "-chip", "BK7231U", "--wifi-peer", "auto"],
+        "timeout": 90,
+        "tags": ["WiFi MAC"],
+        "expected_strings": [
+            "enter [cc8000::V2.2.18::V2.03.47] main ok ; tick=173",
+            "-----rw_main task init----",
+            "-----rw_main  start----",
+            "[WIFI] found BSS 'SmartLight-5783' 1c:d6:bd:d4:57:82 ch 7 (open)",
+            "[WIFI] associated with 'SmartLight-5783' (AID 1)",
+            "[NET] DHCP: we got 192.168.10.2/255.255.255.0 from the device (router 192.168.10.1)",
+            "[NET] ARP: device 192.168.10.1 is at 1c:d6:bd:d4:57:82",
+            "[NET] ping reply from 192.168.10.1 (seq 1)",
+        ],
+        "expected_pins": {2: 0x3C, 3: 0x3C, 20: 0x3C, 21: 0x3C, 23: 0x48},
+    },
+    {
+        # Newer V2.3.72::V2.04.51 revision of the Arnoo Winees WS010078261
+        # AiDot RGBW A60 (2nd Gen, light.A001139) smart bulb on Leedarson
+        # CC8000 (BK7231U).  Unlike 2.0.3.47 (which switches to Soft-AP mode),
+        # 2.0.4.51 stays in Wi-Fi monitor/sniffing mode (0x7fffffde) after
+        # starting rw_main.
+        "name": "BK7231U Arnoo Winees AiDot RGBW A60 bulb (Leedarson CC8000 2.0.4.51) stays in Wi-Fi monitor pairing",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231U_Arnoo_Winees_AiDot_RGBW_A60_Leedarson_CC8000_2.0.4.51.bin"),
+        "args": ["--only-uart", "-chip", "BK7231U", "--wifi-peer", "auto"],
+        "timeout": 90,
+        "tags": ["WiFi MAC"],
+        "expected_strings": [
+            "[WIFI] device RX filter 0x7fffffde: monitor mode",
+            "enter [cc8000::V2.3.72::V2.04.51] main ok ; tick=172",
+            "-----rw_main task init----",
+            "-----rw_main  start----",
+        ],
+        "unexpected_strings": ["found BSS 'SmartLight"],
+        "expected_pins": {2: 0x3C, 3: 0x3C, 20: 0x3C, 21: 0x3C},
+    },
+    {
+        # Plaintext BK7252N dump from a CY365 Car IP camera
+        # (EEE-249530-GDVHL, firmware 1.7.0).  During RF calibration it sets
+        # bit 31 on 0x00900000 (XVR) at 0x0d4ba4 and waits for it to clear;
+        # --xvr-selfclear walks it past that spin so it configures SDIO
+        # P14..P19 (0x378), button P7 (0x3C) and output P5 (0x02), switches
+        # the Wi-Fi MAC from monitor mode (0x7fffffde) to normal reception
+        # (0x3503848c) and probes for networks as a station.
+        "name": "BK7252N CY365 Car IP camera 1.7.0 (--xvr-selfclear) completes RF cal and probes as station",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7252N_CY365_Car_IP_EEE-249530-GDVHL_1.7.0.bin"),
+        "args": ["--only-uart", "-chip", "BK7252N", "--xvr-selfclear",
+                 "--wifi-peer", "auto"],
+        "timeout": 90,
+        "tags": ["WiFi MAC", "XVR"],
+        "expected_strings": [
+            "[WIFI] device RX filter 0x7fffffde: monitor mode",
+            "[WIFI] device RX filter 0x3503848c: back to normal reception",
+            "[WIFI] device acts as a station (it probes for networks): peer takes the access point role",
+        ],
+        "expected_pins": {
+            5: 0x02, 7: 0x3C, 9: 0x00,
+            14: 0x378, 15: 0x378, 16: 0x378, 17: 0x378, 18: 0x378, 19: 0x378,
+        },
+    },
+    {
+        # Plaintext BK7252N dump from a square INO-A13N-V2.2 battery camera
+        # running xciot sw_ver=3.00.21.01_250512 (IOTSDK 3.00.42.01_241230).
+        # Contrasts with BK7252N_Camera_7252N (sw_ver=3.00.21.01_250723): boots
+        # FAL/ROMFS, initializes Button1/Button2 and SARADC channel 0
+        # (battary_status:139), reads xdev_opt (magic=11223344), sets local time
+        # to 2025-3-1 8:1:50, and enters deep sleep with GPIO wake mask 0x2020.
+        "name": "BK7252N INO-A13N-V2.2 square camera (3.00.21.01_250512) restores RTC 2025-3-1 and enters deep sleep",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7252N_Cam_INO-A13N-V2.2_Square_3.00.21.01.bin"),
+        "args": ["--only-uart", "-chip", "BK7252N"],
+        "timeout": 60,
+        "expected_strings": [
+            "RT-Thread Flash Abstraction Layer (V0.4.0) initialize success.",
+            "ROMFS File System initialized!",
+            "Enter normal mode...",
+            "bk_wlan_app_init finished",
+            "rf_thread_init ok",
+            "xc_main, sw_ver=3.00.21.01_250512!",
+            "--- battary_status :139 ---",
+            "return xdev_opt, magic=11223344",
+            "IOTSDK Ver = 3.00.42.01_241230",
+            "date: 2025-3-1, time: 8:1:50",
+            "power status is off, wait to power on",
+            "wake up time out to enter deep sleep",
+            "---enter deep sleep :wake up with gpio 0~31 ps: 0x2020 0x20",
+        ],
+        "expected_pins": {
+            2: 0x00, 4: 0x3F, 5: 0x3F, 9: 0x00, 12: 0x3C, 13: 0x3C,
+            14: 0x378, 15: 0x378, 16: 0x378, 17: 0x378, 18: 0x378, 19: 0x378,
+            22: 0x00, 23: 0x00,
+        },
+    },
+    {
+        # Plaintext BK7252N dump from a Pinmei A9 battery camera (captured via
+        # BKFIL).  Unlike the powered-off INO-A13N-V2.2 and 250723 dumps, this
+        # unit has power status on: it starts xled_start, reads its [iot]
+        # device credentials (did PPH0A906615F0207B0, scode 760441,
+        # prod.glbs.xcthings.com, MAC c8:47:8c:4c:81:2c), initializes AVSDK
+        # 3.00.42.01_241230 and OSAL 1.00.01.64, spawns vtask_wor/unpack/xrpc
+        # threads and registers the dp_save periodic task.
+        "name": "BK7252N Pinmei A9 camera (BKFIL, power on) loads xciot identity and spawns xrpc threads",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7252N_Pinmei_A9_Camera_BKFIL_3.00.42.01.bin"),
+        "args": ["--only-uart", "-chip", "BK7252N"],
+        "timeout": 60,
+        "expected_strings": [
+            "RT-Thread Flash Abstraction Layer (V0.4.0) initialize success.",
+            "ROMFS File System initialized!",
+            "Enter normal mode...",
+            "bk_wlan_app_init finished",
+            "rf_thread_init ok",
+            "power status is on",
+            "-------->xled_start",
+            "did = PPH0A906615F0207B0",
+            "signkey = CRfaBC8kuPZ05YMIJHOzEw==",
+            "scode = 760441",
+            "gdomain = prod.glbs.xcthings.com",
+            "wifi mac_s address is c8:47:8c:4c:81:2c -- s",
+            "AVSDK VER: 3.00.42.01_241230, build:Dec 30 2024-17:39:37",
+            "OSAL_VER:1.00.01.64_240206",
+            "osal_plat_thr_init,name=vtask_wor,stack_size=4096",
+            "osal_plat_thr_init,name=unpack,stack_size=4096",
+            "osal_plat_thr_init,name=xrpc.r,stack_size=4096",
+            "osal_plat_thr_init,name=xrpc.w,stack_size=4096",
+            "vtask_add_work ok",
+            "read wifi error,rc:0",
+        ],
+        "expected_pins": {
+            2: 0x00, 4: 0x3F, 5: 0x3F, 9: 0x00, 12: 0x3C, 13: 0x3C,
+            14: 0x378, 15: 0x378, 16: 0x378, 17: 0x378, 18: 0x378, 19: 0x378,
+            22: 0x02, 23: 0x02,
+        },
+    },
+    {
+        # External SPI programmer read (NeoProgrammer EB6015) of the Pinmei A9
+        # BK7252N camera after a later RTC state (2025-3-1 8:3:05 vs 8:2:30 in
+        # the BKFIL dump).  Boots FAL/ROMFS, keeps power status on (P22/P23 =
+        # 0x02), loads the [iot] credentials and spawns the AVSDK/OSAL/xrpc
+        # worker threads.
+        "name": "BK7252N Pinmei A9 camera (SPI NeoProgrammer dump, RTC 8:3:05) loads xciot identity and spawns xrpc threads",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7252N_Pinmei_A9_Camera_SPI_3.00.42.01.bin"),
+        "args": ["--only-uart", "-chip", "BK7252N"],
+        "timeout": 60,
+        "expected_strings": [
+            "RT-Thread Flash Abstraction Layer (V0.4.0) initialize success.",
+            "ROMFS File System initialized!",
+            "Enter normal mode...",
+            "bk_wlan_app_init finished",
+            "rf_thread_init ok",
+            "2025-03-01 00:03:05",
+            "power status is on",
+            "-------->xled_start",
+            "did = PPH0A906615F0207B0",
+            "scode = 760441",
+            "gdomain = prod.glbs.xcthings.com",
+            "wifi mac_s address is c8:47:8c:4c:81:2c -- s",
+            "AVSDK VER: 3.00.42.01_241230",
+            "OSAL_VER:1.00.01.64_240206",
+            "osal_plat_thr_init,name=vtask_wor,stack_size=4096",
+            "osal_plat_thr_init,name=xrpc.r,stack_size=4096",
+            "osal_plat_thr_init,name=xrpc.w,stack_size=4096",
+            "vtask_add_work ok",
+            "read wifi error,rc:0",
+        ],
+        "expected_pins": {
+            2: 0x00, 4: 0x3F, 5: 0x3F, 9: 0x00, 12: 0x3C, 13: 0x3C,
+            14: 0x378, 15: 0x378, 16: 0x378, 17: 0x378, 18: 0x378, 19: 0x378,
+            22: 0x02, 23: 0x02,
+        },
+    },
+    {
+        # Plaintext BK7252N dump from an XCThings Linklemo A9 camera on the
+        # INO-IPC-V2.3 (Blue PCB) revision.  Boots FAL/ROMFS, keeps power status
+        # on (P22/P23 = 0x02), loads its distinct [iot] identity (did
+        # PPH0A90E1F42CF3350, signkey V9Ja2Pz1D9mssDt5zBov9A==, scode 574818,
+        # MAC c8:47:8c:70:a1:b2) and brings up AVSDK 3.00.42.01_241230 and the
+        # vtask_wor thread.
+        "name": "BK7252N XCThings Linklemo A9 INO-IPC-V2.3 camera loads PPH0A90E1F42CF3350 identity and starts vtask",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7252N_XCThings_Linklemo_A9_INO-IPC-V2.3.bin"),
+        "args": ["--only-uart", "-chip", "BK7252N"],
+        "timeout": 60,
+        "expected_strings": [
+            "RT-Thread Flash Abstraction Layer (V0.4.0) initialize success.",
+            "ROMFS File System initialized!",
+            "Enter normal mode...",
+            "bk_wlan_app_init finished",
+            "rf_thread_init ok",
+            "did = PPH0A90E1F42CF3350",
+            "signkey = V9Ja2Pz1D9mssDt5zBov9A==",
+            "scode = 574818",
+            "gdomain = prod.glbs.xcthings.com",
+            "wifi mac_s address is c8:47:8c:70:a1:b2 -- s",
+            "AVSDK VER: 3.00.42.01_241230, build:Dec 30 2024-17:39:37",
+            "OSAL_VER:1.00.01.64_240206, Dec  3 2024-19:10:18",
+            "osal_plat_thr_init,name=vtask_wor,stack_size=4096",
+            "wait vtask start!",
+        ],
+        "expected_pins": {
+            2: 0x00, 4: 0x3F, 5: 0x3F, 9: 0x00, 12: 0x3C, 13: 0x3C,
+            14: 0x378, 15: 0x378, 16: 0x378, 17: 0x378, 18: 0x378, 19: 0x378,
+            22: 0x02, 23: 0x02,
+        },
+    },
+    {
+        # Plaintext BK7252 (QFN48) dump from a Linklemo XCThings HA15 camera
+        # on the IN-A15-V1.0 (INNOA15 Blue PCB) board, firmware 12.12.16
+        # (RT-Thread 3.1.0 built Apr 1 2024).  Calibrates RF (tssi_th b-145,
+        # g-130, BLE ch0/19/39 txpwr table, default LPF 61/61), mounts the FAL
+        # partition table (app 0x10000, download 0x154000) and ROMFS, creates
+        # the jpegdec thread, runs vbat_detect_test on SARADC channel 0, and
+        # initializes tc_entity_init.
+        "name": "BK7252 Linklemo XCThings HA15 IN-A15-V1.0 camera (12.12.16) boots FAL/ROMFS, jpegdec and vbat_detect_test",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7252_Linklemo_XCThings_HA15_IN-A15-V1.0_12.12.16.bin"),
+        "args": ["--only-uart", "-chip", "BK7252"],
+        "timeout": 60,
+        "expected_strings": [
+            "Thread Operating System",
+            "3.1.0 build Apr  1 2024",
+            "get rfcali_mode:0",
+            "tssi_th:b-145, g-130",
+            "txpwr table for ble ch0/19/39 inused",
+            "NO TXID found in flash, use lpf i&q:61, 61",
+            "RT-Thread Flash Abstraction Layer (V0.4.0) initialize success.",
+            "creat jpegdec thread!",
+            "------------------------->vbat_detect_test",
+            "[ut_xciot.c      /01155] : ---adc channel:0---",
+            "tc_entity_init",
+            "ROMFS File System initialized!",
+            "FLASH File System initialzation failed!",
+            "msh />",
+        ],
+        "expected_pins": {
+            0: 0x78, 1: 0x78, 9: 0x00,
+        },
+    },
+    {
+        # Plaintext BK7252 (QFN48) dump from a Naxclow MiniCam (A11-A9 B-V2.7
+        # 240426 board, RT-Thread 3.1.0 built Aug 7 2024).  Calibrates RF
+        # (tssi_th b-130, g-123, default LPF 61/61), initializes lwIP 2.0.2,
+        # registers station and soft-AP WLAN devices, configures DAC/ADC audio
+        # volumes (65/80), and starts com.naxclow.Camera_v0-1.1.20 for
+        # DevType A9_V2.7_ALERT_A_48P.
+        "name": "BK7252 Naxclow MiniCam A11-A9 B-V2.7 (1.1.20, 48P) boots audio, WLAN and Naxclow camera app",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7252_Naxclow_MiniCam_A11-A9_B-V2.7_240426.bin"),
+        "args": ["--only-uart", "-chip", "BK7252"],
+        "timeout": 60,
+        "expected_strings": [
+            "Thread Operating System",
+            "3.1.0 build Aug  7 2024",
+            "test_flash_read_for_mac",
+            "tssi_th:b-130, g-123",
+            "NO TXID_LPFCAP found in flash, use def 61, 61",
+            "register station wlan device sucess!",
+            "register soft-ap wlan device sucess!",
+            "beken wlan hw init",
+            "drivers  set dac vol:65 - indx:11,dig:30,ana:1a",
+            "set adc vol: 80 - 80",
+            "drv_pm_init",
+            "com.naxclow.Camera_v0-1.1.20",
+            "DevType (A9_V2.7_ALERT_A_48P",
+            "msh />",
+        ],
+        "expected_pins": {
+            0: 0x78, 1: 0x78, 9: 0x00, 10: 0x78, 11: 0x78,
+        },
+    },
+    {
+        # Plaintext BK7252 (QFN68) dump from a 2021-11-24 A9 camera running
+        # Beken SDK 3.0.33 (OSK R-3.0.22, IP W4-3.0.33-P0, RT-Thread 3.1.0
+        # built May 14 2022) and logging on UART1 instead of UART2.  Calibrates
+        # RF (tssi b-125, g-115, xtal_cali:25), completes func_init_extended,
+        # initializes lwIP 2.0.2, registers station and soft-AP WLAN devices,
+        # and reaches the msh /> shell prompt.
+        "name": "BK7252 A9 camera 20211124 (QFN68, SDK 3.0.33, UART1 log) calibrates RF and initializes WLAN",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7252_A9_Camera_20211124_SDK_3.0.33.bin"),
+        "args": ["--only-uart", "-chip", "BK7252"],
+        "timeout": 60,
+        "expected_strings": [
+            "Thread Operating System",
+            "3.1.0 build May 14 2022",
+            "OSK Rev: R-3.0.22",
+            "SDK Rev: 3.0.33",
+            "IP Rev: W4-3.0.33-P0",
+            "rfcali_mode:0",
+            "tssi:b-125, g-115",
+            "xtal_cali:25",
+            "[FUNC]func_init_extended OVER!!!",
+            "start_type:0",
+            "lwIP-2.0.2 initialized!",
+            ("igmp_mac_filter add 224.0.0.1 01:00:5E:00:00:01", 2),
+            "beken wlan hw init",
+            "drv_pm_init",
+            "Partition table NOT found on flash: beken_onchip_crc (len: 24) from offset: 0x0000f000.",
+            "RT-Thread Flash Abstraction Layer (V0.4.0) initialize failed.",
+            "msh />",
+        ],
+        "expected_pins": {
+            0: 0x78, 1: 0x78, 10: 0x78, 11: 0x78,
+        },
+    },
+    {
+        # Plaintext BK7252 (QFN68) dump from a Naxclow A9 camera (RT-Thread
+        # 3.1.0 built May 9 2023, com.naxclow.Camera_v0-1.1.20).  Contrasts
+        # with the Aug 2024 QFN48 MiniCam build: logs 'No TLV header found in
+        # flash', calibrates RF with tssi_th b-120/g-115, starts its watchdog
+        # device, initializes tc_entity_init, and reads device ID 0800C0140548
+        # from flash via sys_test_flash_read.
+        "name": "BK7252 Naxclow A9 QFN68 camera (20230509, 1.1.20) boots audio, WDT and reads device ID 0800C0140548",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7252_Naxclow_A9_Camera_Redacted_1.1.20_20230509.bin"),
+        "args": ["--only-uart", "-chip", "BK7252"],
+        "timeout": 60,
+        "expected_strings": [
+            "Thread Operating System",
+            "3.1.0 build May  9 2023",
+            "test_flash_read_for_mac",
+            "No TLV header found in flash",
+            "tssi_th:b-120, g-115",
+            "[sys_wdtDeviceInitStart - 38]-Debue: start wdt device",
+            "register station wlan device sucess!",
+            "register soft-ap wlan device sucess!",
+            "beken wlan hw init",
+            "drivers  set dac vol:65 - indx:11,dig:30,ana:1a",
+            "set adc vol: 80 - 80",
+            "drv_pm_init",
+            "com.naxclow.Camera_v0-1.1.20",
+            "tc_entity_init",
+            "sign_netConfSignInit_n = (NULL)",
+            "[0]202305091627",
+            "sys_test_flash_read [0800C0140548]",
+            "sign_readFlashDEVICE_id state 0",
+            "[1]0800C0140548",
+        ],
+        "expected_pins": {
+            0: 0x78, 1: 0x78, 9: 0x00, 10: 0x78, 11: 0x78,
+        },
+    },
+    {
+        # Plaintext BK7252 (QFN48) dump from a T99 MiniCam with GC0311 sensor
+        # (CYCAM SDK).  Release build suppresses UART console output via
+        # rt_console_set_device("no_uart"), probes SDIO on P14..P19 via the
+        # SDCard controller (0x00802d00..0x00802d34), checks SCTRL_USB_PLUG_WAKEUP
+        # (0x00800084 bit 21) and SARADC temperature/battery, and brings up the
+        # 'EEE-196629-TLESS' Soft-AP at 192.168.169.100, handing out
+        # 192.168.169.101 over DHCP and answering ARP + ICMP echo.
+        "name": "BK7252 T99 MiniCam (QFN48, GC0311) probes SDIO and hosts EEE-196629-TLESS AP",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7252_T99_MiniCam_GC0311.bin"),
+        "args": ["--only-uart", "-chip", "BK7252", "--wifi-peer", "sta"],
+        "timeout": 60,
+        "expected_strings": [
+            "[WIFI] device RX filter 0x7fffffde: monitor mode, every frame on air accepted (sniffing, as in EZ pairing)",
+            "[WIFI] device RX filter 0x3503848c: back to normal reception",
+            "[WIFI] found BSS 'EEE-196629-TLESS' 00:00:00:12:56:77 ch 11 (open)",
+            "[WIFI] authenticated with 00:00:00:12:56:77",
+            "[WIFI] associated with 'EEE-196629-TLESS' (AID 1)",
+            "[NET] DHCP: we got 192.168.169.101/255.255.255.0 from the device (router 192.168.169.100)",
+            "[NET] ARP: device 192.168.169.100 is at 00:00:00:12:56:77",
+            "[NET] ping reply from 192.168.169.100 (seq 1)",
+        ],
+        "expected_pins": {
+            0: 0x78, 1: 0x78, 4: 0x3C, 5: 0x00, 7: 0x3C,
+            10: 0x78, 11: 0x78, 12: 0x3C,
+            14: 0x78, 15: 0x78, 16: 0x78, 17: 0x78, 18: 0x78, 19: 0x78,
+        },
+    },
+    {
+        # Plaintext BK7252 (QFN68) dump from an A10 CYCAM camera (LV-MW102P-V1.3
+        # board, VM101P_v85_0729).  Probes SDIO on P14..P19, checks USB plug
+        # status (0x00800084 bit 21) and SARADC, drives P24 low (0x00), and
+        # brings up the 'PIXA-077260-DNGUV' Soft-AP (90:91:64:08:54:80) at
+        # 192.168.169.100, handing out 192.168.169.101 over DHCP and answering
+        # ARP + ICMP echo.
+        "name": "BK7252 A10 CYCAM (QFN68, VM101P_v85_0729) probes SDIO and hosts PIXA-077260-DNGUV AP",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7252_A10_CYCAM_VM101P_v85_0729.bin"),
+        "args": ["--only-uart", "-chip", "BK7252", "--wifi-peer", "sta"],
+        "timeout": 60,
+        "expected_strings": [
+            "[WIFI] device RX filter 0x7fffffde: monitor mode, every frame on air accepted (sniffing, as in EZ pairing)",
+            "[WIFI] device RX filter 0x3503848c: back to normal reception",
+            "[WIFI] found BSS 'PIXA-077260-DNGUV' 90:91:64:08:54:80 ch 11 (open)",
+            "[WIFI] authenticated with 90:91:64:08:54:80",
+            "[WIFI] associated with 'PIXA-077260-DNGUV' (AID 1)",
+            "[NET] DHCP: we got 192.168.169.101/255.255.255.0 from the device (router 192.168.169.100)",
+            "[NET] ARP: device 192.168.169.100 is at 90:91:64:08:54:80",
+            "[NET] ping reply from 192.168.169.100 (seq 1)",
+        ],
+        "expected_pins": {
+            0: 0x78, 1: 0x78, 4: 0x3C, 7: 0x3C,
+            10: 0x78, 11: 0x78, 12: 0x3C,
+            14: 0x78, 15: 0x78, 16: 0x78, 17: 0x78, 18: 0x78, 19: 0x78,
+        },
+    },
+    {
+        # Plaintext BK7252 (QFN48) dump from a Pix-Link A9 camera
+        # (CYCAM_RW101P_v19_1010, PIXA-180431-XLPNL).  Probes SDIO on P14..P19,
+        # configures P7 as pull-up input (0x3C), and brings up the
+        # 'PIXA-180431-XLPNL' Soft-AP (90:91:64:0b:56:77) at 192.168.169.100,
+        # handing out 192.168.169.101 over DHCP and answering ARP + ICMP echo.
+        "name": "BK7252 Pix-Link A9 camera (QFN48, RW101P_v19_1010) probes SDIO and hosts PIXA-180431-XLPNL AP",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7252_A9_Pix-Link_CYCAM_RW101P_v19_1010.bin"),
+        "args": ["--only-uart", "-chip", "BK7252", "--wifi-peer", "sta"],
+        "timeout": 60,
+        "expected_strings": [
+            "[WIFI] device RX filter 0x7fffffde: monitor mode, every frame on air accepted (sniffing, as in EZ pairing)",
+            "[WIFI] device RX filter 0x3503848c: back to normal reception",
+            "[WIFI] found BSS 'PIXA-180431-XLPNL' 90:91:64:0b:56:77 ch 11 (open)",
+            "[WIFI] authenticated with 90:91:64:0b:56:77",
+            "[WIFI] associated with 'PIXA-180431-XLPNL' (AID 1)",
+            "[NET] DHCP: we got 192.168.169.101/255.255.255.0 from the device (router 192.168.169.100)",
+            "[NET] ARP: device 192.168.169.100 is at 90:91:64:0b:56:77",
+            "[NET] ping reply from 192.168.169.100 (seq 1)",
+        ],
+        "expected_pins": {
+            0: 0x78, 1: 0x78, 7: 0x3C,
+            14: 0x78, 15: 0x78, 16: 0x78, 17: 0x78, 18: 0x78, 19: 0x78,
+        },
+    },
+    {
+        # Plaintext BL2028N (PAI-053 module) dump from a Dreo WH517S wall
+        # heater running firmware 3.4.3 (Oct 23 2024, SDK 3.0.46).  Boots the
+        # RW BLE 5.x stack (gapm_cmp_evt:BLE_STACK_OK), prints its DREOsh17
+        # banner and license SN, sends 55 AA MCU heartbeat/query frames on
+        # UART1, and starts scanning + temperature/XTAL calibration.
+        "name": "BL2028N Dreo WH517S wall heater (PAI-053, 3.4.3) boots BLE stack and polls MCU",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BL2028N_Dreo_Wall_Heater_WH517S_PAI-053_3.4.3.bin"),
+        "args": ["--only-uart", "--ble-core", "--uart1-hex"],
+        "timeout": 60,
+        "tags": ["BLE", "BLE core", "FIQ", "TuyaMCU"],
+        "expected_strings": [
+            "SDK Rev: 3.0.46_20220921_d9dce354c70f",
+            "chip id=7231a device id=18520001",
+            "calibration_main over",
+            "rwble_hl_init ok",
+            "BLE Rev: B5-3.0.46-P0",
+            "gapm_cmp_evt:BLE_STACK_OK",
+            "firware ver:3.4.3",
+            "Date: Oct 23 2024 14:47:15",
+            "MAC address: 00:1c:c2:a4:d9:1c",
+            "ble_name: DREOsh17",
+            "info checkout: success",
+            "license.sn:1769616359658942465-fda17af2af19fd07:001:0000000000b",
+            "[UART1/MCU] 55 aa 00 00 00 00 00 00 ff 55 aa 00 01 01 00 00 00 01",
+            "[UART1/MCU] 55 aa 00 02 03 00 00 02 01 00 07",
+            "wpa S: DISCONNECTED -> SCANNING",
+        ],
+        "expected_pins": {
+            0: 0x78, 1: 0x78, 10: 0x78, 11: 0x78,
+        },
+    },
+    {
+        # Newer firmware revision (3.8.7, Oct 13 2025) from the same Dreo
+        # WH517S BL2028N PAI-053 wall heater family (MAC 00:1c:c2:a6:a8:07,
+        # XTAL=86).  Boots the RW BLE 5.x stack, prints its updated DREOsh17
+        # banner and license SN, exchanges 55 AA frames on UART1, and starts
+        # Wi-Fi station scanning.
+        "name": "BL2028N Dreo WH517S wall heater (PAI-053, 3.8.7) boots BLE stack and polls MCU",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BL2028N_Dreo_Wall_Heater_WH517S_PAI-053_3.8.7.bin"),
+        "args": ["--only-uart", "--ble-core", "--uart1-hex"],
+        "timeout": 60,
+        "tags": ["BLE", "BLE core", "FIQ", "TuyaMCU"],
+        "expected_strings": [
+            "SDK Rev: 3.0.46_20220921_d9dce354c70f",
+            "chip id=7231a device id=18520001",
+            "calibration_main over",
+            "rwble_hl_init ok",
+            "BLE Rev: B5-3.0.46-P0",
+            "gapm_cmp_evt:BLE_STACK_OK",
+            "firware ver:3.8.7",
+            "Date: Oct 13 2025 10:46:14",
+            "MAC address: 00:1c:c2:a6:a8:07",
+            "ble_name: DREOsh17",
+            "info checkout: success",
+            "license.sn:1769616359658942465-010f809255100431:001:0000000000b",
+            "[UART1/MCU] 55 aa 00 00 00 00 00 00 ff 55 aa 00 01 01 00 00 00 01",
+            "[UART1/MCU] 55 aa 00 02 03 00 00 02 01 00 07",
+            "wpa S: DISCONNECTED -> SCANNING",
+        ],
+        "expected_pins": {
+            0: 0x78, 1: 0x78, 10: 0x78, 11: 0x78,
+        },
+    },
+    {
+        # Plaintext BL2028N (BK7231N identity, SDK 3.0.65 / AliOS Things
+        # AOS-R-1.3.4 / LinkKit 2.3.0_FY_1.6.0) dump from a XiaoMei WP8621N
+        # automatic fish feeder (WIFI002_V20 board, APP: WP8621NK_03).
+        # Exercises the _patch_ldm_caret_stubs normalization of AliOS Things's
+        # `ldmfd sp!, {r0, r1}^` (0xe8fd0003) in boot_handlers.S, brings up the
+        # RW BLE 5.x stack (gapm_cmp_evt:BLE_STACK_OK), initializes LinkKit
+        # (product_key a1c3mFpE63X), and enters Soft-AP / monitor pairing mode.
+        "name": "BL2028N XiaoMei WP8621N fish feeder (AliOS Things, WP8621NK_03) boots BLE and LinkKit",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BL2028N_XiaoMei_WP8621N_Fish_Feeder_WP8621NK_03.bin"),
+        "args": ["--only-uart", "-chip", "BK7231N"],
+        "timeout": 60,
+        "tags": ["BLE", "BLE core", "FIQ"],
+        "expected_strings": [
+            "OSK Rev: A-3.0.30",
+            "SDK Rev: 3.0.65",
+            "chip id=7231c device id=20521023",
+            "calibration_main over",
+            "rwble_hl_init ok",
+            "BLE Rev: B5-3.0.65-P0",
+            "gapm_cmp_evt:BLE_STACK_OK",
+            "-Welcome to AliOS Things-",
+            "Kernel: AOS-R-1.3.4",
+            "LinkKit: 2.3.0_FY_1.6.0",
+            "APP: WP8621NK_03",
+            "VSON product_key[a1c3mFpE63X]",
+            "product_secret[HZQ5AC8ME8Vv5klX]",
+            "device_name[86:21:02:FC:22:41]",
+            "ota init success, ver:WP8621NK_03 type:0",
+            "scan factory ap, set led ON",
+            "struct_calibration.calibration = 1365",
+            "verson = WP8621NK_03",
+        ],
+        "expected_pins": {
+            0: 0x00, 1: 0x00, 7: 0x3C, 9: 0x3C,
+            10: 0x78, 11: 0x78, 15: 0x00, 17: 0x00,
+            22: 0x08, 23: 0x00, 28: 0x3C,
+        },
+    },
+    {
+        # Plaintext BK7238 QIO dump from a Gledopto GL-SPI-206W addressable SPI
+        # LED strip controller running TuyaOS 3.11.11 (built Mar 5 2025 for T1).
+        # Runs tuya_upgrade_main [255], configures SPI pads P14..P17 (0x348 /
+        # 0x34A) for the addressable strip output, loads MAC 80:64:7c:99:dd:7f
+        # and attempts fast-connect to stored BSSID 28:87:ba:a0:f5:6d
+        # (DLINK_FastNet).
+        "name": "BK7238 Gledopto GL-SPI-206W SPI LED controller (TuyaOS 3.11.11) configures SPI pads and fast-connects",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7238_Gledopto_GL-SPI-206W_LED_Controller.bin"),
+        "args": ["--only-uart", "-chip", "BK7238"],
+        "timeout": 60,
+        "expected_strings": [
+            "**********tuya_upgrade_main need upgrade? [255]**********",
+            "device_id=0x21128000",
+            "< TuyaOS V:3.11.11 BS:40.00_PT:2.3_LAN:3.5_CAD:1.0.5_CD:1.0.0 >",
+            "< BUILD AT:2025_03_05_20_01_36 BY ci_manage FOR tuyaos-iot AT T1 >",
+            "t1_common_user_config_ty sw ver:3.0.22",
+            "calibration_main over",
+            "kv has ccode PL",
+            "mac 80:64:7c:99:dd:7f",
+            "found scan rst rssi -43 > -50",
+            "bssid 28:87:ba:a0:f5:6d, cap_info 0x1811, BI 100, ssid DLINK_FastNet",
+        ],
+        "expected_pins": {
+            0: 0x78, 1: 0x78, 10: 0x78, 11: 0x78,
+            14: 0x348, 15: 0x34A, 16: 0x348, 17: 0x348,
+        },
+    },
+    {
+        # Plaintext BK7238 dump from a BrizLabs Fairy RGB LED strip
+        # (sxebObqQRfXmgU, firmware 1.0.1 on Beken SDK 3.0.65 / OSK F-3.0.40).
+        # Completes RF calibration (lpf_i/q 74/76, xtal 23), configures SPI
+        # pads P14..P17 (0x48), button P6 (0x3C), outputs P22 (0x00) and P28
+        # (0x08), loads factory test SSID 'tuyatest' (MAC 44:4a:d6:0c:9e:14)
+        # and computes its PSKC before scanning.
+        "name": "BK7238 BrizLabs Fairy LED RGB (SDK 3.0.65, 1.0.1) configures SPI/GPIO and scans for tuyatest",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7238_BrizLabs_Fairy_LED_RGB_1.0.1.bin"),
+        "args": ["--only-uart", "-chip", "BK7238"],
+        "timeout": 60,
+        "expected_strings": [
+            "OSK Rev: F-3.0.40",
+            "SDK Rev: 3.0.65",
+            "chip id=7238 device id=21128000",
+            "calibration_main over",
+            "lpf_i & q in flash is:74, 76",
+            "xtal in flash is:23",
+            "ssid:tuyatest key:fakepassword",
+            "mac 44:4a:d6: c:9e:14",
+            "PSKC: ssid tuyatest, passphrase fakepassword",
+            "wpa S: DISCONNECTED -> SCANNING",
+        ],
+        "expected_pins": {
+            0: 0x78, 1: 0x78, 6: 0x3C, 10: 0x78, 11: 0x78,
+            14: 0x48, 15: 0x48, 16: 0x48, 17: 0x48,
+            22: 0x00, 28: 0x08,
+        },
+    },
+    {
+        # Plaintext BK7238 dump from a DX-Smart DX-WF24A AT-command Wi-Fi + BLE
+        # combo module.  Suppresses Beken SDK boot chatter, prints 'power on' on
+        # UART, configures P6 and P26 low (0x00), brings up the BLE 5.2
+        # controller and stages its 'WF24-BLE' Complete Name advertisement in
+        # exchange memory at 0x0040e480 +0x0a54.
+        "name": "BK7238 DX-Smart DX-WF24A AT module prints 'power on' and advertises 'WF24-BLE'",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7238_DX-Smart_DX-WF24A_AT.bin"),
+        "args": ["--only-uart", "-chip", "BK7238"],
+        "timeout": 60,
+        "tags": ["BLE", "BLE core", "FIQ"],
+        "expected_strings": [
+            "power on",
+            "[BLE_ADV] EM 0x0040e480 +0x0a54 (13 bytes): 02 01 06 09 09 57 46 32 34 2d 42 4c 45",
+            "[BLE_ADV]   Complete Name",
+            "WF24-BLE",
+        ],
+        "expected_pins": {
+            0: 0x78, 1: 0x78, 6: 0x00, 10: 0x78, 11: 0x78, 26: 0x00,
+        },
+    },
+    {
+        # Plaintext BK7238 dump from a Zengge AK001-ZJ21412 RGBCCT bulb
+        # (35_243_20240425_ZG-BK38-BP101 on Beken SDK 3.0.70 c063598, OS 8.43.0)
+        # driving a BP5758D I2C 5-channel current-regulator LED driver on P24
+        # and P26 (both driven high 0x02 at idle).  Prints its Zengge banner,
+        # BP5758D current settings (8/8/8/30/30 mA), increments PWRRCD store
+        # index 23, and completes RF calibration.
+        "name": "BK7238 Zengge ZJ21412 BP101 RGBCCT bulb (BP5758D I2C, 20240425) boots OS 8.43.0 and calibrates",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7238_Zengge_ZJ21412_BP101_RGBCCT_Bulb.bin"),
+        "args": ["--only-uart", "-chip", "BK7238"],
+        "timeout": 60,
+        "expected_strings": [
+            "SDK Rev: 3.0.70 c063598",
+            "chip id=7238 device id=21128000",
+            "bulid time 20240425",
+            "light version 4.16.0(2)",
+            "|MID-> AK001-ZJ21412",
+            "--------BP5758D rgbwc_ele 8 8 8 30 30",
+            "|OS->8.43.0(4)",
+            "|FW->35_243_20240425_ZG-BK38-BP101",
+            "I(APP:PWRRCD) store index 23",
+            "calibration_main over",
+        ],
+        "expected_pins": {
+            0: 0x78, 1: 0x78, 10: 0x78, 11: 0x78, 24: 0x02, 26: 0x02,
+        },
+    },
+    {
+        # Plaintext BK7238 dump from a Zengge AK001-ZJ21413 Symphony USB SPI
+        # addressable LED controller (77_24_20240423_ZG-BK on Beken SDK 3.0.70
+        # ecb1fb4, Zengge OS 8.42.4).  Configures SPI pads P14..P17 (0x48) and
+        # inputs P6/P8 (0x3C), brings up the BLE 5.2 controller, stages its
+        # 'IOTWF8A9' Complete Name advertisement in exchange memory, and starts
+        # the BRMT remote task.
+        "name": "BK7238 Zengge ZJ21413 Symphony USB SPI LED (OS 8.42.4, 20240423) configures SPI and advertises IOTWF8A9",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7238_Zengge_ZJ21413_Symphony_USB_SPI_LED.bin"),
+        "args": ["--only-uart", "-chip", "BK7238"],
+        "timeout": 60,
+        "tags": ["BLE", "BLE core", "FIQ"],
+        "expected_strings": [
+            "SDK Rev: 3.0.70 ecb1fb4",
+            "chip id=7238 device id=21128000",
+            "bulid time 20240423",
+            "light version 1.1.2(2)",
+            "|MID-> AK001-ZJ21413",
+            "|OS->8.42.4(1)",
+            "|FW->77_24_20240423_ZG-BK",
+            "calibration_main over",
+            "I(PORT) adv_name_get IOTWF8A9",
+            "[BLE_ADV]   Complete Name",
+            "IOTWF8A9",
+            "D(BRMT) (2408) task init success",
+        ],
+        "expected_pins": {
+            0: 0x78, 1: 0x08, 6: 0x3C, 8: 0x3C,
+            10: 0x78, 11: 0x78, 14: 0x48, 15: 0x48, 16: 0x48, 17: 0x48,
+        },
+    },
+    {
+        # Plaintext BK7238 dump from a Zengge W43-M5 V1.2 ceiling light
+        # (AK001-ZJ21412, 3D_23_20250724_ZIL-BK38-M5-12 on Beken SDK 3.0.70
+        # 17e8b67, Zengge OS 9.7.1).  Configures PWM pads P6/P8 (0x48) and SPI
+        # pads P14..P17 (0x48), brings up BLE 5.2 advertising ('IOTWF615'), and
+        # checks the FOTA version record.
+        "name": "BK7238 Zengge W43-M5 V1.2 ceiling light (OS 9.7.1, 20250724) configures PWM/SPI and advertises IOTWF615",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7238_Zengge_Ceiling_Light_W43-M5_V1.2.bin"),
+        "args": ["--only-uart", "-chip", "BK7238"],
+        "timeout": 60,
+        "tags": ["BLE", "BLE core", "FIQ"],
+        "expected_strings": [
+            "SDK Rev: 3.0.70 17e8b67",
+            "chip id=7238 device id=21128000",
+            "bulid time 20250724",
+            "light version 0.1.2(8)",
+            "|MID-> AK001-ZJ21412",
+            "|sdk version -> 2.10.1(6)",
+            "|OS->9.7.1(3)",
+            "|FW->3D_23_20250724_ZIL-BK38-M5-12",
+            "calibration_main over",
+            "I(PORT) adv_name_get IOTWF615",
+            "[BLE_ADV]   Complete Name",
+            "IOTWF615",
+            "I(FOTA) read dev version (old :  ) ( now : 3D_23_20250724_ZIL-BK38-M5-12 ) (target :  )",
+        ],
+        "expected_pins": {
+            0: 0x78, 1: 0x78, 6: 0x48, 8: 0x48,
+            10: 0x78, 11: 0x78, 14: 0x48, 15: 0x48, 16: 0x48, 17: 0x48,
+        },
+    },
+    {
+        # Plaintext BK7238 dump from an eWeLink (CoolKit) door/window sensor
+        # (CK-BK7238-W105SE0X-01-DOOR-HB, version 1.0.4 built 20250516 on Beken
+        # SDK 3.0.70 / OSK F-3.0.44).  Configures reed-switch/button inputs P7,
+        # P22, P23 as pull-up inputs (0x3C) and LED P21 low (0x00), prints its
+        # CoolKit banner and DeviceMac d02704434298, completes RF calibration,
+        # and starts station scanning.
+        "name": "BK7238 eWeLink W105SE0X door/window sensor (1.0.4, SDK 3.0.70) configures reed/button GPIOs and scans",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7238_eWeLink_DoorWindow_W105SE0X_1.0.4.bin"),
+        "args": ["--only-uart", "-chip", "BK7238"],
+        "timeout": 60,
+        "expected_strings": [
+            "OSK Rev: F-3.0.44",
+            "SDK Rev: 3.0.70",
+            "***CK-BK7238-W105SE0X-01-DOOR-HB---Ver:1.0.4,Btim:20250516.09531208.015***",
+            "chip id=7238 device id=21128000",
+            "sta_mac:d0:27:04:43:42:98",
+            "DeviceMac:d02704434298",
+            "calibration_main over",
+            "wpa S: DISCONNECTED -> SCANNING",
+        ],
+        "expected_pins": {
+            0: 0x78, 1: 0x78, 7: 0x3C, 10: 0x78, 11: 0x78,
+            21: 0x00, 22: 0x3C, 23: 0x3C,
+        },
+    },
+    {
+        # Plaintext BK7238 dump from a Zengge Ledytech XGD-NZ-002 ceiling light
+        # on the WB43-M5 V1.1 board (AK001-ZJ21412, 3D_22_20250107_ZIL-BK38 on
+        # Beken SDK 3.0.70 434b394, Zengge SDK 2.9.0 / OS 9.7.1).  Configures
+        # PWM pads P6/P8 (0x48) and SPI pads P14..P17 (0x48), brings up BLE 5.2
+        # advertising ('IOTWF829'), and initializes the BRMT remote task.
+        "name": "BK7238 Zengge Ledytech XGD-NZ-002 WB43-M5 V1.1 (OS 9.7.1, 20250107) configures PWM/SPI and advertises IOTWF829",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7238_Zengge_Ledytech_XGD-NZ-002_WB43-M5_V1.1.bin"),
+        "args": ["--only-uart", "-chip", "BK7238"],
+        "timeout": 60,
+        "tags": ["BLE", "BLE core", "FIQ"],
+        "expected_strings": [
+            "SDK Rev: 3.0.70 434b394",
+            "chip id=7238 device id=21128000",
+            "bulid time 20250107",
+            "light version 0.1.2(8)",
+            "|MID-> AK001-ZJ21412",
+            "|sdk version -> 2.9.0(1)",
+            "|OS->9.7.1(3)",
+            "|FW->3D_22_20250107_ZIL-BK38",
+            "calibration_main over",
+            "I(PORT) adv_name_get IOTWF829",
+            "[BLE_ADV]   Complete Name",
+            "IOTWF829",
+            "D(BRMT) (2588) task init success",
+        ],
+        "expected_pins": {
+            0: 0x78, 1: 0x78, 6: 0x48, 8: 0x48,
+            10: 0x78, 11: 0x78, 14: 0x48, 15: 0x48, 16: 0x48, 17: 0x48,
+        },
+    },
+    {
+        # Stock BK7231T dump from an Arlec / Tuya SSWF01G-WIFI ceiling fan
+        # speed controller (oem_bk7231s_fan_control_arlec:1.0.5 on TUYA IOT SDK
+        # 2.0.0 BS:30.06).  Configures its multi-relay fan speed outputs
+        # (P6/P7/P9/P10 high 0x02, P26 low 0x00) and button inputs (P1/P8/P14
+        # pull-up 0x3C), updates its bound BLE state and localkey, and brings
+        # up GAPM.
+        "name": "BK7231T Tuya Arlec SSWF01G fan speed controller (1.0.5, SDK 2.0.0) configures fan relays and BLE",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231T_Tuya_Fan_Speed_Controller_SSWF01G_1.0.5.bin"),
+        "args": ["--only-uart", "-key", "TUYA"],
+        "timeout": 60,
+        "expected_strings": [
+            "< TUYA IOT SDK V:2.0.0 BS:30.06_PT:2.2_LAN:3.3_CAD:1.0.2_CD:1.0.0 >",
+            "oem_bk7231s_fan_control_arlec:1.0.5",
+            "**********[oem_bk7231s_fan_control_arlec] [1.0.5] compiled at Jul  7 2020 11:27:29**********",
+            "update bound state 1",
+            "device_init ok  free_mem_size:81808",
+            "ty bt update localkey",
+            "55 bc ce cb 9b 56 ac 21 ba 29 28 8a 6e 47 2c f0",
+            "ble adv && resp changed",
+            "gapm_cmp_evt_handler operation = 0x1, status = 0x0",
+        ],
+        "expected_pins": {
+            0: 0x78, 1: 0x3C, 6: 0x02, 7: 0x02, 8: 0x3C, 9: 0x02,
+            10: 0x02, 11: 0x78, 12: 0x78, 13: 0x78, 14: 0x3C, 26: 0x00,
+        },
+    },
+    {
+        # Stock BK7231T dump from a Mirabella Genio Nebular Star Projector
+        # (I003323, oem_bk7231t_light3_laser_nanxin:1.1.2 on TUYA IOT SDK 1.0.2).
+        # Drives 5 hardware PWM channels at 1000 Hz (0x6590 = 26000 ticks:
+        # P6/P8/P9/P24/P26 = PWM0/2/3/4/5) for the nebula LEDs + motor, plus
+        # P7 low (0x00) and button P14 pull-up (0x3C).
+        "name": "BK7231T Tuya Genio Nebular Projector I003323 (5ch 1000 Hz PWM + laser, 1.1.2) boots",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231T_Tuya_Genio_Nebular_Projector_I003323_1.1.2.bin"),
+        "args": ["--only-uart", "-key", "TUYA"],
+        "timeout": 60,
+        "expected_strings": [
+            "goto first bright up!",
+            "**********[oem_bk7231t_light3_laser_nanxin] [1.1.2] compiled at Jan 27 2021 10:29:48**********",
+            "< TUYA IOT SDK V:1.0.2 BS:40.00_PT:2.2_LAN:3.3_CAD:1.0.2_CD:1.0.0 >",
+            "oem_bk7231t_light3_laser_nanxin:1.1.2",
+            "have actived over 15 min, not enter mf_init",
+            "mf_init succ",
+            "button init",
+            "device config data already load! Don't load again!!",
+            "Drive init already init ok",
+        ],
+        "expected_pins": {
+            0: 0x78, 1: 0x78, 6: 0x48, 7: 0x00, 8: 0x48, 9: 0x48,
+            10: 0x78, 11: 0x78, 12: 0x78, 13: 0x78, 14: 0x3C,
+            24: 0x48, 26: 0x48,
+        },
+        "expected_pwm": {
+            0: (0x6590, 0x32C8),
+            2: (0x6590, 0x6590),
+            3: (0x6590, 0x6590),
+            4: (0x6590, 0x6590),
+            5: (0x6590, None),
+        },
+    },
+    {
+        # Stock BK7231T dump from a MOES MS-102 smart garage door controller
+        # (oem_bk7231s_garage_door:1.1.2 on TUYA IOT SDK 1.0.2, WB2S module).
+        # Configures door-contact reed input P26 (pull-down 0x2C), button P6
+        # (pull-up 0x3C), relay/LED outputs P7 (0x02) and P24 (0x00), runs
+        # device_ctrl_init, and updates its BLE advertisement.
+        "name": "BK7231T Tuya MOES MS-102 garage door opener (WB2S, 1.1.2) configures contact/relay GPIOs and BLE",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231T_Tuya_MOES_GarageDoor_MS-102_WB2S_1.1.2.bin"),
+        "args": ["--only-uart", "-key", "TUYA"],
+        "timeout": 60,
+        "expected_strings": [
+            "< TUYA IOT SDK V:1.0.2 BS:40.00_PT:2.2_LAN:3.3_CAD:1.0.2_CD:1.0.0 >",
+            "oem_bk7231s_garage_door:1.1.2",
+            "**********[oem_bk7231s_garage_door] [1.1.2] compiled at Nov 23 2020 20:07:02**********",
+            "device_ctrl_init start!",
+            "device_ctrl_init end!",
+            "device_init ok  free_mem_size:74552",
+            "ty bt update localkey",
+            "ble adv && resp changed",
+        ],
+        "expected_pins": {
+            0: 0x78, 1: 0x78, 6: 0x3C, 7: 0x02,
+            10: 0x78, 11: 0x78, 12: 0x78, 13: 0x78,
+            24: 0x00, 26: 0x2C,
+        },
+    },
+    {
+        # Stock BK7231T dump from a Tuya qcsc400w-v5t motorized smart curtain
+        # switch (oem_bk7231s_curtain_switch:1.6.0 on TUYA IOT SDK 1.0.2, WB3S
+        # module).  Recovers its protected user_param_key, parses and prints
+        # its 3-sub-channel curtain relay/button table (rly P7/P6, bt P8/P10/P24,
+        # intertime 200 ms, drvtime 200 ms), and completes curtain_json_init and
+        # dev_event_json_init.
+        "name": "BK7231T Tuya qcsc400w-v5t smart curtain switch (WB3S, 1.6.0) loads 3-sub-channel curtain config",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231T_Tuya_Smart_Curtain_qcsc400w-v5t_WB3S_1.6.0.bin"),
+        "args": ["--only-uart", "-key", "TUYA"],
+        "timeout": 60,
+        "expected_strings": [
+            "< TUYA IOT SDK V:1.0.2 BS:40.00_PT:2.2_LAN:3.3_CAD:1.0.2_CD:1.0.0 >",
+            "oem_bk7231s_curtain_switch:1.6.0",
+            "**********[oem_bk7231s_curtain_switch] [1.6.0] compiled at May 31 2021 16:53:20**********",
+            "CH[0]:dpid,[1-2-3-10-8-12-{dryEn(true)-intertime200(ms)-drvtime:200(ms)}]",
+            "Sub ch[0]:led[255-  2],rly[  7-  1],bt[  8-  0 - longKey-5000(ms)]",
+            "Sub ch[1]:led[255-  2],rly[255-  2],bt[ 10-  0 - longKey-5000(ms)]",
+            "Sub ch[2]:led[255-  2],rly[  6-  1],bt[ 24-  0 - longKey-5000(ms)]",
+            "curtain_json_init init end!",
+            "dev_event_json_init init end!",
+            "have actived over 15 min, not enter mf_init",
+        ],
+        "expected_pins": {
+            0: 0x78, 1: 0x78, 10: 0x78, 11: 0x78, 12: 0x78, 13: 0x78,
+        },
+    },
+    {
+        # Stock BK7231T dump from a Tuya MCB238 / DDSU238 DIN-rail circuit
+        # breaker (oem_bk7231s_rnd_switch:1.1.8 on TUYA IOT SDK 1.0.2, WB3S
+        # module).  Brings up the BLE GATT database and advertising (STACK INIT
+        # OK, CREATE DB SUCCESS, appm start advertising), completes mf_init,
+        # and prints its recovered bistable-relay pConfig (rl_on1_pin:9,
+        # rl_off1_pin:8, bt1_pin:26, led1_pin:6, netled_pin:24).
+        "name": "BK7231T Tuya MCB238 DDSU238 DIN-rail breaker (WB3S, 1.1.8) starts BLE advertising and loads bistable pConfig",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231T_Tuya_MCB238_Breaker_DDSU238_WB3S_1.1.8.bin"),
+        "args": ["--only-uart", "-key", "TUYA"],
+        "timeout": 60,
+        "expected_strings": [
+            "< TUYA IOT SDK V:1.0.2 BS:40.00_PT:2.2_LAN:3.3_CAD:1.0.2_CD:1.0.0 >",
+            "oem_bk7231s_rnd_switch:1.1.8",
+            "**********[oem_bk7231s_rnd_switch] [1.1.8] compiled at Jul  9 2021 19:30:24**********",
+            "STACK INIT OK",
+            "CREATE DB SUCCESS",
+            "ble adv && resp changed",
+            "appm start advertising",
+            "mf_init succ",
+            "pConfig = {netled_lv:1,bt_type:0,bt1_pin:26,mxcl_led_m:0,led1_pin:6,rand_dpid:43,net_trig:2,rl_on1_pin:9,led_dp:40,jv:1.1.1,lock_dp:41,nety_led:1,rl_off1_pin:8,netled_pin:24,total_stat:0,rl_type:1,bt1_lv:0,",
+        ],
+        "expected_pins": {
+            0: 0x78, 1: 0x78, 10: 0x78, 11: 0x78, 12: 0x78, 13: 0x78,
+        },
+    },
+    {
+        # Stock BK7231T dump from a TreatLife SS02 3-way wall switch
+        # (oem_bk7231s_double_switch_rmd:1.1.3 on TUYA IOT SDK 1.0.8).
+        # Configures traveler/button inputs P6, P26, P28 (pull-up 0x3C) and
+        # relay/LED outputs P8 (0x02), P9 (0x00) and P24 (0x00), brings up the
+        # BLE GATT database (STACK INIT OK, CREATE DB SUCCESS), and starts
+        # advertising.
+        "name": "BK7231T Tuya TreatLife SS02 3-way switch (1.1.3, SDK 1.0.8) configures 3-way GPIOs and BLE",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231T_Tuya_TreatLife_SS02_3-Way_Switch_1.1.3.bin"),
+        "args": ["--only-uart", "-key", "TUYA"],
+        "timeout": 60,
+        "expected_strings": [
+            "< TUYA IOT SDK V:1.0.8 BS:40.00_PT:2.2_LAN:3.3_CAD:1.0.2_CD:1.0.0 >",
+            "oem_bk7231s_double_switch_rmd:1.1.3",
+            "**********[oem_bk7231s_double_switch_rmd] [1.1.3] compiled at May 12 2021 16:12:47**********",
+            "STACK INIT OK",
+            "CREATE DB SUCCESS",
+            "ble adv && resp changed",
+            "appm start advertising",
+        ],
+        "expected_pins": {
+            0: 0x78, 1: 0x78, 6: 0x3C, 8: 0x02, 9: 0x00,
+            10: 0x78, 11: 0x78, 12: 0x78, 13: 0x78,
+            24: 0x00, 26: 0x3C, 28: 0x3C,
+        },
     }
 ]
 
@@ -3016,6 +4310,262 @@ TEST_CASES = [
 # comments there document specific assertion strings for maintainers, while
 # these summarise each test for the HTML report's expandable description.
 DESCRIPTIONS = {
+    "BK7231T Tuya TreatLife SS02 3-way switch (1.1.3, SDK 1.0.8) configures 3-way GPIOs and BLE":
+        "A stock BK7231T dump from a TreatLife SS02 3-way smart wall switch "
+        "(oem_bk7231s_double_switch_rmd:1.1.3 on TUYA IOT SDK 1.0.8). It configures 3-way "
+        "traveler/button inputs P6, P26 and P28 with pull-ups (0x3C) and relay/LED outputs P8 "
+        "(0x02), P9 (0x00) and P24 (0x00), brings up the BLE GATT database (STACK INIT OK, "
+        "CREATE DB SUCCESS), and starts advertising.",
+    "BK7231T Tuya MCB238 DDSU238 DIN-rail breaker (WB3S, 1.1.8) starts BLE advertising and loads bistable pConfig":
+        "A stock BK7231T dump from a Tuya MCB238 / DDSU238 DIN-rail circuit breaker "
+        "(oem_bk7231s_rnd_switch:1.1.8 on TUYA IOT SDK 1.0.2, WB3S module). It brings up the "
+        "BLE GATT database and advertising (STACK INIT OK, CREATE DB SUCCESS, appm start "
+        "advertising), completes mf_init, and logs its recovered bistable-relay pConfig "
+        "(rl_on1_pin:9, rl_off1_pin:8, bt1_pin:26, led1_pin:6, netled_pin:24).",
+    "BK7231T Tuya qcsc400w-v5t smart curtain switch (WB3S, 1.6.0) loads 3-sub-channel curtain config":
+        "A stock BK7231T dump from a Tuya qcsc400w-v5t motorized smart curtain switch "
+        "(oem_bk7231s_curtain_switch:1.6.0 on TUYA IOT SDK 1.0.2, WB3S module). It recovers "
+        "its protected user_param_key, parses and logs its three-sub-channel curtain relay and "
+        "button mapping (open/stop/close buttons on P8/P10/P24, motor relays on P7/P6 with "
+        "200 ms interlock and drive times), and finishes curtain_json_init and dev_event_json_init.",
+    "BK7231T Tuya MOES MS-102 garage door opener (WB2S, 1.1.2) configures contact/relay GPIOs and BLE":
+        "A stock BK7231T dump from a MOES MS-102 smart garage door controller "
+        "(oem_bk7231s_garage_door:1.1.2 on TUYA IOT SDK 1.0.2, WB2S module). It recovers its "
+        "protected flash configuration, configures the door-contact sensor input P26 with a "
+        "pull-down (0x2C), button P6 with a pull-up (0x3C) and relay/LED outputs P7 (0x02) and "
+        "P24 (0x00), completes device_ctrl_init, and updates its BLE advertisement.",
+    "BK7231T Tuya Genio Nebular Projector I003323 (5ch 1000 Hz PWM + laser, 1.1.2) boots":
+        "A stock BK7231T dump from a Mirabella Genio Nebular Star Projector (I003323, "
+        "oem_bk7231t_light3_laser_nanxin:1.1.2 on TUYA IOT SDK 1.0.2). It configures five "
+        "1000 Hz hardware PWM channels (P6/P8/P9/P24/P26 = PWM0/2/3/4/5, period 0x6590 = 26000 "
+        "ticks, with PWM0 at 50% duty 0x32C8 and PWM2..4 at 100% duty) alongside GPIO output P7 "
+        "(0x00) and button input P14 (0x3C).",
+    "BK7231T Tuya Arlec SSWF01G fan speed controller (1.0.5, SDK 2.0.0) configures fan relays and BLE":
+        "A stock BK7231T dump from an Arlec / Tuya SSWF01G-WIFI ceiling fan speed controller "
+        "(oem_bk7231s_fan_control_arlec:1.0.5 on TUYA IOT SDK 2.0.0 BS:30.06). It recovers its "
+        "protected flash configuration, drives its fan-speed relay outputs (P6, P7, P9, P10 high "
+        "0x02; P26 low 0x00) and button inputs (P1, P8, P14 pull-up 0x3C), updates its bound BLE "
+        "localkey, and completes GAPM initialization.",
+    "BK7238 Zengge Ledytech XGD-NZ-002 WB43-M5 V1.1 (OS 9.7.1, 20250107) configures PWM/SPI and advertises IOTWF829":
+        "A plaintext BK7238 dump from a Zengge Ledytech XGD-NZ-002 ceiling light on the "
+        "WB43-M5 V1.1 board (AK001-ZJ21412, 3D_22_20250107_ZIL-BK38 on Beken SDK 3.0.70 "
+        "434b394, Zengge SDK 2.9.0 / OS 9.7.1). It completes RF calibration, configures PWM "
+        "pads P6/P8 (0x48) and SPI pads P14..P17 (0x48), brings up the BLE 5.2 controller, "
+        "stages its 'IOTWF829' Complete Name advertisement in exchange memory, and initializes "
+        "the BRMT remote task.",
+    "BK7238 eWeLink W105SE0X door/window sensor (1.0.4, SDK 3.0.70) configures reed/button GPIOs and scans":
+        "A plaintext BK7238 dump from an eWeLink (CoolKit) door/window sensor "
+        "(CK-BK7238-W105SE0X-01-DOOR-HB, firmware 1.0.4 built May 16 2025 on Beken SDK 3.0.70 / "
+        "OSK F-3.0.44). It prints its CoolKit version banner and DeviceMac d02704434298, "
+        "configures reed-switch and tamper/button inputs P7, P22 and P23 with pull-ups (0x3C) "
+        "and drives status output P21 low (0x00), completes RF calibration, and enters Wi-Fi "
+        "station scanning.",
+    "BK7238 Zengge W43-M5 V1.2 ceiling light (OS 9.7.1, 20250724) configures PWM/SPI and advertises IOTWF615":
+        "A plaintext BK7238 dump from a Zengge W43-M5 V1.2 ceiling light (AK001-ZJ21412, "
+        "3D_23_20250724_ZIL-BK38-M5-12 on Beken SDK 3.0.70 17e8b67, Zengge OS 9.7.1). "
+        "It completes RF calibration, configures PWM pads P6/P8 (0x48) and SPI pads P14..P17 "
+        "(0x48), brings up the BLE 5.2 controller, stages its 'IOTWF615' Complete Name "
+        "advertisement in exchange memory, and checks its FOTA firmware version record.",
+    "BK7238 Zengge ZJ21413 Symphony USB SPI LED (OS 8.42.4, 20240423) configures SPI and advertises IOTWF8A9":
+        "A plaintext BK7238 dump from a Zengge AK001-ZJ21413 Symphony USB SPI addressable LED "
+        "controller (77_24_20240423_ZG-BK on Beken SDK 3.0.70 ecb1fb4, Zengge OS 8.42.4). "
+        "It completes RF calibration, configures SPI pads P14..P17 (0x48) and inputs P6/P8 "
+        "(0x3C), brings up the BLE 5.2 controller, stages its 'IOTWF8A9' Complete Name "
+        "advertisement in exchange memory, and initializes the BRMT remote task.",
+    "BK7238 Zengge ZJ21412 BP101 RGBCCT bulb (BP5758D I2C, 20240425) boots OS 8.43.0 and calibrates":
+        "A plaintext BK7238 dump from a Zengge AK001-ZJ21412 RGBCCT bulb "
+        "(35_243_20240425_ZG-BK38-BP101 on Beken SDK 3.0.70 c063598, Zengge OS 8.43.0) "
+        "using a BP5758D 5-channel I2C constant-current LED driver on P24 and P26 (both 0x02). "
+        "It prints its Zengge banner and BP5758D channel currents (8/8/8/30/30), updates "
+        "PWRRCD store index 23, and completes RF calibration.",
+    "BK7238 DX-Smart DX-WF24A AT module prints 'power on' and advertises 'WF24-BLE'":
+        "A plaintext BK7238 dump from a DX-Smart DX-WF24A AT-command Wi-Fi + BLE combo module. "
+        "It suppresses SDK boot messages, prints 'power on', drives P6 and P26 low (0x00), "
+        "initializes the BLE 5.2 controller, and stages its 'WF24-BLE' Complete Name "
+        "advertisement in exchange memory at 0x0040e480 +0x0a54.",
+    "BK7238 BrizLabs Fairy LED RGB (SDK 3.0.65, 1.0.1) configures SPI/GPIO and scans for tuyatest":
+        "A plaintext BK7238 dump from a BrizLabs Fairy RGB LED string light (sxebObqQRfXmgU, "
+        "firmware 1.0.1 on Beken SDK 3.0.65 / OSK F-3.0.40). It completes RF calibration "
+        "(lpf_i/q 74/76, xtal 23), configures SPI pads P14..P17 (0x48), button P6 (0x3C) and "
+        "outputs P22/P28, loads its factory test credentials ('tuyatest' / 'fakepassword', "
+        "MAC 44:4a:d6:0c:9e:14), computes its PSKC, and enters Wi-Fi station scanning.",
+    "BK7238 Gledopto GL-SPI-206W SPI LED controller (TuyaOS 3.11.11) configures SPI pads and fast-connects":
+        "A plaintext BK7238 QIO dump from a Gledopto GL-SPI-206W addressable SPI LED strip "
+        "controller running TuyaOS 3.11.11 (built Mar 5 2025 for T1). It runs the Tuya OTA "
+        "bootloader check (tuya_upgrade_main [255]), completes RF calibration, configures SPI "
+        "pads P14..P17 (0x348/0x34A) for the addressable pixel strip, loads MAC 80:64:7c:99:dd:7f, "
+        "and initiates a fast-connect scan for its stored 'DLINK_FastNet' network.",
+    "BL2028N XiaoMei WP8621N fish feeder (AliOS Things, WP8621NK_03) boots BLE and LinkKit":
+        "A plaintext BL2028N dump from a XiaoMei WP8621N automatic fish feeder (WIFI002_V20 "
+        "board, APP: WP8621NK_03, built on SDK 3.0.65 with AliOS Things AOS-R-1.3.4 and LinkKit "
+        "2.3.0_FY_1.6.0). It exercises the boot_handlers.S `ldmfd sp!, {r0, r1}^` (0xe8fd0003) "
+        "exception entry normalization, completes RF calibration, initializes the RW BLE 5.x "
+        "stack, loads its VSON LinkKit credentials (product_key a1c3mFpE63X, MAC 86:21:02:FC:22:41), "
+        "turns on the status LED, and reports calibration = 1365.",
+    "BL2028N Dreo WH517S wall heater (PAI-053, 3.8.7) boots BLE stack and polls MCU":
+        "A plaintext BL2028N dump from a Dreo WH517S wall heater (PAI-053 module) running "
+        "firmware 3.8.7 (built Oct 13 2025 on SDK 3.0.46, MAC 00:1c:c2:a6:a8:07, XTAL=86). "
+        "It completes RF calibration, brings up the RW BLE 5.x stack (gapm_cmp_evt:BLE_STACK_OK), "
+        "prints its DREOsh17 product banner and license serial number, transmits 55 AA protocol "
+        "frames to the heater MCU over UART1, and enters Wi-Fi station scanning.",
+    "BL2028N Dreo WH517S wall heater (PAI-053, 3.4.3) boots BLE stack and polls MCU":
+        "A plaintext BL2028N dump from a Dreo WH517S wall heater (PAI-053 module, firmware "
+        "3.4.3 built Oct 23 2024 on SDK 3.0.46). It completes RF calibration, brings up the "
+        "RW BLE 5.x stack (gapm_cmp_evt:BLE_STACK_OK), prints its DREOsh17 product banner and "
+        "license serial number, transmits 55 AA protocol frames to the heater MCU over UART1, "
+        "and enters Wi-Fi station scanning.",
+    "BK7252 Pix-Link A9 camera (QFN48, RW101P_v19_1010) probes SDIO and hosts PIXA-180431-XLPNL AP":
+        "A BK7252 (QFN48) dump from a Pix-Link A9 mini camera (CYCAM_RW101P_v19_1010). "
+        "It silences UART console output via rt_console_set_device(\"no_uart\"), probes for an "
+        "SD card on P14..P19 via the 0x00802d00 SDCard controller, configures P7 as a pull-up "
+        "input (0x3C), and brings up the open 'PIXA-180431-XLPNL' Soft-AP (90:91:64:0b:56:77) "
+        "at 192.168.169.100, assigning 192.168.169.101 over DHCP and replying to ARP and ICMP ping.",
+    "BK7252 A10 CYCAM (QFN68, VM101P_v85_0729) probes SDIO and hosts PIXA-077260-DNGUV AP":
+        "A BK7252 (QFN68) dump from an A10 CYCAM mini camera (LV-MW102P-V1.3 board, "
+        "VM101P_v85_0729). It silences UART console output via rt_console_set_device(\"no_uart\"), "
+        "probes for an SD card on P14..P19 via the 0x00802d00 SDCard controller, checks "
+        "SCTRL_USB_PLUG_WAKEUP (0x00800084 bit 21) and SARADC, and brings up the open "
+        "'PIXA-077260-DNGUV' Soft-AP (90:91:64:08:54:80) at 192.168.169.100, assigning "
+        "192.168.169.101 over DHCP and replying to ARP and ICMP ping.",
+    "BK7252 T99 MiniCam (QFN48, GC0311) probes SDIO and hosts EEE-196629-TLESS AP":
+        "A BK7252 (QFN48) dump from a T99 MiniCam with a GC0311 DVP sensor (CYCAM SDK). "
+        "The release build silences UART console output via rt_console_set_device(\"no_uart\"), "
+        "probes for an SD card on P14..P19 through the 0x00802d00 SDCard controller, checks "
+        "SCTRL_USB_PLUG_WAKEUP (0x00800084 bit 21) and SARADC, and brings up the open "
+        "'EEE-196629-TLESS' Soft-AP at 192.168.169.100, assigning 192.168.169.101 over DHCP "
+        "and replying to ARP and ICMP ping.",
+    "BK7252 Naxclow A9 QFN68 camera (20230509, 1.1.20) boots audio, WDT and reads device ID 0800C0140548":
+        "A BK7252 (QFN68) dump from a Naxclow A9 camera (RT-Thread 3.1.0 built May 9 2023). "
+        "Unlike the Aug 2024 QFN48 MiniCam build, this earlier QFN68 image reports 'No TLV header "
+        "found in flash', calibrates RF with tssi_th b-120/g-115, starts its watchdog device, "
+        "registers the station and soft-AP WLAN interfaces, configures audio DAC/ADC volumes "
+        "(65/80), initializes tc_entity_init, and reads device ID 0800C0140548 from flash.",
+    "BK7252 A9 camera 20211124 (QFN68, SDK 3.0.33, UART1 log) calibrates RF and initializes WLAN":
+        "A BK7252 (QFN68) dump from an A9 camera on Beken SDK 3.0.33 (OSK R-3.0.22, IP "
+        "W4-3.0.33-P0, RT-Thread 3.1.0 built May 14 2022) that routes its console log to UART1 "
+        "instead of UART2. It completes RF calibration (tssi b-125/g-115, xtal_cali 25), "
+        "initializes lwIP 2.0.2 and both WLAN interfaces, runs drv_pm_init, and reaches msh />.",
+    "BK7252 Naxclow MiniCam A11-A9 B-V2.7 (1.1.20, 48P) boots audio, WLAN and Naxclow camera app":
+        "A BK7252 (QFN48) dump from a Naxclow MiniCam on the A11-A9 B-V2.7 (240426) board "
+        "(RT-Thread 3.1.0 built Aug 7 2024). It completes RF calibration (tssi_th b-130/g-123), "
+        "initializes lwIP 2.0.2 and the station/soft-AP WLAN interfaces, configures audio DAC/ADC "
+        "volumes (65/80) and board GPIOs, and launches com.naxclow.Camera_v0-1.1.20 for "
+        "DevType A9_V2.7_ALERT_A_48P.",
+    "BK7252 Linklemo XCThings HA15 IN-A15-V1.0 camera (12.12.16) boots FAL/ROMFS, jpegdec and vbat_detect_test":
+        "A BK7252 (QFN48) dump from a Linklemo XCThings HA15 camera on the IN-A15-V1.0 (INNOA15 "
+        "Blue PCB) board, firmware 12.12.16 (RT-Thread 3.1.0 built Apr 1 2024). It completes RF "
+        "calibration (tssi_th b-145/g-130, BLE ch0/19/39 txpwr table), mounts the FAL partition "
+        "table and ROMFS, creates the jpegdec thread, runs vbat_detect_test on SARADC channel 0, "
+        "and initializes tc_entity_init.",
+    "BK7252N XCThings Linklemo A9 INO-IPC-V2.3 camera loads PPH0A90E1F42CF3350 identity and starts vtask":
+        "A BK7252N dump from an XCThings Linklemo A9 camera built on the INO-IPC-V2.3 (Blue PCB) "
+        "board. It initializes FAL and ROMFS, configures SDIO pads P14..P19 (0x378), buttons "
+        "P12/P13 (0x3C) and outputs P22/P23 (0x02), reads its distinct [iot] device credentials "
+        "(did PPH0A90E1F42CF3350, scode 574818, MAC c8:47:8c:70:a1:b2) from flash, and starts "
+        "AVSDK 3.00.42.01, OSAL 1.00.01.64 and the vtask_wor worker thread.",
+    "BK7252N Pinmei A9 camera (SPI NeoProgrammer dump, RTC 8:3:05) loads xciot identity and spawns xrpc threads":
+        "An external SPI programmer dump (NeoProgrammer EB6015) of the Pinmei A9 BK7252N camera "
+        "captured at a later flash RTC timestamp (2025-03-01 00:03:05 UTC). It initializes FAL "
+        "and ROMFS, restores its persisted [iot] credentials and MAC c8:47:8c:4c:81:2c, keeps P22 "
+        "and P23 driven high (0x02), and brings up AVSDK 3.00.42.01 and the xrpc worker threads.",
+    "BK7252N Pinmei A9 camera (BKFIL, power on) loads xciot identity and spawns xrpc threads":
+        "A BK7252N dump from a Pinmei A9 camera captured via BKFIL with power status on in flash. "
+        "Unlike the powered-off camera dumps (which enter deep sleep), this unit keeps P22 and P23 "
+        "driven high (0x02), starts xled_start, reads its [iot] device credentials (did "
+        "PPH0A906615F0207B0, scode 760441, prod.glbs.xcthings.com, MAC c8:47:8c:4c:81:2c), "
+        "initializes AVSDK 3.00.42.01 and OSAL 1.00.01.64, and spawns the vtask_wor, unpack, "
+        "xrpc.r and xrpc.w worker threads.",
+    "BK7252N INO-A13N-V2.2 square camera (3.00.21.01_250512) restores RTC 2025-3-1 and enters deep sleep":
+        "A BK7252N dump from an INO-A13N-V2.2 square battery camera running an earlier xciot "
+        "build (sw_ver=3.00.21.01_250512 vs 250723). It initializes FAL and ROMFS, configures "
+        "SDIO pads P14..P19 (0x378), buttons P12/P13 (0x3C) and drives P22/P23 low (0x00) on "
+        "sleep entry after reading SARADC channel 0 (battary_status:139), xdev_opt "
+        "(magic=11223344) and setting the local clock to 2025-3-1 8:1:50.",
+    "BK7252N CY365 Car IP camera 1.7.0 (--xvr-selfclear) completes RF cal and probes as station":
+        "A BK7252N dump from a CY365 Car IP camera (EEE-249530-GDVHL, firmware 1.7.0). Without "
+        "--xvr-selfclear it spins at 0x0d4ba4 waiting for bit 31 of XVR register 0x00900000 to "
+        "self-clear. With --xvr-selfclear it completes RF calibration, configures SDIO pads "
+        "P14..P19 (0x378), button P7 (0x3C) and output P5 (0x02), transitions the Wi-Fi MAC RX "
+        "filter from monitor mode (0x7fffffde) to normal reception (0x3503848c), and begins active "
+        "station probing.",
+    "BK7231U Arnoo Winees AiDot RGBW A60 bulb (Leedarson CC8000 2.0.4.51) stays in Wi-Fi monitor pairing":
+        "The newer V2.3.72::V2.04.51 firmware dump from the Arnoo Winees WS010078261 AiDot RGBW "
+        "A60 (2nd Gen, light.A001139) smart bulb on a Leedarson CC8000 BK7231U module. Unlike the "
+        "earlier 2.0.3.47 build (which immediately switches from monitor mode to its SmartLight "
+        "Soft-AP), 2.0.4.51 remains in Wi-Fi MAC monitor/sniffing mode (RX filter 0x7fffffde) "
+        "after bringing up rw_main and configuring P2, P3, P20 and P21.",
+    "BK7231U Arnoo Winees AiDot RGBW A60 bulb (Leedarson CC8000 2.0.3.47) hosts SmartLight-5783 AP and answers ping":
+        "An earlier V2.2.18::V2.03.47 firmware dump from an Arnoo Winees WS010078261 AiDot RGBW "
+        "A60 (2nd Gen, light.A001139) smart bulb on a Leedarson CC8000 BK7231U module. It starts "
+        "its open pairing Soft-AP 'SmartLight-5783' (1c:d6:bd:d4:57:82, channel 7), assigns "
+        "192.168.10.2/24 to the emulated station from router 192.168.10.1 via DHCP, and replies "
+        "to ARP and ICMP ping while configuring P2, P3, P20, P21 and P23.",
+    "BK7231U Arnoo AiDot RGBW A19 bulb (Leedarson CC8000 2.0.4.51) enters Wi-Fi monitor pairing":
+        "A BK7231U dump from an Arnoo AiDot RGBW A19 (2nd Gen, light.A001126) smart bulb on a "
+        "Leedarson CC8000 module (V2.3.72::V2.04.51). It opens the Wi-Fi MAC RX filter "
+        "(0x7fffffde) into monitor/sniffing mode, prints its CC8000 version banner, configures "
+        "P2, P3, P20 and P21 as pull-up inputs, and starts the RivieraWaves rw_main task.",
+    "BK7231U C-Chip CC8000 HLK-B30 dev board boots RT-Thread 3.1.0 and FAL partitions":
+        "A BK7231U dump from a C-Chip CC8000 / Hi-Link HLK-B30 development board running RT-Thread "
+        "3.1.0. It reads its factory RF calibration parameters from flash (temp 280, crystal offset "
+        "48), initializes lwIP 2.0.2, registers station and soft-AP WLAN interfaces, and mounts the "
+        "RT-Thread FAL V0.4.0 partition table.",
+    "BK7231U C-Chip C-8133U RT-Thread 3.1.0 firmware mounts FAL partitions":
+        "An RT-Thread 3.1.0 build from the C-Chip C-8133U BK7231U directory (contrasting with the "
+        "AliOS Things dumps from the same board). It completes RF calibration, brings up lwIP 2.0.2, "
+        "registers station and soft-AP WLAN interfaces, and initializes the RT-Thread Flash "
+        "Abstraction Layer (FAL V0.4.0) partition table.",
+    "BK7231U C-Chip C-8133U AliOS LED driver (reset_counts:1) configures 500 Hz PWM without resetting":
+        "A companion BK7231U C-Chip C-8133U AliOS Things dump captured with reset_counts:1 in flash. "
+        "It configures all five PWM pads (P7, P8, P9, P24, P26), programs PWM0 for a 500 Hz period "
+        "(0xCB20 ticks at 26 MHz), starts its Wi-Fi scan, and confirms the 3x reset handler is not "
+        "triggered when reset_counts is below 3.",
+    "BK7231U C-Chip C-8133U AliOS LED driver (reset_counts:3) configures 5ch PWM and activates reset":
+        "The first BK7231U dump in the suite: a C-Chip C-8133U 5-channel RGB+CCT LED driver "
+        "running AliOS Things. It restores its persisted light parameters (50% brightness, "
+        "4500 K, Red=255), configures all five PWM pads (P7, P8, P9, P24, P26) into second-"
+        "function mode, initiates a Wi-Fi scan, and fires its three-cycle reset handler.",
+    "BK7231Q Tuya MOES Relay 1.0.4-2 (rst_cnt:2) drives relay high and scans":
+        "A second BK7231Q MOES WA2 one-gang relay unit on firmware 1.0.4 captured with rst_cnt:2. "
+        "Before manufacturing-test override, its default power-on state drives P18 high (relay "
+        "closed), configures P6 as a pull-up button input and P7 low, and initiates a Wi-Fi scan.",
+    "BK7231Q Tuya MOES Relay 1.0.4 (SDK 2.0.0) maps GPIO and enters product test":
+        "The 1.0.4 factory firmware of the BK7231Q MOES WA2 one-gang relay on Tuya IoT SDK 2.0.0 "
+        "(rst_cnt:1). It configures P18 as an active-high relay output and P6 as a pull-up button "
+        "input, completes SARADC calibration, scans the virtual tuya_mdev_test1 AP, and enters "
+        "product test mode.",
+    "BK7231Q Tuya MOES Relay 1.0.6 (SDK 2.0.0) scans factory SSID and enters product test":
+        "A factory-state BK7231Q MOES WA2 one-gang relay dump on Tuya IoT SDK 2.0.0 (version "
+        "1.0.6). With SOC_BK7231 SARADC FIFO_EMPTY bit 28 reported when drained, it completes "
+        "SARADC calibration and Wi-Fi scanning against the virtual tuya_mdev_test1 AP, measures "
+        "RSSI -45 dB, and enters product test mode.",
+    "BK7231Q Tuya MOES Relay 1.1.3-2 completes 3x-reset WDT reboot and enters EZ pairing":
+        "A BK7231Q MOES WA2 one-gang relay dump captured after two fast power cycles "
+        "(fsw_cnt_key=2). On first boot it reaches the three-cycle factory-reset threshold, "
+        "clears the counter in flash and reboots through the hardware watchdog; on the second "
+        "boot it reads back fsw_cnt_key=0, drains the SOC_BK7231 SARADC FIFO (bit 28), and "
+        "brings up EZ-mode Wi-Fi pairing.",
+    "BK7231M SparkleIoT XH-CB2S Matter mini switch boots into Matter init":
+        "A 4 MB plaintext BK7231M dump from a SparkleIoT XH-CB2S mini switch built on Quectel's "
+        "Matter SDK (svc_quec_matter) and Beken SDK 3.0.56. It boots the Beken RTOS on UART1, "
+        "enters the Matter application ('going Chip') and runs its network-config and log-flag "
+        "initialization on UART2.",
+    "BK7231M ChinaMobile HeJiaQin X1S plug joins JX-ChanCe-M2 and starts BL0937 calibration":
+        "A plaintext BK7231M China Mobile HeJiaQin (HuiJu X1S) CB2S metering plug on Beken SDK "
+        "3.0.56. With the BK7231N chip identity and SARADC_ADC_CTRL_CFG trigger modeled, it "
+        "completes RF calibration and BLE 5.1 startup, loads its factory CMEI/SN burninfo, "
+        "associates with the virtual 'JX-ChanCe-M2' factory AP over DHCP, and enters BL0937B "
+        "power-meter calibration.",
+    "BK7231M VeSync WHOGPLUG Plug 1.0.02 (SDK 3.0.56) calibrates, advertises BLE and scans":
+        "The 1.0.02 firmware revision of the VeSync/GreenSun WHOGPLUG EU smart plug on Beken SDK "
+        "3.0.56. Unlike 1.0.01, this build enforces the BK7231N chip-ID check and exercises the "
+        "SARADC_ADC_CTRL_CFG trigger during RF calibration before starting FlashDB, BLE 5.1 "
+        "advertising, pwm_new pulse capture and Wi-Fi scanning.",
+    "BK7231M VeSync Aubess BSD33 BSDOG02 plug (SDK 3.0.56) calibrates, advertises BLE and scans":
+        "A plaintext BK7231M VeSync/Aubess BSD33 (BSDOG02) smart-plug dump on Beken SDK 3.0.56. "
+        "It enforces the BK7231N chip-ID check and pulses SARADC_ADC_CTRL_CFG bit 8 during RF "
+        "calibration before mounting its FlashDB KV partitions, bringing up BLE 5.1 advertising, "
+        "configuring pwm_new metering capture and starting a Wi-Fi scan.",
     "BK7231T Tuya BN-LINK WB2S metering plug boots its relay application":
         "A newly added stock BN-LINK WB2S metering-plug dump on Tuya SDK 2.0.0. It recovers its "
         "protected configuration, validates the licensed product key, initializes the dltj energy-"
@@ -3738,14 +5288,23 @@ def _result(test_config, passed, elapsed=0.0, insns=None, timed_out=False, outpu
     }
 
 
+_PORT_LOCK = threading.Lock()
+_CLAIMED_PORTS = set()
+
+
 def _free_port():
     """A TCP port on 127.0.0.1 that nothing listens on right now."""
     import socket
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+    with _PORT_LOCK:
+        for _ in range(32):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+            s.close()
+            if port not in _CLAIMED_PORTS:
+                _CLAIMED_PORTS.add(port)
+                return port
+        return port
 
 
 # 802.11 frame kinds a case can require in its capture ("pcap_expect"), as
@@ -3976,7 +5535,12 @@ def run_snapshot_roundtrip(test_config):
         print(f"FAIL: Binary not found: {binary}")
         return _result(test_config, passed=False, output="Binary not found: %s" % binary)
 
-    snap = os.path.join(tempfile.gettempdir(), "bekensim_selftest_%d.snap" % os.getpid())
+    fd, snap = tempfile.mkstemp(prefix="bekensim_selftest_", suffix=".snap")
+    os.close(fd)
+    try:
+        os.remove(snap)
+    except OSError:
+        pass
     base = [sys.executable, MAIN_SCRIPT, binary] + test_config["args"]
     start = time.time()
     a_lines, a_to = _stream_until(base + ["--snapshot-save", snap, "--snapshot-at",
@@ -4362,7 +5926,7 @@ def run_test(test_config):
     print(f"Test '{name}' PASSED. ({elapsed:.0f}s)")
     return result
 
-def _write_report(results):
+def _write_report(results, wall_time=None):
     """Emit the HTML report to report/index.html. Never fails the run itself."""
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -4376,7 +5940,7 @@ def _write_report(results):
                 os.environ.get("GITHUB_SERVER_URL", "https://github.com"),
                 os.environ.get("GITHUB_REPOSITORY", ""), run_id)
         meta = {
-            "total_time": sum(r["elapsed"] for r in results),
+            "total_time": wall_time if wall_time is not None else sum(r["elapsed"] for r in results),
             "chips": sorted({r["chip"] for r in results if r.get("chip")}),
             "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
             "commit": os.environ.get("GITHUB_SHA"),
@@ -4396,21 +5960,40 @@ def main():
     # leaves report/index.html alone - it describes the whole suite.
     patterns = [a.lower() for i, a in enumerate(sys.argv[1:])
                 if i > 0 and sys.argv[i] == "-k"]
+    jobs_arg = [int(a) for i, a in enumerate(sys.argv[1:])
+                if i > 0 and sys.argv[i] in ("-j", "--jobs")]
+    default_jobs = 1 if os.environ.get("CI") else min(6, os.cpu_count() or 1)
+    jobs = max(1, jobs_arg[-1] if jobs_arg else int(os.environ.get("JOBS") or default_jobs))
     selected = [t for t in TEST_CASES
                 if not patterns or any(p in t["name"].lower() for p in patterns)]
     if patterns and not selected:
         print("No test name contains any of: %s" % ", ".join(patterns))
         sys.exit(2)
 
-    results = [run_test(test) for test in selected]
+    suite_start = time.time()
+    if jobs > 1 and len(selected) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        indexed = sorted(enumerate(selected),
+                         key=lambda it: (-int(bool(it[1].get("snapshot_roundtrip"))),
+                                         -it[1].get("timeout", 60),
+                                         it[0]))
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            futs = [(idx, pool.submit(run_test, t)) for idx, t in indexed]
+            out = [None] * len(selected)
+            for idx, fut in futs:
+                out[idx] = fut.result()
+            results = out
+    else:
+        results = [run_test(test) for test in selected]
+    wall_time = time.time() - suite_start
     passed = sum(1 for r in results if r["passed"])
     failed = len(results) - passed
 
     print(f"=====================================")
-    print(f"Test Run Completed: {passed} passed, {failed} failed.")
+    print(f"Test Run Completed: {passed} passed, {failed} failed. ({wall_time:.1f}s)")
 
     if not patterns:
-        _write_report(results)
+        _write_report(results, wall_time=wall_time)
 
     sys.exit(1 if failed else 0)
 

@@ -209,6 +209,8 @@ class SimulatorState:
         # True while stdout sits at a line boundary. Report lines may only be
         # written then, so they never land inside a UART log line.
         self.uart_at_line_start = True
+        self.last_uart_insn = 0
+        self.uart_line_tail = b""
         # The RTOS idle task's stack as (low, high), once found; see idle
         # skipping in _run_chunked. Here, not on the emulator, so a snapshot
         # carries it and a resumed run skips exactly as the original did.
@@ -992,6 +994,11 @@ class BekenEmulator:
         # marker string once the emission rate went up.
         if data:
             self.state.uart_at_line_start = data.endswith(b"\n")
+            self.state.last_uart_insn = self.state.insn_count
+            if self.state.uart_at_line_start:
+                self.state.uart_line_tail = b""
+            else:
+                self.state.uart_line_tail = (self.state.uart_line_tail + data)[-16:]
             if self._snapshot_marker is not None:
                 self._snapshot_check_uart(data)
 
@@ -1130,6 +1137,19 @@ class BekenEmulator:
             # boot. Guarded by _emit_insns (off unless the harness asks) and
             # throttled, so this costs nothing on a normal run.
             if self._emit_insns:
+                # An RT-Thread shell prompt ('msh />') ends without a newline
+                # and then parks waiting for console input forever. Once the
+                # UART has been silent for 500k instructions (10 slow ticks),
+                # close the prompt line so pending [EMU_GPIO]/[EMU_PERIPH]/
+                # [EMU_INSNS] lines can flush without splitting any other stream.
+                if (not state.uart_at_line_start
+                        and state.uart_line_tail.rstrip(b" ").endswith(b"msh />")
+                        and state.insn_count - state.last_uart_insn >= 500_000):
+                    buf = sys.__stdout__.buffer
+                    buf.write(b"\n")
+                    buf.flush()
+                    state.uart_at_line_start = True
+                    state.uart_line_tail = b""
                 # Peripheral changes go out on THIS tick (the slow one)
                 # rather than the 1M-instruction one, and only for registers
                 # that actually changed. The emulator never exits on its own -
@@ -1611,9 +1631,9 @@ class BekenEmulator:
                     "ADCDBG cfg write=0x%08x chnl_en=%d chip=%#x\n"
                     % (value, (value >> 2) & 1, self.chip_id_value))
                 sys.__stderr__.flush()
-            # Only the BK7231(T/U/N/M) SARADC layout uses this model; the
-            # 7238/7252/7252N layout differs and is served via 0x802c0c.
-            if self.is_bk7231:
+            # The BK7231(T/U/N/M) and BK7252 (SOC_BK7221U) SARADC layouts use
+            # this model; the 7238/7252N layout differs and is served via 0x802c0c.
+            if self.is_bk7231 or self.is_bk7252:
                 if value & (1 << 2):                # CHNL_EN: start converting
                     if self.state.saradc_pending == 0:
                         self.state.saradc_pending = 32
@@ -1670,6 +1690,14 @@ class BekenEmulator:
             return
         if address == 0x00800004:
             mu.mem_write(address, struct.pack("<I", self.device_id_value))
+            return
+        # BK7252 SCTRL_USB_PLUG_WAKEUP (0x00800084): bit 21 (USB_PLUG_IN_STATUS)
+        # reports USB 5V power present so battery-powered cameras (CYCAM/T99)
+        # stay awake and boot their application instead of shutting down into
+        # deep sleep when the power button is not held.
+        if address == 0x00800084 and self.is_bk7252:
+            cur = struct.unpack("<I", mu.mem_read(address, 4))[0]
+            mu.mem_write(address, struct.pack("<I", cur | (1 << 21)))
             return
         # GPIO config reads combine firmware-owned config with the external pad
         # level.  Only real pin slots come through this path; the adjacent
@@ -1750,22 +1778,51 @@ class BekenEmulator:
             return
 
         if address == 0x00802c00:
-            # Config readback: FIFO_EMPTY (bit 30) reflects the emulated FIFO -
-            # set when drained, clear while samples pend so the ISR's
-            # `while((cfg & FIFO_EMPTY)==0)` loop reads them. INT_CLR (bit 8) is
-            # deliberately never reflected, so saradc_int_clr()'s do/while exits.
-            # Identical to the historical constant (1<<30) whenever idle.
-            cfg = 0 if (self.is_bk7231
-                        and self.state.saradc_pending) else (1 << 30)
+            # Config readback: FIFO_EMPTY (bit 28 on SOC_BK7231 Q/T/U, bit 30
+            # on SOC_BK7231N/BK7252) reflects the emulated FIFO - set when drained,
+            # clear while samples pend so the ISR's `while((cfg & FIFO_EMPTY)==0)`
+            # loop reads them. INT_CLR (bit 7/8) is deliberately never reflected,
+            # so saradc_int_clr()'s do/while exits.
+            cfg = 0 if ((self.is_bk7231 or self.is_bk7252)
+                        and self.state.saradc_pending) else ((1 << 28) | (1 << 30))
             mu.mem_write(address, struct.pack("<I", cfg))
+            return
+
+        # BK7231N/BK7252 SARADC_ADC_CTRL_CFG (0x00802c08). Newer SDK builds
+        # (SDK Rev 3.0.56+, e.g. VeSync BSD33 / WHOGPLUG 1.0.02, ChinaMobile
+        # HeJiaQin) set bit 8 (0x100) here during calibration_main's SARADC
+        # reads and spin on `while (REG_READ(0x802c08) & 0x100)` waiting for
+        # hardware to clear the trigger bit.
+        if address == 0x00802c08 and (self.is_bk7231 or self.is_bk7252):
+            cur = struct.unpack("<I", mu.mem_read(address, 4))[0]
+            mu.mem_write(address, struct.pack("<I", cur & ~0x100))
             return
 
         # BK7238/BK7252N SARADC state register (SARADC_ADC_STATE). Its driver
         # drains the sample FIFO with `while(!(STATE & FIFO_EMPTY)) read DATA;`
         # spin loops during init; report FIFO_EMPTY (bit 30) so they terminate
         # immediately. Actual sampling is interrupt-driven, never polled here.
-        if address == 0x00802c0c:
+        if address == 0x00802c0c and not self.is_bk7252:
             mu.mem_write(address, struct.pack("<I", 1 << 30))
+            return
+
+        # BK7251/BK7252 SDCard controller (0x00802d00..0x00802d3c). Camera
+        # firmwares probe for an SD card during boot by writing CMD_SEND_CTRL
+        # (0x00802d00) and spinning on SDCARD_CMDRSP_INT_SEL (0x00802d24) until
+        # one of NORSP_END_INT (bit 0), RSP_END_INT (bit 1), or TIMEOUT_INT
+        # (bit 2) asserts. Report NORSP_END_INT when the command does not
+        # expect a response (CMD_FLAGS_RSP bit 1 clear, e.g. CMD0) and
+        # TIMEOUT_INT | DATA_TIME_OUT_INT (bits 2 and 5) when a response is
+        # expected from the absent card. Also report RX/TX FIFO ready (bits
+        # 18..19) on SDCARD_FIFO_THRESHOLD (0x00802d34).
+        if address == 0x00802d24:
+            cmd_ctrl = struct.unpack("<I", mu.mem_read(0x00802d00, 4))[0]
+            stat = 0x24 if (cmd_ctrl & 0x2) else 0x01
+            mu.mem_write(address, struct.pack("<I", stat))
+            return
+        if address == 0x00802d34:
+            cur = struct.unpack("<I", mu.mem_read(address, 4))[0]
+            mu.mem_write(address, struct.pack("<I", cur | (3 << 18)))
             return
 
         # SCTRL_EFUSE_CTRL readback: shadow with EFUSE_OPER_EN self-cleared.
@@ -1944,9 +2001,9 @@ class BekenEmulator:
             mu.mem_write(address, struct.pack("<I", val))
             return
 
-        if address in [self.UART1_FIFO_STATUS, self.UART2_FIFO_STATUS, 0x00802c00]:
+        if self.only_uart or address in (self.UART1_FIFO_STATUS, self.UART2_FIFO_STATUS, 0x00802c00):
             return
-        
+
         try:
             mem_val = mu.mem_read(address, size)
             val = struct.unpack("<I" if size == 4 else "<H" if size == 2 else "B", mem_val)[0]
@@ -1969,6 +2026,24 @@ class BekenEmulator:
             self._print(f"Failed to map page 0x{page:08x}: {e}")
         return False
 
+    @staticmethod
+    def _patch_ldm_caret_stubs(img):
+        """Normalize word-aligned `ldmfd sp!, {r0, r1}^` (0xe8fd0003) in the
+        first 2 KB (boot_handlers.S IRQ/FIQ entry stubs in AliOS Things / SDK
+        3.0.65) to `ldmfd sp!, {r0, r1}` (0xe8bd0003).  R0 and R1 are unbanked
+        across all ARM modes so the S-bit has no architectural effect, but
+        QEMU/Unicorn's ARMv5 decoder rejects LDM(2) (S=1, PC=0) with writeback
+        (W=1) as UC_ERR_INSN_INVALID.
+        """
+        head = img[:0x800]
+        if b"\x03\x00\xfd\xe8" not in head:
+            return bytes(img)
+        buf = bytearray(img)
+        for off in range(0, min(len(buf), 0x800) - 3, 4):
+            if buf[off:off + 4] == b"\x03\x00\xfd\xe8":
+                buf[off + 2] = 0xbd
+        return bytes(buf)
+
     def setup(self):
         self.mu.mem_map(self.FLASH_BASE, self.FLASH_SIZE)
         self.mu.mem_map(self.RAM_BASE, self.RAM_SIZE)
@@ -1978,9 +2053,11 @@ class BekenEmulator:
         self.mu.mem_write(self.FLASH_BASE, self.raw_flash[:self.FLASH_SIZE])
         
         if self.bootloader:
-            self.mu.mem_write(0x00000000, self.bootloader)
+            boot_img = self._patch_ldm_caret_stubs(self.bootloader)
+            self.mu.mem_write(0x00000000, boot_img)
         if self.app:
-            self.mu.mem_write(0x00010000, self.app)
+            app_img = self._patch_ldm_caret_stubs(self.app)
+            self.mu.mem_write(0x00010000, app_img)
 
         self.mu.mem_write(self.UART1_FIFO_STATUS, struct.pack("<I", 1 << 17 | 1 << 19 | 1 << 20))
         self.mu.mem_write(self.UART2_FIFO_STATUS, struct.pack("<I", 1 << 17 | 1 << 19 | 1 << 20))
@@ -2140,7 +2217,8 @@ class BekenEmulator:
         # BKSNAP01 is intentionally forward-readable.  Snapshots created before
         # the watchdog model simply resume with a reset-value, idle watchdog.
         for name, value in (("wdt_first_period", None), ("wdt_period_ms", 0),
-                            ("wdt_clock_enabled", True), ("wdt_deadline", None)):
+                            ("wdt_clock_enabled", True), ("wdt_deadline", None),
+                            ("last_uart_insn", 0), ("uart_line_tail", b"")):
             if not hasattr(self.state, name):
                 setattr(self.state, name, value)
         if not hasattr(self.state, "gpio_hw"):
