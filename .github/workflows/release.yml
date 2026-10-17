@@ -1,14 +1,19 @@
-name: Beken Simulator Windows Release
+name: Beken Simulator Release (Windows & Linux)
 
 on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
   workflow_dispatch:
   release:
     types: [published]
 
-# The test/Pages workflow remains read-only. Only this release-specific job may
-# replace an asset on a release the repository owner has already published.
 permissions:
   contents: write
+
+concurrency:
+  group: "release-${{ github.ref }}"
+  cancel-in-progress: false
 
 jobs:
   windows-exe:
@@ -83,14 +88,118 @@ jobs:
           dist/BekenSimulator.exe.sha256
         if-no-files-found: error
 
-    - name: Attach executable to GitHub release
-      if: ${{ github.event_name == 'release' }}
+  linux-x64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - name: Checkout release source
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.release.tag_name || github.ref }}
+
+    - name: Set up Python 3.10 x64
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.10"
+        architecture: "x64"
+        cache: pip
+
+    - name: Install system Tk and Xvfb dependencies
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq xvfb python3-tk tk8.6 tcl8.6 binutils
+
+    - name: Install emulator dependencies and PyInstaller
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install -r requirements.txt "PyInstaller==6.22.3"
+
+    - name: Build standalone Linux x64 executable
+      run: bash ./tools/build_linux_release.sh
+
+    - name: Smoke-test packaged Unicorn runtime and firmware resources
+      run: ./dist/BekenSimulator-linux-x64 --package-smoke
+
+    - name: Run packaged GUI self-tests
+      run: xvfb-run -a ./dist/BekenSimulator-linux-x64 --selftest
+
+    - name: Write SHA-256 checksum
+      run: |
+        (cd dist && sha256sum BekenSimulator-linux-x64 > BekenSimulator-linux-x64.sha256)
+
+    - name: Preserve workflow artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: BekenSimulator-linux-x64
+        path: |
+          dist/BekenSimulator-linux-x64
+          dist/BekenSimulator-linux-x64.sha256
+        if-no-files-found: error
+
+  publish-release:
+    needs: [windows-exe, linux-x64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Download Windows artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: BekenSimulator-windows-x64
+        path: release-assets
+
+    - name: Download Linux artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: BekenSimulator-linux-x64
+        path: release-assets
+
+    - name: Publish or update GitHub Release
       env:
         GH_TOKEN: ${{ github.token }}
-      shell: pwsh
       run: |
-        gh release upload `
-          "${{ github.event.release.tag_name }}" `
-          ".\dist\BekenSimulator.exe" `
-          ".\dist\BekenSimulator.exe.sha256" `
+        set -euo pipefail
+        if [[ "${{ github.event_name }}" == "release" ]]; then
+          TAG="${{ github.event.release.tag_name }}"
+          TITLE="${TAG}"
+        elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+          TAG="${{ github.ref_name }}"
+          TITLE="Beken Simulator ${TAG}"
+        else
+          TAG="latest"
+          TITLE="Beken Simulator (Latest Build)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f "${TAG}" "${{ github.sha }}"
+          git push -f origin "refs/tags/${TAG}"
+        fi
+
+        SHORT_SHA="$(echo "${{ github.sha }}" | cut -c1-7)"
+        NOTES="Standalone Windows x64 (\`BekenSimulator.exe\`) and Linux x64 (\`BekenSimulator-linux-x64\`) builds with bundled sample firmwares (commit \`${SHORT_SHA}\`)."
+
+        if ! gh release view "${TAG}" >/dev/null 2>&1; then
+          gh release create "${TAG}" \
+            --target "${{ github.sha }}" \
+            --title "${TITLE}" \
+            --notes "${NOTES}" \
+            --latest
+        elif [[ "${TAG}" == "latest" ]]; then
+          gh release edit "${TAG}" \
+            --target "${{ github.sha }}" \
+            --title "${TITLE}" \
+            --notes "${NOTES}" \
+            --latest
+        fi
+
+        gh release upload "${TAG}" \
+          release-assets/BekenSimulator.exe \
+          release-assets/BekenSimulator.exe.sha256 \
+          release-assets/BekenSimulator-linux-x64 \
+          release-assets/BekenSimulator-linux-x64.sha256 \
           --clobber

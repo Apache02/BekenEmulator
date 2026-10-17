@@ -5962,7 +5962,7 @@ def main():
                 if i > 0 and sys.argv[i] == "-k"]
     jobs_arg = [int(a) for i, a in enumerate(sys.argv[1:])
                 if i > 0 and sys.argv[i] in ("-j", "--jobs")]
-    default_jobs = 1 if os.environ.get("CI") else min(6, os.cpu_count() or 1)
+    default_jobs = min(4, os.cpu_count() or 1) if os.environ.get("CI") else min(6, os.cpu_count() or 1)
     jobs = max(1, jobs_arg[-1] if jobs_arg else int(os.environ.get("JOBS") or default_jobs))
     selected = [t for t in TEST_CASES
                 if not patterns or any(p in t["name"].lower() for p in patterns)]
