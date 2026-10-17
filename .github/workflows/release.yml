@@ -1,4 +1,4 @@
-name: Beken Simulator Release (Windows & Linux)
+name: Beken Emulator Release (Windows & Linux)
 
 on:
   push:
@@ -55,7 +55,7 @@ jobs:
       shell: pwsh
       run: |
         $process = Start-Process `
-          -FilePath ".\dist\BekenSimulator.exe" `
+          -FilePath ".\dist\BekenEmulator.exe" `
           -ArgumentList "--package-smoke" `
           -Wait -PassThru -NoNewWindow
         if ($process.ExitCode -ne 0) {
@@ -66,7 +66,7 @@ jobs:
       shell: pwsh
       run: |
         $process = Start-Process `
-          -FilePath ".\dist\BekenSimulator.exe" `
+          -FilePath ".\dist\BekenEmulator.exe" `
           -ArgumentList "--selftest" `
           -Wait -PassThru -NoNewWindow
         if ($process.ExitCode -ne 0) {
@@ -76,16 +76,16 @@ jobs:
     - name: Write SHA-256 checksum
       shell: pwsh
       run: |
-        $hash = (Get-FileHash ".\dist\BekenSimulator.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
-        "$hash  BekenSimulator.exe" | Set-Content ".\dist\BekenSimulator.exe.sha256" -NoNewline
+        $hash = (Get-FileHash ".\dist\BekenEmulator.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+        "$hash  BekenEmulator.exe" | Set-Content ".\dist\BekenEmulator.exe.sha256" -NoNewline
 
     - name: Preserve workflow artifact
       uses: actions/upload-artifact@v4
       with:
-        name: BekenSimulator-windows-x64
+        name: BekenEmulator-windows-x64
         path: |
-          dist/BekenSimulator.exe
-          dist/BekenSimulator.exe.sha256
+          dist/BekenEmulator.exe
+          dist/BekenEmulator.exe.sha256
         if-no-files-found: error
 
   linux-x64:
@@ -119,22 +119,22 @@ jobs:
       run: bash ./tools/build_linux_release.sh
 
     - name: Smoke-test packaged Unicorn runtime and firmware resources
-      run: ./dist/BekenSimulator-linux-x64 --package-smoke
+      run: ./dist/BekenEmulator-linux-x64 --package-smoke
 
     - name: Run packaged GUI self-tests
-      run: xvfb-run -a ./dist/BekenSimulator-linux-x64 --selftest
+      run: xvfb-run -a ./dist/BekenEmulator-linux-x64 --selftest
 
     - name: Write SHA-256 checksum
       run: |
-        (cd dist && sha256sum BekenSimulator-linux-x64 > BekenSimulator-linux-x64.sha256)
+        (cd dist && sha256sum BekenEmulator-linux-x64 > BekenEmulator-linux-x64.sha256)
 
     - name: Preserve workflow artifact
       uses: actions/upload-artifact@v4
       with:
-        name: BekenSimulator-linux-x64
+        name: BekenEmulator-linux-x64
         path: |
-          dist/BekenSimulator-linux-x64
-          dist/BekenSimulator-linux-x64.sha256
+          dist/BekenEmulator-linux-x64
+          dist/BekenEmulator-linux-x64.sha256
         if-no-files-found: error
 
   publish-release:
@@ -151,13 +151,13 @@ jobs:
     - name: Download Windows artifact
       uses: actions/download-artifact@v4
       with:
-        name: BekenSimulator-windows-x64
+        name: BekenEmulator-windows-x64
         path: release-assets
 
     - name: Download Linux artifact
       uses: actions/download-artifact@v4
       with:
-        name: BekenSimulator-linux-x64
+        name: BekenEmulator-linux-x64
         path: release-assets
 
     - name: Publish or update GitHub Release
@@ -170,10 +170,10 @@ jobs:
           TITLE="${TAG}"
         elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
           TAG="${{ github.ref_name }}"
-          TITLE="Beken Simulator ${TAG}"
+          TITLE="Beken Emulator ${TAG}"
         else
           TAG="latest"
-          TITLE="Beken Simulator (Latest Build)"
+          TITLE="Beken Emulator (Latest Build)"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -f "${TAG}" "${{ github.sha }}"
@@ -181,7 +181,7 @@ jobs:
         fi
 
         SHORT_SHA="$(echo "${{ github.sha }}" | cut -c1-7)"
-        NOTES="Standalone Windows x64 (\`BekenSimulator.exe\`) and Linux x64 (\`BekenSimulator-linux-x64\`) builds with bundled sample firmwares (commit \`${SHORT_SHA}\`)."
+        NOTES="Standalone Windows x64 (\`BekenEmulator.exe\`) and Linux x64 (\`BekenEmulator-linux-x64\`) builds with bundled sample firmwares (commit \`${SHORT_SHA}\`)."
 
         if ! gh release view "${TAG}" >/dev/null 2>&1; then
           gh release create "${TAG}" \
@@ -198,8 +198,8 @@ jobs:
         fi
 
         gh release upload "${TAG}" \
-          release-assets/BekenSimulator.exe \
-          release-assets/BekenSimulator.exe.sha256 \
-          release-assets/BekenSimulator-linux-x64 \
-          release-assets/BekenSimulator-linux-x64.sha256 \
+          release-assets/BekenEmulator.exe \
+          release-assets/BekenEmulator.exe.sha256 \
+          release-assets/BekenEmulator-linux-x64 \
+          release-assets/BekenEmulator-linux-x64.sha256 \
           --clobber

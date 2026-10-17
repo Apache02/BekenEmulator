@@ -220,7 +220,7 @@ class SimulatorUI:
     def __init__(self, root, initial_image=None, settings_path=CONFIG_PATH):
         self.root = root
         self.settings_path = settings_path    # None: neither read nor write one
-        root.title("BekenSimulator")
+        root.title("BekenEmulator")
         root.minsize(1280, 620)
 
         self.emu = None
@@ -917,10 +917,10 @@ class SimulatorUI:
         try:
             opened = webbrowser.open(self._active_forward_url, new=2)
         except Exception as exc:
-            messagebox.showerror("BekenSimulator", "Could not open the browser: %s" % exc)
+            messagebox.showerror("BekenEmulator", "Could not open the browser: %s" % exc)
             return
         if not opened:
-            messagebox.showerror("BekenSimulator", "Could not find a browser to open %s"
+            messagebox.showerror("BekenEmulator", "Could not find a browser to open %s"
                                  % self._active_forward_url)
 
     def _set_text_option(self, name, value):
@@ -1057,7 +1057,7 @@ class SimulatorUI:
         path = os.path.join(FIRMWARE_DIR, profile["file"])
         if not os.path.isfile(path):
             messagebox.showerror(
-                "BekenSimulator",
+                "BekenEmulator",
                 "The bundled quick-run image is missing:\n%s" % path)
             return
         if profile.get("wifi"):
@@ -1330,7 +1330,7 @@ class SimulatorUI:
         """Write the captured frames as an Ethernet pcap, for Wireshark."""
         rows = self._visible_frames()
         if not rows:
-            messagebox.showinfo("BekenSimulator", "Nothing captured yet.")
+            messagebox.showinfo("BekenEmulator", "Nothing captured yet.")
             return
         path = filedialog.asksaveasfilename(defaultextension=".pcap",
                                             filetypes=[("pcap", "*.pcap"), ("All", "*.*")])
@@ -1723,7 +1723,7 @@ class SimulatorUI:
             return
         path = self.var_image.get().strip()
         if not path or not os.path.isfile(path):
-            messagebox.showerror("BekenSimulator", "Pick a flash dump first.")
+            messagebox.showerror("BekenEmulator", "Pick a flash dump first.")
             return
         self._refresh_tuya_config(path=path)
         # Read every Tk variable HERE, on the main thread. Tkinter is not
@@ -1732,7 +1732,7 @@ class SimulatorUI:
             cfg = self._collect_cfg()
         except ValueError as e:
             self.tabs.select(self.config_tab)
-            messagebox.showerror("BekenSimulator", str(e))
+            messagebox.showerror("BekenEmulator", str(e))
             return
         self._run_tuya_config = self.tuya_config
         self._run_image = path

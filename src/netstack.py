@@ -1212,7 +1212,7 @@ class TcpConn:
             return                              # wait for the whole body
         self.answered = True
         request = head.split(b"\r\n", 1)[0].decode("latin-1", "replace")
-        reply = ("BekenSimulator offline network: %s\n" % request).encode("latin-1", "replace")
+        reply = ("BekenEmulator offline network: %s\n" % request).encode("latin-1", "replace")
         self.queue(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n"
                    b"Connection: close\r\n\r\n%s" % (len(reply), reply))
         self.close_after_flush = True
@@ -1766,7 +1766,7 @@ class NetStack:
         if not self.ip:
             return
         self.ping_seq += 1
-        icmp = struct.pack("!BBHHH", 8, 0, 0, 0xBEEF, self.ping_seq) + b"BekenSimulator ping"
+        icmp = struct.pack("!BBHHH", 8, 0, 0, 0xBEEF, self.ping_seq) + b"BekenEmulator ping"
         icmp = icmp[:2] + struct.pack("!H", checksum(icmp)) + icmp[4:]
         self.send_ip(ipv4_packet(self.ip, target_ip, IP_ICMP, icmp, ident=self.ident), target_ip)
         self.ident = (self.ident + 1) & 0xFFFF
@@ -2189,7 +2189,7 @@ class NetStack:
         conn.request_path = path
         conn.opened_us = self.now_us
         conn.last_activity_us = self.now_us
-        conn.queue(("GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: BekenSimulator\r\n"
+        conn.queue(("GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: BekenEmulator\r\n"
                     "Connection: close\r\n\r\n" % (path, ip2str(self.device_ip))).encode("latin-1"))
         self.conns[(self.ip, lport, self.device_ip, 80)] = conn
         conn.state = "SYN_SENT"
@@ -2402,7 +2402,7 @@ def _run_selftests():
     check(cl.ip == str2ip("192.168.4.3") and cl.dhcp_state == "STATIC", "static fallback next to the device's address")
     kinds = [(f[12:14], f[14 + 20 + 0] if f[12:14] == b"\x08\x00" else None) for f in out2[-2:]]
     check(any(k[0] == b"\x08\x06" for k in kinds) and any(k == (b"\x08\x00", 8) for k in kinds), "ARP request and ping sent to the device")
-    echo = b"\x00\x00\x00\x00\xbe\xef\x00\x01" + b"BekenSimulator ping"
+    echo = b"\x00\x00\x00\x00\xbe\xef\x00\x01" + b"BekenEmulator ping"
     echo = echo[:2] + struct.pack("!H", checksum(echo)) + echo[4:]
     cl.input(eth_frame(cl.mac, dev_mac, ETH_IP, ipv4_packet(str2ip("192.168.4.1"), cl.ip, IP_ICMP, echo)))
     check(cl.ping_replies == 1 and any("ping reply from 192.168.4.1" in l for l in logs2), "ping reply recognised")

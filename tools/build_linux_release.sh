@@ -41,7 +41,7 @@ done
     --clean \
     --onefile \
     --console \
-    --name BekenSimulator-linux-x64 \
+    --name BekenEmulator-linux-x64 \
     --paths "${REPO_ROOT}" \
     --distpath "${DIST_PATH}" \
     --workpath "${WORK_PATH}" \
@@ -51,7 +51,7 @@ done
     "${DATA_ARGS[@]}" \
     tools/sim_ui.py
 
-BIN_PATH="${DIST_PATH}/BekenSimulator-linux-x64"
+BIN_PATH="${DIST_PATH}/BekenEmulator-linux-x64"
 if [[ ! -f "${BIN_PATH}" ]]; then
     echo "Error: PyInstaller reported success but did not create ${BIN_PATH}" >&2
     exit 1

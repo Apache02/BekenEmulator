@@ -1,4 +1,4 @@
-name: Beken Simulator Self-Tests
+name: Beken Emulator Self-Tests
 
 on:
   push:
@@ -73,7 +73,7 @@ jobs:
 
     # The UI needs a display to build its widgets. xvfb gives it one; if it is
     # unavailable the self-tests report a skip rather than failing the build.
-    - name: Simulator UI self-tests (no firmware)
+    - name: Emulator UI self-tests (no firmware)
       run: |
         sudo apt-get update -qq && sudo apt-get install -y -qq xvfb python3-tk
         xvfb-run -a python tools/sim_ui.py --selftest

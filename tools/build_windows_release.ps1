@@ -40,7 +40,7 @@ try {
         "--clean",
         "--onefile",
         "--console",
-        "--name", "BekenSimulator",
+        "--name", "BekenEmulator",
         "--paths", $repoRoot,
         "--distpath", $distPath,
         "--workpath", $workPath,
@@ -56,7 +56,7 @@ try {
         throw "PyInstaller failed with exit code $LASTEXITCODE"
     }
 
-    $exePath = Join-Path $distPath "BekenSimulator.exe"
+    $exePath = Join-Path $distPath "BekenEmulator.exe"
     if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
         throw "PyInstaller reported success but did not create $exePath"
     }

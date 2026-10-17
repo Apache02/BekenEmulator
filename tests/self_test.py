@@ -293,13 +293,13 @@ TEST_CASES = [
             "Info:CMD:MqttPushReachedTheFirmware",
         ],
         "pcap_expect": ["beacon", "authentication", "association request", "association response",
-                        "data", "GET /hello?dev=obk", "BekenSimulator offline network",
+                        "data", "GET /hello?dev=obk", "BekenEmulator offline network",
                         "obkSim/connected"],
         # The same traffic at the IP level, which is what the GUI's details
         # window shows and what --pcap-ip writes: the frames themselves, both
         # directions, the bytes the device actually put on the wire.
         "ip_pcap_expect": ["GET /hello?dev=obk", "api.bekensim.test",
-                           "BekenSimulator offline network", "obkSim", "cmnd/obkSim/echo"],
+                           "BekenEmulator offline network", "obkSim", "cmnd/obkSim/echo"],
     },
     {
         # Snapshots (--snapshot-save / --snapshot-load), the core of it: the
@@ -5473,7 +5473,7 @@ def _http_probe(port, path, expect, emit, timeout=180, method="GET", body=None, 
     """
     import socket
     payload = body.encode("utf-8") if body is not None else b""
-    req = ("%s %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nUser-Agent: Mozilla/5.0 (BekenSimulator self-test)\r\n"
+    req = ("%s %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nUser-Agent: Mozilla/5.0 (BekenEmulator self-test)\r\n"
            "Accept: text/html,application/xhtml+xml,application/json\r\nConnection: close\r\n"
            % (method, path, port))
     if body is not None:
