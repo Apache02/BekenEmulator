@@ -256,7 +256,7 @@ TEST_CASES = [
         # sendGet http://api.bekensim.test/hello?dev=obk". Offline, each gets a
         # local answer: NTP from the host clock (OBK prints the time it
         # parsed), the GET from the offline HTTP responder - OBK's client
-        # reports the whole 144-byte reply as received - and MQTT from the
+        # reports the whole 143-byte reply as received - and MQTT from the
         # offline broker: CONNECT, SUBSCRIBEs and the "connected = online"
         # PUBLISH, after which OBK reports the session up. The repeating GET
         # must be answered twice: a fresh connection, port and sequence each
@@ -281,7 +281,7 @@ TEST_CASES = [
             "[NET] DNS api.bekensim.test -> 10.200.",
             "sends: HTTP GET /hello?dev=obk HTTP/1.1 host api.bekensim.test",
             ("[NET] HTTP GET /hello?dev=obk HTTP/1.1 answered 200 (offline)", 2),
-            "httpclient - no response buff, skipped 144",
+            "httpclient - no response buff, skipped 143",
             "[NET] DNS mqtt.bekensim.test -> 10.200.",
             "sends: MQTT CONNECT (v3.1.1, client id 'obkSim'",
             "connected to the offline broker",
