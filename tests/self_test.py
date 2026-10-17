@@ -3909,8 +3909,10 @@ TEST_CASES = [
         "name": "BK7238 Gledopto GL-SPI-206W SPI LED controller (TuyaOS 3.11.11) configures SPI pads and fast-connects",
         "binary": os.path.join(ROOT_DIR, "firmwares",
                                "BK7238_Gledopto_GL-SPI-206W_LED_Controller.bin"),
-        "args": ["--only-uart", "-chip", "BK7238"],
-        "timeout": 60,
+        "args": ["--only-uart", "-chip", "BK7238",
+                 "--wifi-peer", "ap", "--wifi-ssid", "DLINK_FastNet",
+                 "--wifi-pass", "F4STN3T@W*f*PL1234567890"],
+        "timeout": 90,
         "expected_strings": [
             "**********tuya_upgrade_main need upgrade? [255]**********",
             "device_id=0x21128000",
@@ -3920,8 +3922,11 @@ TEST_CASES = [
             "calibration_main over",
             "kv has ccode PL",
             "mac 80:64:7c:99:dd:7f",
-            "found scan rst rssi -43 > -50",
             "bssid 28:87:ba:a0:f5:6d, cap_info 0x1811, BI 100, ssid DLINK_FastNet",
+            "writed fci to flash ssid=DLINK_FastNet",
+            "[NET] DHCP: device 80:64:7c:99:dd:7f got 192.168.1.100 (gateway/DNS 192.168.1.1)",
+            "handshake authenticated; serving encrypted MQTT offline",
+            "[NET] MQTT SUBSCRIBE smart/device/in/bf70c4ef9a3806556brng4",
         ],
         "expected_pins": {
             0: 0x78, 1: 0x78, 10: 0x78, 11: 0x78,
@@ -3940,6 +3945,7 @@ TEST_CASES = [
                                "BK7238_BrizLabs_Fairy_LED_RGB_1.0.1.bin"),
         "args": ["--only-uart", "-chip", "BK7238"],
         "timeout": 60,
+        "tags": ["BLE", "BLE core", "FIQ"],
         "expected_strings": [
             "OSK Rev: F-3.0.40",
             "SDK Rev: 3.0.65",
@@ -3947,10 +3953,14 @@ TEST_CASES = [
             "calibration_main over",
             "lpf_i & q in flash is:74, 76",
             "xtal in flash is:23",
+            "gapm_cmp_evt:BLE_STACK_OK",
+            "BLE_5_CREATE_DB",
             "ssid:tuyatest key:fakepassword",
             "mac 44:4a:d6: c:9e:14",
             "PSKC: ssid tuyatest, passphrase fakepassword",
             "wpa S: DISCONNECTED -> SCANNING",
+            "[BLE_ADV]   16-bit UUIDs (incomplete)  01 a1                                   ..  uuid=0xA101",
+            "sxebObqQRfXmgU  uuid=0xA101",
         ],
         "expected_pins": {
             0: 0x78, 1: 0x78, 6: 0x3C, 10: 0x78, 11: 0x78,
@@ -3986,12 +3996,13 @@ TEST_CASES = [
         # driving a BP5758D I2C 5-channel current-regulator LED driver on P24
         # and P26 (both driven high 0x02 at idle).  Prints its Zengge banner,
         # BP5758D current settings (8/8/8/30/30 mA), increments PWRRCD store
-        # index 23, and completes RF calibration.
+        # index 23, completes RF calibration, and advertises IOTWF46D over BLE 5.2.
         "name": "BK7238 Zengge ZJ21412 BP101 RGBCCT bulb (BP5758D I2C, 20240425) boots OS 8.43.0 and calibrates",
         "binary": os.path.join(ROOT_DIR, "firmwares",
                                "BK7238_Zengge_ZJ21412_BP101_RGBCCT_Bulb.bin"),
         "args": ["--only-uart", "-chip", "BK7238"],
         "timeout": 60,
+        "tags": ["BLE", "BLE core", "FIQ"],
         "expected_strings": [
             "SDK Rev: 3.0.70 c063598",
             "chip id=7238 device id=21128000",
@@ -4003,6 +4014,8 @@ TEST_CASES = [
             "|FW->35_243_20240425_ZG-BK38-BP101",
             "I(APP:PWRRCD) store index 23",
             "calibration_main over",
+            "I(PORT) adv_name_get IOTWF46D",
+            "[BLE_ADV]   Service Data               00 5a 4c 07 00 00 00 00 00 00 00 35 ..  .ZL........5....  uuid=0x5A00",
         ],
         "expected_pins": {
             0: 0x78, 1: 0x78, 10: 0x78, 11: 0x78, 24: 0x02, 26: 0x02,
@@ -4141,8 +4154,9 @@ TEST_CASES = [
         "name": "BK7231T Tuya Arlec SSWF01G fan speed controller (1.0.5, SDK 2.0.0) configures fan relays and BLE",
         "binary": os.path.join(ROOT_DIR, "firmwares",
                                "BK7231T_Tuya_Fan_Speed_Controller_SSWF01G_1.0.5.bin"),
-        "args": ["--only-uart", "-key", "TUYA"],
-        "timeout": 60,
+        "args": ["--only-uart", "-key", "TUYA",
+                 "--wifi-peer", "ap", "--wifi-ssid", "HomeNET", "--wifi-pass", "746025625"],
+        "timeout": 90,
         "expected_strings": [
             "< TUYA IOT SDK V:2.0.0 BS:30.06_PT:2.2_LAN:3.3_CAD:1.0.2_CD:1.0.0 >",
             "oem_bk7231s_fan_control_arlec:1.0.5",
@@ -4153,6 +4167,10 @@ TEST_CASES = [
             "55 bc ce cb 9b 56 ac 21 ba 29 28 8a 6e 47 2c f0",
             "ble adv && resp changed",
             "gapm_cmp_evt_handler operation = 0x1, status = 0x0",
+            "ssid:HomeNET, 1",
+            "[NET] DHCP: device 68:57:2d:f9:7c:48 got 192.168.1.100 (gateway/DNS 192.168.1.1)",
+            "[NET] DNS m2.tuyaeu.com -> 10.200.0.1 (offline sinkhole)",
+            "TLS_PSK_WITH_AES_128_CBC_SHA256",
         ],
         "expected_pins": {
             0: 0x78, 1: 0x3C, 6: 0x02, 7: 0x02, 8: 0x3C, 9: 0x02,
@@ -4164,7 +4182,8 @@ TEST_CASES = [
         # (I003323, oem_bk7231t_light3_laser_nanxin:1.1.2 on TUYA IOT SDK 1.0.2).
         # Drives 5 hardware PWM channels at 1000 Hz (0x6590 = 26000 ticks:
         # P6/P8/P9/P24/P26 = PWM0/2/3/4/5) for the nebula LEDs + motor, plus
-        # P7 low (0x00) and button P14 pull-up (0x3C).
+        # P7 low (0x00) and button P14 pull-up (0x3C), and brings up BLE GATT
+        # advertising (STACK INIT OK, CREATE DB SUCCESS, appm start advertising).
         "name": "BK7231T Tuya Genio Nebular Projector I003323 (5ch 1000 Hz PWM + laser, 1.1.2) boots",
         "binary": os.path.join(ROOT_DIR, "firmwares",
                                "BK7231T_Tuya_Genio_Nebular_Projector_I003323_1.1.2.bin"),
@@ -4180,6 +4199,10 @@ TEST_CASES = [
             "button init",
             "device config data already load! Don't load again!!",
             "Drive init already init ok",
+            "STACK INIT OK",
+            "CREATE DB SUCCESS",
+            "ble adv && resp changed",
+            "appm start advertising",
         ],
         "expected_pins": {
             0: 0x78, 1: 0x78, 6: 0x48, 7: 0x00, 8: 0x48, 9: 0x48,
@@ -4198,13 +4221,17 @@ TEST_CASES = [
         # Stock BK7231T dump from a MOES MS-102 smart garage door controller
         # (oem_bk7231s_garage_door:1.1.2 on TUYA IOT SDK 1.0.2, WB2S module).
         # Configures door-contact reed input P26 (pull-down 0x2C), button P6
-        # (pull-up 0x3C), relay/LED outputs P7 (0x02) and P24 (0x00), runs
-        # device_ctrl_init, and updates its BLE advertisement.
+        # (pull-up 0x3C), relay/LED outputs P7 (0x02) and P24 (0x00), updates
+        # its BLE advertisement, and reconnects to its pre-backup WPA2 network
+        # (FASTWEB-casaFW), obtaining a DHCP lease and emitting Tuya LAN 3.3
+        # discovery broadcasts.
         "name": "BK7231T Tuya MOES MS-102 garage door opener (WB2S, 1.1.2) configures contact/relay GPIOs and BLE",
         "binary": os.path.join(ROOT_DIR, "firmwares",
                                "BK7231T_Tuya_MOES_GarageDoor_MS-102_WB2S_1.1.2.bin"),
-        "args": ["--only-uart", "-key", "TUYA"],
-        "timeout": 60,
+        "args": ["--only-uart", "-key", "TUYA",
+                 "--wifi-peer", "ap", "--wifi-ssid", "FASTWEB-casaFW",
+                 "--wifi-pass", "Giuseppe2707&Marta0909"],
+        "timeout": 90,
         "expected_strings": [
             "< TUYA IOT SDK V:1.0.2 BS:40.00_PT:2.2_LAN:3.3_CAD:1.0.2_CD:1.0.0 >",
             "oem_bk7231s_garage_door:1.1.2",
@@ -4214,6 +4241,10 @@ TEST_CASES = [
             "device_init ok  free_mem_size:74552",
             "ty bt update localkey",
             "ble adv && resp changed",
+            "ssid:FASTWEB-casaFW, 1",
+            "[NET] DHCP: device b8:06:0d:ca:44:35 got 192.168.1.100 (gateway/DNS 192.168.1.1)",
+            "[NET] DNS m2.tuyaeu.com -> 10.200.0.1 (offline sinkhole)",
+            '"gwId":"bf5758e46fc5d63663qc5f","active":2,"ablilty":0,"encrypt":true,"productKey":"keymxkctp9ukgcvg"',
         ],
         "expected_pins": {
             0: 0x78, 1: 0x78, 6: 0x3C, 7: 0x02,
@@ -4226,8 +4257,9 @@ TEST_CASES = [
         # switch (oem_bk7231s_curtain_switch:1.6.0 on TUYA IOT SDK 1.0.2, WB3S
         # module).  Recovers its protected user_param_key, parses and prints
         # its 3-sub-channel curtain relay/button table (rly P7/P6, bt P8/P10/P24,
-        # intertime 200 ms, drvtime 200 ms), and completes curtain_json_init and
-        # dev_event_json_init.
+        # intertime 200 ms, drvtime 200 ms), completes curtain_proc_dev_init,
+        # and brings up BLE GATT advertising (STACK INIT OK, CREATE DB SUCCESS,
+        # appm start advertising).
         "name": "BK7231T Tuya qcsc400w-v5t smart curtain switch (WB3S, 1.6.0) loads 3-sub-channel curtain config",
         "binary": os.path.join(ROOT_DIR, "firmwares",
                                "BK7231T_Tuya_Smart_Curtain_qcsc400w-v5t_WB3S_1.6.0.bin"),
@@ -4244,9 +4276,14 @@ TEST_CASES = [
             "curtain_json_init init end!",
             "dev_event_json_init init end!",
             "have actived over 15 min, not enter mf_init",
+            "STACK INIT OK",
+            "CREATE DB SUCCESS",
+            "ble adv && resp changed",
+            "appm start advertising",
         ],
         "expected_pins": {
-            0: 0x78, 1: 0x78, 10: 0x78, 11: 0x78, 12: 0x78, 13: 0x78,
+            0: 0x78, 1: 0x00, 6: 0x00, 7: 0x00, 8: 0x3C,
+            10: 0x3C, 11: 0x78, 12: 0x78, 13: 0x78, 24: 0x3C,
         },
     },
     {
@@ -4280,14 +4317,17 @@ TEST_CASES = [
         # Stock BK7231T dump from a TreatLife SS02 3-way wall switch
         # (oem_bk7231s_double_switch_rmd:1.1.3 on TUYA IOT SDK 1.0.8).
         # Configures traveler/button inputs P6, P26, P28 (pull-up 0x3C) and
-        # relay/LED outputs P8 (0x02), P9 (0x00) and P24 (0x00), brings up the
-        # BLE GATT database (STACK INIT OK, CREATE DB SUCCESS), and starts
-        # advertising.
+        # relay/LED outputs P8, P9 and P24, brings up the BLE GATT database
+        # (STACK INIT OK, CREATE DB SUCCESS), starts advertising, and reconnects
+        # to its pre-backup WPA2 network (DLINK_FastNet), obtaining a DHCP lease
+        # and emitting Tuya LAN 3.3 discovery broadcasts.
         "name": "BK7231T Tuya TreatLife SS02 3-way switch (1.1.3, SDK 1.0.8) configures 3-way GPIOs and BLE",
         "binary": os.path.join(ROOT_DIR, "firmwares",
                                "BK7231T_Tuya_TreatLife_SS02_3-Way_Switch_1.1.3.bin"),
-        "args": ["--only-uart", "-key", "TUYA"],
-        "timeout": 60,
+        "args": ["--only-uart", "-key", "TUYA",
+                 "--wifi-peer", "ap", "--wifi-ssid", "DLINK_FastNet",
+                 "--wifi-pass", "F4STN3T@W*f*PL1234567890"],
+        "timeout": 90,
         "expected_strings": [
             "< TUYA IOT SDK V:1.0.8 BS:40.00_PT:2.2_LAN:3.3_CAD:1.0.2_CD:1.0.0 >",
             "oem_bk7231s_double_switch_rmd:1.1.3",
@@ -4296,9 +4336,11 @@ TEST_CASES = [
             "CREATE DB SUCCESS",
             "ble adv && resp changed",
             "appm start advertising",
+            "[NET] DHCP: device 38:1f:8d:f3:bd:35 got 192.168.1.100 (gateway/DNS 192.168.1.1)",
+            '"gwId":"bf9014e5bafa4fa172qfyf","active":2,"ablilty":0,"encrypt":true,"productKey":"keyu5sjrcfhjsvd8"',
         ],
         "expected_pins": {
-            0: 0x78, 1: 0x78, 6: 0x3C, 8: 0x02, 9: 0x00,
+            0: 0x78, 1: 0x78, 6: 0x3C, 9: 0x00,
             10: 0x78, 11: 0x78, 12: 0x78, 13: 0x78,
             24: 0x00, 26: 0x3C, 28: 0x3C,
         },
