@@ -4344,6 +4344,508 @@ TEST_CASES = [
             10: 0x78, 11: 0x78, 12: 0x78, 13: 0x78,
             24: 0x00, 26: 0x3C, 28: 0x3C,
         },
+    },
+    {
+        "name": "BL2028N Zemismart Matter ZML2 RGBCT bulb (UAM026, 1.21) prints Matter SetupQRCode and drives pwm_new",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "Zemismart_Matter_ZML2_RGBCT_CSA23291MAT40804-24_UAM026_1.21.bin"),
+        "args": ["--only-uart", "-chip", "BK7231N", "--ble-core"],
+        "timeout": 60,
+        "expected_strings": [
+            "SetupQRCode: [MT:--VJ0-IC005WSL02810]",
+            "Copy/paste the below URL in a browser to see the QR Code:https://project-chip.github.io/connectedhomeip/qrcode.html?data=MT%3A--VJ",
+        ],
+    },
+    {
+        "name": "BK7238 Tuya Arlec PC191HA-S4 plug (T1-2S-NL, 1.0.2) calibrates and fast-connects to stored AP",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "Tuya_Arlec_PC191HA-S4_Plug_(schemaID-e1mtsiag)_keykmm3rjyqy5r8p_74xo1nolwa6xkjeu_T1-2S-NL_1.0.2.bin"),
+        "args": ["--only-uart", "-chip", "BK7238", "--ble-core"],
+        "timeout": 60,
+        "expected_strings": [
+            "prvHeapInit-start addr:0x415098, size:175976",
+            "**********tuya_upgrade_main need upgrade? [255]**********",
+            "< BUILD AT:2025_01_02_15_55_27 BY ci_manage FOR tuyaos-iot AT T1 >",
+            "name:oem_t1_plug",
+            "tuya_tls_rand_init ok!",
+            "calibration_main over",
+            "!! tkl_wifi_station_fast_connect",
+            "found scan rst rssi -34 > -50",
+        ],
+    },
+    {
+        "name": "BK7238 Tuya BSEED M1 metering socket (T1-2S-NL, 1.1.4) boots TuyaOS plug app and scans",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "Tuya_BSEED_M1_Measure_Socket_(schemaID-e1nbktiw)_keykmm3rjyqy5r8p_vl7svb0a4o9gogeb_T1-2S-NL_1.1.4.bin"),
+        "args": ["--only-uart", "-chip", "BK7238", "--ble-core"],
+        "timeout": 60,
+        "expected_strings": [
+            "prvHeapInit-start addr:0x415118, size:175848",
+            "**********tuya_upgrade_main need upgrade? [255]**********",
+            "< BUILD AT:2025_01_02_15_55_27 BY ci_manage FOR tuyaos-iot AT T1 >",
+            "name:oem_t1_plug",
+            "tuya_tls_rand_init ok!",
+            "calibration_main over",
+            "mf_init succ",
+            "scan_start_req_handler",
+        ],
+    },
+    {
+        "name": "BK7238 Tuya QS-WIFI-S10-C04 curtain module (T1-M, 1.0.6) raises SmartLife-BF55 AP and BLE central",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "Tuya_Curtain_QS-WIFI-S10-C04_(schemaID-e1n257is)_keyafhmcfuursnuw_ocz3mqv0v4ntkzva_ocz3mqv0v4ntkzva_T1-M_1.0.6.bin"),
+        "args": ["--only-uart", "-chip", "BK7238", "--ble-core"],
+        "timeout": 60,
+        "expected_strings": [
+            "prvHeapInit-start addr:0x414e60, size:176544",
+            "sdk_info:< TuyaOS V:3.11.11 BS:40.00_PT:2.3_LAN:3.5_CAD:1.0.5_CD:1.0.0 >",
+            "wifi soc init. pid:ocz3mqv0v4ntkzva firmwarekey:NULL ver:1.0.6",
+            "serial_no:80647ce3bf55",
+            "start ap success:SmartLife-BF55",
+            "ty bt sdk init success finish",
+            "ble central init success",
+            "app_key_task start!!!",
+        ],
+    },
+    {
+        "name": "BK7238 Tuya AZIot 4-gang switch (T1-3S, 1.1.9) calibrates and starts Wi-Fi scan",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "Tuya_AZIot_4GSwitch_(schemaID-e1mzybmo)_keyfxuj3d5wg53wx_yiijiejtycigal7g_T1-3S_1.1.9.bin"),
+        "args": ["--only-uart", "-chip", "BK7238", "--ble-core"],
+        "timeout": 60,
+        "expected_strings": [
+            "prvHeapInit-start addr:0x415120, size:175840",
+            "**********tuya_upgrade_main need upgrade? [255]**********",
+            "< BUILD AT:2025_01_08_15_12_50 BY ci_manage FOR tuyaos-iot AT T1 >",
+            "tuya_tls_rand_init ok!",
+            "calibration_main over",
+            "gw_cntl->gw_wsm.stat:1",
+            "mf_init succ",
+            "scan_start_req_handler",
+        ],
+    },
+    {
+        "name": "BK7238 Tuya TOMZN 63A SmartMeterPro breaker (T1-U-HL, 1.1.0) loads 63A config and fast-connects",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "Tuya_TOMZN_63A_Breaker_SmartMeterPro_(schemaID-e1n27y7k)_key7mapd9sdpyyf9_suznd0ma6xr4caz0_T1-U-HL_1.1.0.bin"),
+        "args": ["--only-uart", "-chip", "BK7238", "--ble-core"],
+        "timeout": 60,
+        "expected_strings": [
+            "[MEM DBG] heap init-------size:199672 addr:0x40f408---------",
+            "< TuyaOS V:3.11.16 BS:40.00_PT:2.3_LAN:3.5_CAD:1.0.5_CD:1.0.0 >",
+            ",over_cur: is 63000",
+            "tuya_tls_rand_init ok!",
+            "!! tkl_wifi_station_fast_connect",
+            "found scan rst rssi -37 > -50",
+        ],
+    },
+    {
+        "name": "BK7231N Tuya Milfra 3-gang TB11 switch (SDK 2.3.3) initializes BLE 5.1 stack and GAPM config",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231N_Milfra_3g_TB11_QIO_2024-20-8-15-32-47.bin"),
+        "args": ["--only-uart", "-chip", "BK7231N", "-key", "TUYA", "--ble-core"],
+        "timeout": 60,
+        "expected_strings": [
+            "prvHeapInit-start addr:0x410958, size:128680",
+            "ble mac:50-8b-b9-6e-c3-ba",
+            "ty bt sdk init success finish",
+            "< TUYA IOT SDK V:2.3.3 BS:40.00_PT:2.2_LAN:3.4_CAD:1.0.5_CD:1.0.0 >",
+            "< BUILD AT:2022_12_22_14_55_08 BY ci_manage FOR ty_iot_sdk AT bk7231n >",
+            "gapm_cmp_evt:GAPM_SET_DEV_CONFIG",
+        ],
+    },
+    {
+        "name": "BK7231N Tuya A228903 Plafon ceiling light initializes BLE 5.1 GATT DB and advertising",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231N_QIO_A228903_Plafon_2024-13-1-19-42-24.bin"),
+        "args": ["--only-uart", "-chip", "BK7231N", "-key", "TUYA", "--ble-core"],
+        "timeout": 60,
+        "expected_strings": [
+            "prvHeapInit-start addr:0x411930, size:124624",
+            "ble mac:18-de-50-ea-4c-c4",
+            "ty bt sdk init success finish",
+            "gapm_cmp_evt:BLE_STACK_OK",
+            "[PLATFORM NOTICE]STACK INIT OK",
+            "[PLATFORM NOTICE]CREATE DB SUCCESS",
+        ],
+    },
+    {
+        "name": "BK7231N Tuya LSC SmartPanel (CBU, 1.3.1) boots TuyaOS and scans for tuya_mdev_test2",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "Tuya_LSC_SmartPanel_(schemaID-e1mu25o0)_keyj3w8cmutjmwk5_duxmr5beo0hrowle_CBU_1.3.1.bin"),
+        "args": ["--only-uart", "-chip", "BK7231N", "-key", "TUYA", "--ble-core"],
+        "timeout": 60,
+        "expected_strings": [
+            "[MEM DBG] heap init-------size:153512 addr:0x40a858---------",
+            "tuya_tls_rand_init ok!",
+            "mf_init succ",
+            "< BUILD AT:2024_12_12_17_45_32 BY ci_manage FOR tuyaos-iot AT bk7231n >",
+            "calibration_main over",
+            "current product ssid name:tuya_mdev_test2",
+            "scan_start_req_handler",
+        ],
+    },
+    {
+        "name": "BK7231N Tuya Sprycle SPL11-528 water valve (CB3S, 1.0.2) starts BLE advertising and ADC channel 3",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "Tuya_Sprycle_SPL11-528_Water_Valve_(SchemaID-000003w2yl)_s2vw3kf1575apfyc_CB3S_1.0.2.bin"),
+        "args": ["--only-uart", "-chip", "BK7231N", "-key", "TUYA", "--ble-core"],
+        "timeout": 60,
+        "expected_strings": [
+            "prvHeapInit-start addr:0x4114a0, size:125792",
+            "< TUYA IOT SDK V:2.3.1 BS:40.00_PT:2.2_LAN:3.3_CAD:1.0.3_CD:1.0.0 >",
+            "fj_wifi_ble_controller_moto:1.0.2",
+            "[ble_appm_start_advertising]",
+            "mf_init succ",
+            "tuya_hard_init is success",
+            "gw_cntl.gw_if.product_key:s2vw3kf1575apfyc, input:s2vw3kf1575apfyc",
+            "scan_start_req_handler",
+        ],
+    },
+    {
+        "name": "BK7231N Tuya Eurodomest HDMI Sync Box (CBU, 1.0.7) starts BLE stack and lighting effect task",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "Tuya_Eurodomest_HDMI_Sync_Box_(6204000100_schemaID-er8l48)_aceyfgaokqwk4nzj_CBU_1.0.7.bin"),
+        "args": ["--only-uart", "-chip", "BK7231N", "-key", "TUYA", "--ble-core"],
+        "timeout": 60,
+        "expected_strings": [
+            "prvHeapInit-start addr:0x412040, size:122816",
+            "gapm_cmp_evt:BLE_STACK_OK",
+            "[ble_appm_start_advertising]",
+            "calibration_main over",
+            "app lighting is enable now",
+            "Succeed to malloc space for app_light_cfg.seg_list",
+            "lighting effect main task in running",
+        ],
+    },
+    {
+        "name": "BK7231N Tuya ATLO-RC-IR universal IR remote (SDK 2.3.1) loads IR pin map and starts BLE adv",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231N_QIO_ATLO-RC-IR-TUYA_2025-16-1-16-44-50.bin"),
+        "args": ["--only-uart", "-chip", "BK7231N", "-key", "TUYA", "--ble-core"],
+        "timeout": 60,
+        "expected_strings": [
+            "prvHeapInit-start addr:0x411550, size:125616",
+            "< TUYA IOT SDK V:2.3.1 BS:40.00_PT:2.2_LAN:3.3_CAD:1.0.3_CD:1.0.0 >",
+            "gapm_cmp_evt:BLE_STACK_OK",
+            "[ble_appm_start_advertising]",
+            "mf_init succ",
+            "key:infre:-----val:7----len:1",
+            "key:infrr:-----val:8----len:1",
+            "current product ssid name:tuya_mdev_test1",
+        ],
+    },
+    {
+        "name": "BK7231T Tuya W-105N motorized ball valve (WB3S, 1.1.5) loads pConfig and starts BLE adv",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "Tuya_BallValve_W-105N_(WIFI&BLE-_schemaID-0000043vc2)_key7axydcvmea3x9_hjnivuviqdko7mzd_WB3S_1.1.5.bin"),
+        "args": ["--only-uart", "-key", "TUYA"],
+        "timeout": 60,
+        "expected_strings": [
+            "< TUYA IOT SDK V:1.0.6 BS:40.00_PT:2.2_LAN:3.3_CAD:1.0.2_CD:1.0.0 >",
+            "**********[oem_bk7231s_rnd_zero_dctrl_switch] [1.1.5] compiled at Jun 22 2021",
+            "mf_init succ",
+            "gw_cntl.gw_if.product_key:key7axydcvmea3x9, input:key7axydcvmea3x9",
+            "device_init ok  free_mem_size:67688",
+            "appm start advertising",
+        ],
+    },
+    {
+        "name": "BK7231T Tuya AHRISE AHR-083 power strip (WB3S, 1.1.0) loads multi-relay pConfig and advertises BLE",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "Tuya_AHRISE_AHR-083_PowerStrip_(schemaID-000002qqwe)_keya4gvchmtapm8n_fn2jtjtvkegj2oll_WB3S_1.1.0.bin"),
+        "args": ["--only-uart", "-key", "TUYA"],
+        "timeout": 60,
+        "expected_strings": [
+            "< TUYA IOT SDK V:1.0.2 BS:40.00_PT:2.2_LAN:3.3_CAD:1.0.2_CD:1.0.0 >",
+            "**********[oem_bk7231s_rnd_switch] [1.1.0] compiled at Oct  3 2020 15:09:14",
+            "mf_init succ",
+            "gw_cntl.gw_if.product_key:keya4gvchmtapm8n, input:keya4gvchmtapm8n",
+            "IO - wifi_stat:\tpin-9\ttype low",
+            "device_init ok  free_mem_size:66344",
+            "appm start advertising",
+        ],
+    },
+    {
+        "name": "BK7231T Tuya MS-103 two-way TempHum switch (1.2.8, SDK 1.0.2) starts BLE advertising and scans",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "Tuya_MS-103-Two-Way_TempHum_Switch_(NH-YM0430_schemaID-0000037bpa)_keyxnxg34hf5xw9e_dlsdk5zvkuuhufpy_1.2.8.bin"),
+        "args": ["--only-uart", "-key", "TUYA"],
+        "timeout": 60,
+        "expected_strings": [
+            "< TUYA IOT SDK V:1.0.2 BS:40.00_PT:2.2_LAN:3.3_CAD:1.0.2_CD:1.0.0 >",
+            "**********[oem_bk7231_2onoff_wetemp] [1.2.8] compiled at Jul 16 2021 14:33:15",
+            "ble adv && resp changed",
+            "appm start advertising",
+            "mf_init succ",
+            "scan_start_req_handler",
+        ],
+    },
+    {
+        "name": "BK7231T Tuya TreatLife ST30 TV LED backlight (1.0.2, SDK 1.0.2) initializes RGB frame, BLE and ADC",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "Tuya_TreatLife_ST30_TV_LED_Backlight_(ST30HSR_schemaID-000002fli4)_xhsx0clcbovz5xre_1.0.2.bin"),
+        "args": ["--only-uart", "-key", "TUYA"],
+        "timeout": 60,
+        "expected_strings": [
+            "--------------> PID:xhsx0clcbovz5xre",
+            "**********[HYS_03_010_RGB_xhsx0clcbovz5xre] [1.0.2] compiled at Dec 21 2020 16:13:43",
+            "appm start advertising",
+            "mf_init succ",
+            "gw_cntl.gw_if.product_key:xhsx0clcbovz5xre, input:xhsx0clcbovz5xre",
+            "frame init ok!",
+            "==== tuya_hal_adc_init enter ==== channel:3",
+        ],
+    },
+    {
+        "name": "BK7231T Tuya BIM8774 16A 3500W metering socket (WB2S, 1.3.5) boots dltj energy app and BLE",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "Tuya_BIM8774_Socket_16A_3500W_(BOMSOC8774_schemaID-0000032ccw)_keym9qkuywghyrvs_jug4i7aunvvjfhq7_WB2S_1.3.5.bin"),
+        "args": ["--only-uart", "-key", "TUYA"],
+        "timeout": 60,
+        "expected_strings": [
+            "< TUYA IOT SDK V:1.0.2 BS:40.00_PT:2.2_LAN:3.3_CAD:1.0.2_CD:1.0.0 >",
+            "**********[oem_bk7231s_dltj] [1.3.5] compiled at Dec 25 2020 10:09:10**********",
+            "mf_init succ",
+            "gw_cntl.gw_if.product_key:keym9qkuywghyrvs, input:keym9qkuywghyrvs",
+            "dltj_run_int",
+            "device_init ok  free_mem_size:67376",
+            "appm start advertising",
+        ],
+    },
+    {
+        "name": "BK7231T Tuya 120V A19 9W smart bulb (WB2L, 2.9.6) raises SmartLife-8811 AP and auto-blinks",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "Tuya_120V_A19_9W_SMART_BULB_(schemaID-000002p9xg)_keytg5kq8gvkv9dh_mlgrefimabrept8a_WB2L_2.9.6.bin"),
+        "args": ["--only-uart", "-key", "TUYA"],
+        "timeout": 60,
+        "expected_strings": [
+            "**********[oem_bk7231s_light_ty] [2.9.6] compiled at Oct 29 2020 14:38:00**********",
+            "mf_init succ",
+            "gw_cntl.gw_if.product_key:keytg5kq8gvkv9dh, input:keytg5kq8gvkv9dh",
+            "frame init ok!",
+            "ssid:SmartLife-8811\tkey:  channnel: 6",
+            "appm start advertising",
+            "start AP config auto blink",
+        ],
+    },
+    {
+        "name": "BK7231T Tuya 120V A60 9W smart bulb (WB2L, 2.9.25, SDK 2.3.2) loads 5ch light config and boots",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "Tuya_120V_A60_9W_SMART_BULB_(schemaID-000004kvcq)_keytg5kq8gvkv9dh_uuyc3x6l7gusczhb_WB2L_2.9.25.bin"),
+        "args": ["--only-uart", "-key", "TUYA"],
+        "timeout": 60,
+        "expected_strings": [
+            "prvHeapInit-start addr:0x421b18, size:124136",
+            "crc_r[ca] crc_g[00] crc_b[67]",
+            "goto first bright up!",
+            "ty bt sdk init success finish",
+            "mf_init succ",
+            "< TUYA IOT SDK V:2.3.2 BS:40.00_PT:2.2_LAN:3.3_CAD:1.0.4_CD:1.0.0 >",
+            "< BUILD AT:2022_02_25_14_49_05 BY ci_manage FOR ty_iot_sdk AT bk7231t >",
+        ],
+    },
+    {
+        "name": "BK7231T Tuya 1CH WB01 switch (WB3S, 1.1.5, SDK 1.0.6) loads pConfig and starts BLE adv",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "Tuya_1CH_WB01_Switch_(schemaID-00000489v0)_key7axydcvmea3x9_etehelyd9guknfyi_WB3S_1.1.5.bin"),
+        "args": ["--only-uart", "-key", "TUYA"],
+        "timeout": 60,
+        "expected_strings": [
+            "< TUYA IOT SDK V:1.0.6 BS:40.00_PT:2.2_LAN:3.3_CAD:1.0.2_CD:1.0.0 >",
+            "**********[oem_bk7231s_rnd_zero_dctrl_switch] [1.1.5] compiled at Jun 22 2021",
+            "appm start advertising",
+            "mf_init succ",
+            "pConfig = {rl1_lv:1,bt_type:0,bt1_pin:6,mxcl_led_m:0,led1_pin:11,rand_dpid:18",
+            "gw_cntl.gw_if.product_key:key7axydcvmea3x9, input:key7axydcvmea3x9",
+            "device_init ok  free_mem_size:68040",
+        ],
+    },
+    {
+        "name": "OpenBeken DeepSleep 10 enters SCTRL deep sleep and wakes via RTC timer",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "OpenBK7231T_QIO_1.18.300_mathDemo_obkStartupCommand_uartConsole.bin"),
+        "args": ["--only-uart", "-key", "TUYA",
+                 "--uart1-rx", "DeepSleep 10",
+                 "--deep-sleep-wake", "rtc"],
+        "timeout": 60,
+        "tags": ["deep sleep"],
+        "expected_strings": [
+            "Warn:CFG:CFG_InitAndLoad: Correct config has been loaded with 0 changes count.",
+            "[SLEEP] entered deep sleep (RTC=10s)",
+            "[SLEEP] waking from deep sleep (RTC timer); device reset #1",
+            "Info:CMD:StartupBeforeConsole",
+        ],
+    },
+    {
+        "name": "OpenBeken PinDeepSleep enters SCTRL deep sleep and wakes via GPIO P10",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "OpenBK7231T_QIO_1.18.300_mathDemo_obkStartupCommand_uartConsole.bin"),
+        "args": ["--only-uart", "-key", "TUYA",
+                 "--uart1-rx", "SetPinRole 10 Btn\\nPinDeepSleep",
+                 "--deep-sleep-wake", "gpio:10"],
+        "timeout": 60,
+        "tags": ["deep sleep"],
+        "expected_strings": [
+            "Warn:CFG:CFG_InitAndLoad: Correct config has been loaded with 0 changes count.",
+            "[SLEEP] entered deep sleep (GPIO=[P10:LOW])",
+            "[SLEEP] waking from deep sleep (GPIO P10=0); device reset #1",
+            "Warn:CFG:CFG_InitAndLoad: Correct config has been loaded with 1 changes count.",
+        ],
+    },
+    {
+        "name": "BK7231N Tuya Generic Motion Sensor (CBU, 1.0.6) enters deep sleep and wakes on PIR GPIO P16",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231N_Tuya_Generic_Motion_Sensor_CBU_1.0.6.bin"),
+        "args": ["--only-uart", "-chip", "BK7231N", "-key", "TUYA",
+                 "--wifi", "--deep-sleep-wake", "gpio:16"],
+        "timeout": 90,
+        "tags": ["deep sleep"],
+        "expected_strings": [
+            "upload_by_wake_event,cur_wake_type:0",
+            "enter sleep mode,sleep_timer is 28800",
+            "[SLEEP] entered deep sleep (RTC=28800s, GPIO=[P16:HIGH, P20:HIGH])",
+            "[SLEEP] waking from deep sleep (GPIO P16=1); device reset #1",
+            "upload_by_wake_event,cur_wake_type:3",
+        ],
+    },
+    {
+        "name": "BK7231N Tuya Rain Sensor (CBU, 1.1.9) enters deep sleep and wakes on water-probe GPIO P16",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231N_Tuya_Rain_Sensor_CBU_1.1.9.bin"),
+        "args": ["--only-uart", "-chip", "BK7231N", "-key", "TUYA",
+                 "--gpio-input", "20:1", "--deep-sleep-wake", "gpio:16"],
+        "timeout": 90,
+        "tags": ["deep sleep"],
+        "expected_strings": [
+            "oem_bk7231n_water_sensor_plus:1.1.9",
+            "power_on wake up",
+            "enter sleep mode,sleep_timer is 28800",
+            "[SLEEP] entered deep sleep (RTC=28800s, GPIO=[P16:HIGH, P20:LOW])",
+            "[SLEEP] waking from deep sleep (GPIO P16=1); device reset #1",
+            "IO wake up",
+            "g_dev_ctl.wake_event is :2",
+        ],
+    },
+    {
+        "name": "BK7231N Tuya TH01 TempHum Sensor (CBU, 1.1.17) enters 3600s deep sleep and wakes via RTC timer",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7231N_Tuya_TH01_TempHum_CBU_1.1.17.bin"),
+        "args": ["--only-uart", "-chip", "BK7231N", "-key", "TUYA",
+                 "--gpio-input", "20:1", "--deep-sleep-wake", "rtc"],
+        "timeout": 90,
+        "tags": ["deep sleep"],
+        "expected_strings": [
+            "oem_bk7231n_temp_hum_sensor:1.1.17",
+            "Wakeup_GetEvent is:0",
+            "sleep sec is:3600",
+            "[SLEEP] entered deep sleep (RTC=3600s, GPIO=[P16:HIGH, P20:LOW])",
+            "[SLEEP] waking from deep sleep (RTC timer); device reset #1",
+            "Wakeup_GetEvent is:4",
+        ],
+    },
+    {
+        "name": "BK7238 Tuya SRW-TH01 TempHum Sensor (T1-AHL, 1.0.1) enters 240s deep sleep and wakes via RTC timer",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7238_Tuya_SRW-TH01_TempHum_T1-AHL_1.0.1.bin"),
+        "args": ["--only-uart", "-chip", "BK7238",
+                 "--wifi", "--deep-sleep-wake", "rtc"],
+        "timeout": 90,
+        "tags": ["deep sleep"],
+        "expected_strings": [
+            "start_type:0",
+            "---enter deep sleep :wake up with gpio 0~31 ps: 0x300 0x100",
+            "---enter deep sleep :wake up with   rosc  ps :240 s",
+            "[SLEEP] entered deep sleep (RTC=240s, GPIO=[P8:LOW, P9:HIGH])",
+            "[SLEEP] waking from deep sleep (RTC timer); device reset #1",
+            "start_type:4",
+        ],
+    },
+    {
+        "name": "BK7252N Pinmei A9 Camera (SDK 3.00.42.01) probes GC0328C over I2C1 and captures JPEG frame via EJPEG+GDMA",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7252N_Pinmei_A9_Camera_BKFIL_3.00.42.01.bin"),
+        "args": ["--only-uart", "-chip", "BK7252N",
+                 "--uart1-rx", "video_buffer open\\nvideo_buffer read 4096\\n"],
+        "timeout": 90,
+        "tags": ["camera", "EJPEG"],
+        "expected_strings": [
+            "0328c id_data:9d",
+            "GC0328C init finish",
+            "jpeg opened",
+            "vbuf opened",
+            "[CAMERA] GC0328C streaming 640x480 JPEG (1180 bytes/frame",
+            "get frame ret: 0, len:1185",
+            "ff,d8,ff,e0,00,10,4a,46,49,46,",
+        ],
+    },
+    {
+        "name": "BK7252 Linklemo XCThings HA15 Camera (IN-A15-V1.0) probes GC0328C over I2C1 and streams EJPEG+GDMA frames",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7252_Linklemo_XCThings_HA15_IN-A15-V1.0_12.12.16.bin"),
+        "args": ["--only-uart", "-chip", "BK7252",
+                 "--uart1-rx", "video open\\n"],
+        "timeout": 90,
+        "tags": ["camera", "EJPEG"],
+        "expected_strings": [
+            "video_transfer_main entry",
+            "open I2C1",
+            "0328c id_data:9d",
+            "GC0328C init finish",
+            "[CAMERA] GC0328C streaming 640x480 JPEG (1180 bytes/frame",
+        ],
+    },
+    {
+        "name": "BK7252 Tuya A9 Cam SC-10024 (1.0.4, SDK 3.0.29) raises SmartLife-2640 Soft-AP and serves DHCP",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7252_Tuya_A9_Cam_SC-10024_1.0.4.bin"),
+        "args": ["--only-uart", "-chip", "BK7252", "--wifi-peer", "auto"],
+        "timeout": 90,
+        "tags": ["camera"],
+        "expected_strings": [
+            "SDK Rev: 3.0.29",
+            "SC008-WB00:1.0.4",
+            "wifi soc init. pid:keyph8vwhadwsx3a",
+            "serial_no:381f8da92640",
+            "[WIFI] associated with 'SmartLife-2640' (AID 1)",
+            "[NET] DHCP: we got 192.168.175.100/255.255.255.0 from the device (router 192.168.175.1)",
+            "[NET] ping reply from 192.168.175.1 (seq 1)",
+        ],
+    },
+    {
+        "name": "BK7252 Tuya Doorbell IP06 V6.3 (SC028_WB30_ALK, 2.2.4) boots BLE, SDRAM heap and reads 4MB flash key",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7252_Tuya_Doorbell_IP06_V6.3_2.2.4.bin"),
+        "args": ["--only-uart", "-chip", "BK7252", "-key", "TUYA"],
+        "timeout": 90,
+        "tags": ["camera"],
+        "expected_strings": [
+            "prvHeapInit-start addr:0x420cb0, size:127824",
+            "[MEM DBG] heap init-------size:229376 addr:0x908000---------",
+            "SDK Rev: 3.0.29",
+            "ty bt sdk init success finish",
+            "firmware compiled at [Sep 13 2024 14:31:56]",
+            "key_addr: 0x397000   block_sz 4096",
+            "0xc3 0x3d 0x40 0x5b 0x90 0xfa 0x59 0x81 0x20 0x31 0x54 0xd8 0x80 0xa9 0x8f 0xc",
+        ],
+    },
+    {
+        "name": "BK7252 Tuya ONENUO ML1T-B Doorbell (SC028_WB30_ALK, 2.2.4) boots BLE, SDRAM heap and reads 4MB flash key",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "BK7252_Tuya_ONENUO_ML1T-B_Doorbell_2.2.4.bin"),
+        "args": ["--only-uart", "-chip", "BK7252", "-key", "TUYA"],
+        "timeout": 90,
+        "tags": ["camera"],
+        "expected_strings": [
+            "prvHeapInit-start addr:0x420cb8, size:127816",
+            "[MEM DBG] heap init-------size:229376 addr:0x908000---------",
+            "SDK Rev: 3.0.29",
+            "ty bt sdk init success finish",
+            "SC028_WB30_ALK:2.2.4",
+            "firmware compiled at [Jul 20 2023 14:41:22]",
+            "key_addr: 0x397000   block_sz 4096",
+            "0x89 0x33 0xfa 0xd1 0x58 0xfb 0x7f 0x3b 0xe7 0x24 0x97 0xd2 0x15 0xb2 0x6f 0xbd",
+        ],
     }
 ]
 
@@ -4352,6 +4854,158 @@ TEST_CASES = [
 # comments there document specific assertion strings for maintainers, while
 # these summarise each test for the HTML report's expandable description.
 DESCRIPTIONS = {
+    "OpenBeken DeepSleep 10 enters SCTRL deep sleep and wakes via RTC timer":
+        "Exercises OpenBeken's `DeepSleep 10` command on BK7231T: the firmware counts down, "
+        "programs the SCTRL 32 kHz ROSC timer (`0x0080011C`/`0x00800140`) for 10 seconds, and "
+        "writes `0xADC1` to `SCTRL_SLEEP` (`0x00800104`). With `--deep-sleep-wake rtc`, the "
+        "emulator wakes the chip via warm SCTRL reset with `ROSC_TIMER_INT_STATUS` set.",
+    "OpenBeken PinDeepSleep enters SCTRL deep sleep and wakes via GPIO P10":
+        "Exercises OpenBeken's `PinDeepSleep` door-sensor sleep mode on BK7231T: after configuring "
+        "P10 as a button (`SetPinRole 10 Btn`), `PinDeepSleep` arms `SCTRL_GPIO_WAKEUP_EN` "
+        "(`0x00800120`) and `SCTRL_GPIO_WAKEUP_TYPE` (`0x00800124`) for active-low wake on P10, "
+        "enters deep sleep via `0x00800104`, and wakes via `--deep-sleep-wake gpio:10`.",
+    "BK7231N Tuya Generic Motion Sensor (CBU, 1.0.6) enters deep sleep and wakes on PIR GPIO P16":
+        "A stock battery-powered Tuya PIR motion sensor on BK7231N (CBU module, firmware 1.0.6). "
+        "On cold boot it reports `cur_wake_type:0`, arms a 28800s RTC timer plus GPIO wake on P16 "
+        "(PIR trigger, active-high) and P20 (button), and enters SCTRL deep sleep (`0x00800104`). "
+        "When woken via `--deep-sleep-wake gpio:16`, the firmware reads the retained SCTRL/AON GPIO "
+        "wake status registers (`0x00800128`/`0x00808004`) and reports `cur_wake_type:3` (PIR alarm).",
+    "BK7231N Tuya Rain Sensor (CBU, 1.1.9) enters deep sleep and wakes on water-probe GPIO P16":
+        "A stock battery-powered Tuya water/rain leak sensor on BK7231N (`oem_bk7231n_water_sensor_plus:1.1.9`, "
+        "CBU module). On cold boot it logs `power_on wake up`, arms a 28800s RTC timer plus GPIO wake on "
+        "P16 (water probe, active-high) and P20 (reset button, active-low), and enters SCTRL deep sleep. "
+        "Waking on P16 (`--deep-sleep-wake gpio:16`) reboots the chip with GPIO wake status set so the "
+        "firmware logs `IO wake up` and `g_dev_ctl.wake_event is :2`.",
+    "BK7231N Tuya TH01 TempHum Sensor (CBU, 1.1.17) enters 3600s deep sleep and wakes via RTC timer":
+        "A stock battery-powered Tuya TH01 temperature and humidity sensor on BK7231N "
+        "(`oem_bk7231n_temp_hum_sensor:1.1.17`, CBU module). On cold boot it logs `Wakeup_GetEvent is:0`, "
+        "arms a 3600s SCTRL ROSC timer plus GPIO wake on P16/P20, and enters deep sleep. When woken via "
+        "`--deep-sleep-wake rtc`, the warm reset sets `ROSC_TIMER_INT_STATUS` (`0x0080011C` bit 8) and "
+        "the firmware recognizes an RTC wake (`Wakeup_GetEvent is:4`).",
+    "BK7238 Tuya SRW-TH01 TempHum Sensor (T1-AHL, 1.0.1) enters 240s deep sleep and wakes via RTC timer":
+        "A stock battery-powered Tuya SRW-TH01 temperature and humidity sensor on BK7238 (T1-AHL module, "
+        "firmware 1.0.1). On cold boot (`start_type:0`) it scans for its AP, then arms GPIO wake on P8/P9 "
+        "and a 240s ROSC timer before writing `0xADC1` to `SCTRL_SLEEP` (`0x00800104`). Waking via "
+        "`--deep-sleep-wake rtc` resets the chip with `ROSC_TIMER_INT_STATUS` set, which `bk_misc_init_start_type` "
+        "reports as `start_type:4` (`RESET_SOURCE_DEEPPS_RTC`).",
+    "BK7252N Pinmei A9 Camera (SDK 3.00.42.01) probes GC0328C over I2C1 and captures JPEG frame via EJPEG+GDMA":
+        "End-to-end DVP camera sensor and hardware JPEG capture test on BK7252N (`BK7252N_Pinmei_A9_Camera_BKFIL_3.00.42.01.bin`). "
+        "Typing `video_buffer open` and `video_buffer read 4096` into the RT-Thread MSH shell initializes Timer 5 "
+        "(`0x00802A4C`), probes the emulated GalaxyCore GC0328C sensor at I2C1 slave `0x21` (chip ID `0x9D` at reg `0xF0`), "
+        "writes all 374 sensor configuration registers, enables `YUV_BUF` (`0x00A04000`) and `EJPEG` (`0x00A03000`) with "
+        "GDMA channel 4 circular capture (`0x00809140`), and reads back a complete 1185-byte JFIF JPEG frame (`ff,d8,ff,e0,...`).",
+    "BK7252 Linklemo XCThings HA15 Camera (IN-A15-V1.0) probes GC0328C over I2C1 and streams EJPEG+GDMA frames":
+        "End-to-end DVP camera sensor and EJPEG streaming test on BK7252 (`BK7252_Linklemo_XCThings_HA15_IN-A15-V1.0_12.12.16.bin`). "
+        "Typing `video open` into the RT-Thread MSH shell starts `video_transfer_main`, opens hardware `I2C1` (`0x00802300`), "
+        "identifies the emulated GC0328C sensor (`id_data:9d`), writes 391 sensor configuration registers, and streams "
+        "640x480 JPEG frames through the BK7252 EJPEG encoder (`0x0080A000`) and GDMA channel 4 (`0x00809080`).",
+    "BK7252 Tuya A9 Cam SC-10024 (1.0.4, SDK 3.0.29) raises SmartLife-2640 Soft-AP and serves DHCP":
+        "A 4 MiB plaintext CRC-framed BK7252 dump from a Tuya SC-10024 A9 VGA Wi-Fi camera (`SC008-WB00:1.0.4` on "
+        "SDK 3.0.29, PID `keyph8vwhadwsx3a`). It initializes its 256 KiB external SDRAM heap at `0x00900000`, raises its "
+        "`SmartLife-2640` pairing Soft-AP, and hands our virtual Wi-Fi station a `192.168.175.100` DHCP lease and ICMP ping reply.",
+    "BK7252 Tuya Doorbell IP06 V6.3 (SC028_WB30_ALK, 2.2.4) boots BLE, SDRAM heap and reads 4MB flash key":
+        "A 4 MiB TUYA-encrypted BK7252 dump from an IP06 V6.3 smart video doorbell (`SC028_WB30_ALK:2.2.4` on SDK 3.0.29). "
+        "It initializes both internal SRAM and 224 KiB external SDRAM heaps, brings up the BLE stack (`ty bt sdk init success finish`), "
+        "completes RF calibration, and reads its protected flash key from `0x397000` in upper 4 MiB SPI flash.",
+    "BK7252 Tuya ONENUO ML1T-B Doorbell (SC028_WB30_ALK, 2.2.4) boots BLE, SDRAM heap and reads 4MB flash key":
+        "A 4 MiB TUYA-encrypted BK7252 dump from an ONENUO ML1T-B smart video doorbell (`SC028_WB30_ALK:2.2.4` on SDK 3.0.29, "
+        "PID `keytqn8773d8kwuu`). It initializes internal SRAM and external SDRAM heaps, brings up the BLE stack, completes "
+        "RF calibration, and reads its protected flash key from `0x397000`.",
+    "BL2028N Zemismart Matter ZML2 RGBCT bulb (UAM026, 1.21) prints Matter SetupQRCode and drives pwm_new":
+        "A plaintext BL2028N dump from a Zemismart ZML2 Matter over Wi-Fi RGBCT smart bulb "
+        "(CSA23291MAT40804-24, Uascent UAM026 v1.21). It initializes the Matter commissioning "
+        "stack, prints its SetupQRCode (MT:--VJ0-IC005WSL02810) and QR helper URL on UART, "
+        "and drives the BK7231N/BL2028N pwm_new peripheral.",
+    "BK7238 Tuya Arlec PC191HA-S4 plug (T1-2S-NL, 1.0.2) calibrates and fast-connects to stored AP":
+        "A plaintext BK7238 dump from an Arlec Grid Connect PC191HA Series 4 smart plug "
+        "(oem_t1_plug:1.0.2 on TuyaOS, T1-2S-NL module). It completes RF calibration and TLS "
+        "RNG initialization, reads its protected key at 0x1f5000, and triggers Wi-Fi station "
+        "fast-connect to its stored 'amc' network.",
+    "BK7238 Tuya BSEED M1 metering socket (T1-2S-NL, 1.1.4) boots TuyaOS plug app and scans":
+        "A plaintext BK7238 dump from a BSEED M1 energy-metering wall socket (oem_t1_plug:1.1.4 "
+        "on TuyaOS, T1-2S-NL module). It completes RF calibration and TLS RNG initialization, "
+        "recovers its protected flash key at 0x1f5000, finishes mf_init, and starts Wi-Fi scanning.",
+    "BK7238 Tuya QS-WIFI-S10-C04 curtain module (T1-M, 1.0.6) raises SmartLife-BF55 AP and BLE central":
+        "A plaintext BK7238 dump from a Lonsonho QS-WIFI-S10-C04 smart curtain switch module "
+        "(tuyaos_curtain:1.0.6 on TuyaOS 3.11.11, T1-M module). It initializes the BLE 5.2 stack "
+        "and BLE central remote-control listener, validates product ID ocz3mqv0v4ntkzva, raises "
+        "its open SmartLife-BF55 pairing Soft-AP, and starts app_key_task.",
+    "BK7238 Tuya AZIot 4-gang switch (T1-3S, 1.1.9) calibrates and starts Wi-Fi scan":
+        "A plaintext BK7238 dump from an AZIot 4-gang smart wall switch (oem_t1_switch:1.1.9 on "
+        "TuyaOS, T1-3S module). It completes RF calibration and TLS RNG initialization, recovers "
+        "its protected flash key at 0x1f5000, finishes mf_init, and starts Wi-Fi scanning.",
+    "BK7238 Tuya TOMZN 63A SmartMeterPro breaker (T1-U-HL, 1.1.0) loads 63A config and fast-connects":
+        "A plaintext BK7238 dump from a TOMZN 63A DIN-rail smart circuit breaker and energy meter "
+        "(TuyaOS 3.11.16, T1-U-HL module, 1.1.0). It loads its bistable relay and 63000 mA "
+        "over-current configuration from flash, completes RF calibration, and initiates Wi-Fi "
+        "fast-connect to its stored 'shuoda5' network.",
+    "BK7231N Tuya Milfra 3-gang TB11 switch (SDK 2.3.3) initializes BLE 5.1 stack and GAPM config":
+        "A stock BK7231N QIO dump from a Milfra 3-gang TB11 smart wall switch (TUYA IOT SDK "
+        "2.3.3). With the BK7231N BLE 5.1 controller modeled, it initializes the RW BLE stack, "
+        "logs BLE MAC 50-8b-b9-6e-c3-ba, and completes GAPM device configuration.",
+    "BK7231N Tuya A228903 Plafon ceiling light initializes BLE 5.1 GATT DB and advertising":
+        "A stock BK7231N QIO dump from an A228903 RGBCW LED ceiling plafon light. It initializes "
+        "the RivieraWaves BLE 5.1 stack (BLE_STACK_OK, STACK INIT OK), creates its GATT database "
+        "(CREATE DB SUCCESS), and starts BLE advertising.",
+    "BK7231N Tuya LSC SmartPanel (CBU, 1.3.1) boots TuyaOS and scans for tuya_mdev_test2":
+        "A stock BK7231N dump from an LSC Smart Connect LED SmartPanel (CBU module, firmware "
+        "1.3.1 on TuyaOS). It recovers its protected key at 0x1ee000, initializes TLS RNG and "
+        "mf_init, completes RF calibration, and scans for the tuya_mdev_test2 factory SSID.",
+    "BK7231N Tuya Sprycle SPL11-528 water valve (CB3S, 1.0.2) starts BLE advertising and ADC channel 3":
+        "A stock BK7231N dump from a Sprycle SPL11-528 smart irrigation water timer valve "
+        "(fj_wifi_ble_controller_moto:1.0.2 on TUYA IOT SDK 2.3.1, CB3S module). It brings up "
+        "BLE 5.1 advertising, validates product key s2vw3kf1575apfyc, initializes battery/valve "
+        "SARADC channel 3, and starts Wi-Fi scanning.",
+    "BK7231N Tuya Eurodomest HDMI Sync Box (CBU, 1.0.7) starts BLE stack and lighting effect task":
+        "A stock BK7231N dump from a Eurodomest 6204000100 HDMI ambient-lighting TV sync box "
+        "(CBU module, firmware 1.0.7). It brings up the BLE 5.1 stack and advertising, completes "
+        "RF calibration, allocates its segmented lighting buffer, and launches the lighting "
+        "effect main task.",
+    "BK7231N Tuya ATLO-RC-IR universal IR remote (SDK 2.3.1) loads IR pin map and starts BLE adv":
+        "A stock BK7231N QIO dump from an ATLO-RC-IR-TUYA Wi-Fi universal infrared remote blaster "
+        "(TUYA IOT SDK 2.3.1). It brings up the BLE 5.1 stack and advertising, reads its protected "
+        "configuration mapping IR transmit (P7), IR receive (P8), reset button (P9) and status LED "
+        "(P24), and scans for tuya_mdev_test1.",
+    "BK7231T Tuya W-105N motorized ball valve (WB3S, 1.1.5) loads pConfig and starts BLE adv":
+        "A stock BK7231T dump from a W-105N Wi-Fi + BLE motorized water/gas ball valve controller "
+        "(oem_bk7231s_rnd_zero_dctrl_switch:1.1.5 on TUYA IOT SDK 1.0.6, WB3S module). It loads "
+        "its pin configuration (bt1_pin:26, led1_pin:24), validates product key key7axydcvmea3x9, "
+        "completes device_init, and starts BLE advertising.",
+    "BK7231T Tuya AHRISE AHR-083 power strip (WB3S, 1.1.0) loads multi-relay pConfig and advertises BLE":
+        "A stock BK7231T dump from an AHRISE AHR-083 multi-socket smart power strip "
+        "(oem_bk7231s_rnd_switch:1.1.0 on TUYA IOT SDK 1.0.2, WB3S module). It recovers its "
+        "protected key at 0x1ee000, loads its multi-relay pin table (wifi_stat on P9), validates "
+        "product key keya4gvchmtapm8n, and starts BLE advertising.",
+    "BK7231T Tuya MS-103 two-way TempHum switch (1.2.8, SDK 1.0.2) starts BLE advertising and scans":
+        "A stock BK7231T dump from an MS-103 two-way temperature and humidity thermostat switch "
+        "(oem_bk7231_2onoff_wetemp:1.2.8 on TUYA IOT SDK 1.0.2). It completes RF calibration, "
+        "brings up BLE GATT advertising, loads its relay/sensor pin configuration, and starts "
+        "Wi-Fi scanning.",
+    "BK7231T Tuya TreatLife ST30 TV LED backlight (1.0.2, SDK 1.0.2) initializes RGB frame, BLE and ADC":
+        "A stock BK7231T dump from a TreatLife ST30 RGB TV ambient LED backlight strip "
+        "(HYS_03_010_RGB_xhsx0clcbovz5xre:1.0.2 on TUYA IOT SDK 1.0.2). It initializes the light "
+        "control frame in mode 1, brings up BLE advertising, validates PID xhsx0clcbovz5xre, "
+        "initializes SARADC channel 3 for mic/music sensing, and starts Wi-Fi scanning.",
+    "BK7231T Tuya BIM8774 16A 3500W metering socket (WB2S, 1.3.5) boots dltj energy app and BLE":
+        "A stock BK7231T dump from a BIM8774 (BOMSOC8774) 16A 3500W energy-metering smart socket "
+        "(oem_bk7231s_dltj:1.3.5 on TUYA IOT SDK 1.0.2, WB2S module). It recovers its protected "
+        "key, validates product key keym9qkuywghyrvs, initializes the dltj energy accumulator, "
+        "and starts BLE advertising.",
+    "BK7231T Tuya 120V A19 9W smart bulb (WB2L, 2.9.6) raises SmartLife-8811 AP and auto-blinks":
+        "A stock BK7231T dump from a 120V A19 9W RGBCW smart bulb (oem_bk7231s_light_ty:2.9.6 on "
+        "TUYA IOT SDK 1.0.2, WB2L module). It initializes the 5-channel light frame, validates "
+        "product key keytg5kq8gvkv9dh, raises its SmartLife-8811 pairing Soft-AP on channel 6, "
+        "starts BLE advertising, and begins AP-config auto-blinking.",
+    "BK7231T Tuya 120V A60 9W smart bulb (WB2L, 2.9.25, SDK 2.3.2) loads 5ch light config and boots":
+        "A stock BK7231T dump from a 120V A60 9W RGBCW smart bulb (oem_bk7231s_light_ty:2.9.25 on "
+        "TUYA IOT SDK 2.3.2, WB2L module). It loads its 5-channel PWM pin map (2 1 0 4 3) and "
+        "color balance table (28 28 28 50 50), initializes the BLE stack, and recovers its "
+        "protected flash key.",
+    "BK7231T Tuya 1CH WB01 switch (WB3S, 1.1.5, SDK 1.0.6) loads pConfig and starts BLE adv":
+        "A stock BK7231T dump from a 1-channel WB01 smart switch "
+        "(oem_bk7231s_rnd_zero_dctrl_switch:1.1.5 on TUYA IOT SDK 1.0.6, WB3S module). It brings "
+        "up BLE advertising, loads its relay/button/LED pConfig (bt1_pin:6, led1_pin:11), "
+        "validates product key key7axydcvmea3x9, and reaches wifi_stat = 5.",
     "BK7231T Tuya TreatLife SS02 3-way switch (1.1.3, SDK 1.0.8) configures 3-way GPIOs and BLE":
         "A stock BK7231T dump from a TreatLife SS02 3-way smart wall switch "
         "(oem_bk7231s_double_switch_rmd:1.1.3 on TUYA IOT SDK 1.0.8). It configures 3-way "

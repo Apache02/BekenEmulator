@@ -73,6 +73,42 @@ def parse_mqtt_pubs(specs):
     return out
 
 
+def parse_gpio_inputs(specs):
+    """Parse --gpio-input 'PIN:LEVEL' items into {pin: level}."""
+    out = {}
+    for spec in specs or ():
+        parts = spec.split(":", 1)
+        if len(parts) != 2:
+            raise ValueError("bad --gpio-input %r (want PIN:LEVEL, e.g. 20:1)" % spec)
+        try:
+            pin = int(parts[0], 0)
+            lvl = int(parts[1], 0)
+        except ValueError:
+            raise ValueError("bad --gpio-input %r (want PIN:LEVEL, e.g. 20:1)" % spec)
+        if lvl not in (0, 1):
+            raise ValueError("bad --gpio-input %r (level must be 0 or 1)" % spec)
+        out[pin] = lvl
+    return out
+
+
+def parse_deep_sleep_wakes(specs):
+    """Parse --deep-sleep-wake items ('rtc', 'gpio', 'gpio:PIN', 'auto')."""
+    out = []
+    for spec in specs or ():
+        text = str(spec).strip().lower()
+        if text in ("rtc", "gpio", "auto"):
+            out.append(text)
+        elif text.startswith("gpio:"):
+            try:
+                pin = int(text.split(":", 1)[1], 0)
+            except ValueError:
+                raise ValueError("bad --deep-sleep-wake %r (want rtc, gpio, gpio:PIN, or auto)" % spec)
+            out.append("gpio:%d" % pin)
+        else:
+            raise ValueError("bad --deep-sleep-wake %r (want rtc, gpio, gpio:PIN, or auto)" % spec)
+    return out
+
+
 # The checks below are shared by the command line and the GUI, so the two
 # accept exactly the same values. Each raises ValueError naming the flag.
 def parse_http_gets(paths):
@@ -259,6 +295,16 @@ def parse_args():
                         help="Resume from a snapshot instead of booting. The dump, -chip and --wifi "
                              "must match the run that saved it; a peer / port forwards / pcap "
                              "given now are attached to the restored device.")
+    parser.add_argument("--gpio-input", dest="gpio_inputs", action="append", default=[],
+                        metavar="PIN:LEVEL",
+                        help="Drive physical GPIO pin PIN to LEVEL (0 or 1) from power-on. "
+                             "Repeatable, e.g. --gpio-input 20:1 holds an active-low reset "
+                             "button high at its external pull-up idle state.")
+    parser.add_argument("--deep-sleep-wake", dest="deep_sleep_wakes", action="append", default=[],
+                        metavar="SPEC",
+                        help="Automatically wake the chip when it enters deep sleep (0x800104=0xADC1). "
+                             "SPEC is rtc (RTC timer), gpio (first wake-enabled GPIO), gpio:PIN "
+                             "(specific GPIO pin), or auto. Repeatable for multi-cycle sleep/wake.")
     parser.add_argument("-key", "--key", dest="key", default=None, metavar="KEY",
                         help="Firmware decryption key: a known name (%s), 32 hex chars, or base64 of 16 bytes. "
                              "Omit for plaintext images (no decryption)." % ", ".join(sorted(KNOWN_KEYS)))
@@ -272,7 +318,8 @@ def build_emulator(dump_path, key=None, chip="BK7231", with_boot=False, only_uar
                    uart1_hex=False, uart1_rx=b"", uart1_rx_delay=None, tuyamcu=False,
                    tuyamcu_pid=None, tuyamcu_raw=False, tuyamcu_dps=None,
                    tuyamcu_injects=None, xvr_selfclear=False, uart_sink=None,
-                   save_decrypted=True, log=None, ble_core=None, wifi=False):
+                   save_decrypted=True, log=None, ble_core=None, wifi=False,
+                   deep_sleep_wakes=None, gpio_inputs=None):
     """Load a dump and return a configured, not-yet-started BekenEmulator.
 
     Everything between "here is an image and some options" and "start running"
@@ -367,7 +414,9 @@ def build_emulator(dump_path, key=None, chip="BK7231", with_boot=False, only_uar
                          tuyamcu_injects=tuyamcu_injects, uart_sink=uart_sink,
                          ble_core=ble_core, wifi=wifi,
                          exception_vector_base=0x10000 if app_window is not None else 0,
-                         chip_variant=chip_name)
+                         chip_variant=chip_name,
+                         deep_sleep_wakes=deep_sleep_wakes,
+                         gpio_inputs=gpio_inputs)
 
 
 def main():
@@ -400,7 +449,9 @@ def main():
             tuyamcu_dps=parse_dp_specs(args.tuyamcu_dps),
             tuyamcu_injects=parse_hex_blobs(args.tuyamcu_injects),
             xvr_selfclear=args.xvr_selfclear, ble_core=args.ble_core,
-            wifi=args.wifi or want_peer)
+            wifi=args.wifi or want_peer,
+            deep_sleep_wakes=parse_deep_sleep_wakes(args.deep_sleep_wakes),
+            gpio_inputs=parse_gpio_inputs(args.gpio_inputs))
         if want_peer:
             # The offline TLS peer needs the image's PSK to authenticate its
             # local broker session.  --net-out is an opaque end-to-end relay,

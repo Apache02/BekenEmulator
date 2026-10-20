@@ -89,6 +89,34 @@ INTERESTING_DUMPS = (
      "chip": "BK7231", "key": "TUYA", "wifi": True},
     {"label": "MOES relay", "file": "BK7231Q_Tuya_MOES_Relay_WA2_1.1.3.bin",
      "chip": "BK7231", "key": "(none)", "wifi": True},
+    {"label": "BP5758D bulb", "file": "BK7238_Zengge_ZJ21412_BP101_RGBCCT_Bulb.bin",
+     "chip": "BK7238", "key": "(none)", "wifi": True},
+    {"label": "PWM bulb", "file": "BK7231T_Tuya_A60_SmartBulb_RGBCWW_5ch_PWM_1000Hz.bin",
+     "chip": "BK7231", "key": "TUYA", "wifi": True},
+    {"label": "BL0942 meter", "file": "OpenBK7231T_QIO_1.18.300_mathDemo_obkStartupCommand_BL0942.bin",
+     "chip": "BK7231", "key": "TUYA", "wifi": True},
+    {"label": "BL0937 plug", "file": "BK7231T_Tuya_BN-LINK_Plug_WB2S_1.0.3.bin",
+     "chip": "BK7231", "key": "TUYA", "wifi": True},
+    {"label": "OBK sleep",
+     "file": "OpenBK7231T_QIO_1.18.300_mathDemo_obkStartupCommand_uartConsole.bin",
+     "chip": "BK7231", "key": "TUYA", "wifi": True,
+     "uart1_rx": b"DeepSleep 10\r\n"},
+    {"label": "PIR sleep",
+     "file": "BK7231N_Tuya_Generic_Motion_Sensor_CBU_1.0.6.bin",
+     "chip": "BK7231N", "key": "TUYA", "wifi": True},
+    {"label": "Rain sleep",
+     "file": "BK7231N_Tuya_Rain_Sensor_CBU_1.1.9.bin",
+     "chip": "BK7231N", "key": "TUYA", "wifi": True},
+    {"label": "TH01 sleep",
+     "file": "BK7238_Tuya_SRW-TH01_TempHum_T1-AHL_1.0.1.bin",
+     "chip": "BK7238", "key": "(none)", "wifi": True},
+    {"label": "HA15 cam",
+     "file": "BK7252_Linklemo_XCThings_HA15_IN-A15-V1.0_12.12.16.bin",
+     "chip": "BK7252", "key": "(none)", "wifi": True},
+    {"label": "Pinmei cam",
+     "file": "BK7252N_Pinmei_A9_Camera_BKFIL_3.00.42.01.bin",
+     "chip": "BK7252N", "key": "(none)", "wifi": True,
+     "uart1_rx": b"test_W291M\n"},
     {"label": "GBDQA breaker", "file": "BK7238_GBDQA_63V_16A.bin",
      "chip": "BK7238", "key": "(none)", "wifi": True, "paired": True,
      "net_out": True},
@@ -148,6 +176,8 @@ QUICK_COMMANDS = [
     "getChannel 1",
     "setPinRole 1 AlwaysHigh",
     "setPinRole 1 AlwaysLow",
+    "DeepSleep 10",
+    "backlog setPinRole 10 Btn; PinDeepSleep",
 ]
 QUICK_PER_ROW = 4       # they wrap rather than run off the end of the window
 
@@ -341,20 +371,21 @@ class SimulatorUI:
         # what was selected and remains fully editable afterwards.
         self.interesting_buttons = []
         self.interesting_group_labels = []
+        self._pending_uart1_rx = None
         for paired, title in ((False, "Quick run:"),
                               (True, "Real Tuya reconnect (owned IDs only; sends to cloud):")):
             interesting = ttk.Frame(self.root)
             interesting.pack(fill="x", padx=6, pady=(0, 3))
             heading = ttk.Label(interesting, text=title)
-            heading.pack(side="left", padx=(0, 4))
+            heading.grid(row=0, column=0, sticky="w", padx=(0, 4))
             self.interesting_group_labels.append(heading)
-            for profile in INTERESTING_DUMPS:
-                if bool(profile.get("paired")) != paired:
-                    continue
+            group_profiles = [p for p in INTERESTING_DUMPS if bool(p.get("paired")) == paired]
+            for idx, profile in enumerate(group_profiles):
+                row, col = divmod(idx, 10)
                 button = ttk.Button(
                     interesting, text=profile["label"],
                     command=lambda p=profile: self._run_interesting(p))
-                button.pack(side="left", padx=(0, 4))
+                button.grid(row=row, column=col + 1, sticky="w", padx=(0, 4), pady=(0, 2))
                 self.interesting_buttons.append(button)
 
         run = ttk.Frame(self.root)
@@ -446,6 +477,66 @@ class SimulatorUI:
         ttk.Label(peri, textvariable=self.var_pwm, anchor="w",
                   wraplength=300, justify="left").pack(side="bottom", fill="x", pady=(4, 0),
                                                        before=pf)
+
+        # Energy Meter (BL0942 UART1 / BL0937 Pulse) simulated inputs.
+        self.meter_frame = ttk.Frame(peri)
+        self.meter_frame.pack(side="bottom", fill="x", pady=(4, 0), before=pf)
+        self.var_meter = tk.StringVar(value="Meter: none detected (BL0942 UART1 ready)")
+        ttk.Label(self.meter_frame, textvariable=self.var_meter, anchor="w",
+                  wraplength=300, justify="left").pack(side="top", fill="x")
+        meter_inputs = ttk.Frame(self.meter_frame)
+        meter_inputs.pack(side="top", fill="x", pady=(2, 0))
+        self.var_meter_v = tk.StringVar(value="230")
+        self.var_meter_a = tk.StringVar(value="1.5")
+        self.var_meter_w = tk.StringVar(value="345")
+        for lbl_txt, var_obj in (("V:", self.var_meter_v),
+                                 ("A:", self.var_meter_a),
+                                 ("W:", self.var_meter_w)):
+            ttk.Label(meter_inputs, text=lbl_txt).pack(side="left", padx=(0, 2))
+            ent = ttk.Entry(meter_inputs, textvariable=var_obj, width=6)
+            ent.pack(side="left", padx=(0, 6))
+            ent.bind("<Return>", lambda _e: self._apply_energy_meter())
+        self.btn_meter_apply = ttk.Button(meter_inputs, text="Set V/A/W", width=9,
+                                          command=self._apply_energy_meter)
+        self.btn_meter_apply.pack(side="right")
+
+        # LED Driver (SM2135 / SM2235 / BP5758D / BP1658CJ / WS2812 / PWM) live color swatch.
+        self.led_frame = ttk.Frame(peri)
+        self.led_frame.pack(side="bottom", fill="x", pady=(4, 0), before=pf)
+        self.led_swatch = tk.Canvas(self.led_frame, width=38, height=22,
+                                    highlightthickness=1, highlightbackground="#5b6472",
+                                    background=periph.LED_OFF_HEX)
+        self.led_swatch.pack(side="left", padx=(0, 6))
+        self.var_led = tk.StringVar(value="LED driver: none detected")
+        ttk.Label(self.led_frame, textvariable=self.var_led, anchor="w",
+                  wraplength=255, justify="left").pack(side="left", fill="x", expand=True)
+
+        # Camera Sensor (GC0328C I2C + EJPEG + GDMA) live preview & frame counter.
+        self.cam_frame = ttk.Frame(peri)
+        self.cam_frame.pack(side="bottom", fill="x", pady=(4, 0), before=pf)
+        self.cam_canvas = tk.Canvas(self.cam_frame, width=64, height=48,
+                                    highlightthickness=1, highlightbackground="#5b6472",
+                                    background="#101216")
+        self.cam_canvas.pack(side="left", padx=(0, 6))
+        self._cam_photo = None
+        self.var_camera = tk.StringVar(value="Camera: none detected")
+        ttk.Label(self.cam_frame, textvariable=self.var_camera, anchor="w",
+                  wraplength=230, justify="left").pack(side="left", fill="x", expand=True)
+
+        # Deep Sleep status & manual RTC / GPIO wakeup controls.
+        self.sleep_frame = ttk.Frame(peri)
+        self.sleep_frame.pack(side="bottom", fill="x", pady=(4, 0), before=pf)
+        self.var_sleep = tk.StringVar(value="Sleep: AWAKE")
+        ttk.Label(self.sleep_frame, textvariable=self.var_sleep, anchor="w",
+                  wraplength=200, justify="left").pack(side="left", fill="x", expand=True)
+        self.btn_wake_gpio = ttk.Button(
+            self.sleep_frame, text="Wake GPIO", width=10, state="disabled",
+            command=lambda: self._wake_deep_sleep("gpio"))
+        self.btn_wake_gpio.pack(side="right", padx=(4, 0))
+        self.btn_wake_rtc = ttk.Button(
+            self.sleep_frame, text="Wake RTC", width=9, state="disabled",
+            command=lambda: self._wake_deep_sleep("rtc"))
+        self.btn_wake_rtc.pack(side="right")
 
         gpio_ctl = ttk.Frame(peri)
         gpio_ctl.pack(side="bottom", fill="x", pady=(4, 0), before=pf)
@@ -615,6 +706,8 @@ class SimulatorUI:
         self.txt_tuya_json.configure(state="disabled")
         if key is None:
             self.var_tuya_status.set("Pick an existing flash dump to decode.")
+            if not self._running():
+                self._refresh_static_periph()
             return None
 
         try:
@@ -622,6 +715,8 @@ class SimulatorUI:
         except Exception as exc:
             self.var_tuya_status.set("Tuya config decode failed: %s: %s"
                                      % (type(exc).__name__, exc))
+            if not self._running():
+                self._refresh_static_periph()
             return None
         self.tuya_config = decoded
         if not decoded:
@@ -630,6 +725,8 @@ class SimulatorUI:
             else:
                 note = "No recoverable Tuya configuration found in this image."
             self.var_tuya_status.set(note)
+            if not self._running():
+                self._refresh_static_periph()
             return None
 
         for label, value in decoded.get("human", []):
@@ -646,6 +743,8 @@ class SimulatorUI:
             "%s storage at 0x%06X — %d config fields, %d datapoints"
             % (storage, decoded.get("offset", 0), len(safe_pairs),
                len(decoded.get("dps", []))))
+        if not self._running():
+            self._refresh_static_periph()
         return decoded
 
     # ------------------------------------------------------------ Config tab
@@ -1060,6 +1159,7 @@ class SimulatorUI:
                 "BekenEmulator",
                 "The bundled quick-run image is missing:\n%s" % path)
             return
+        self._pending_uart1_rx = profile.get("uart1_rx")
         if profile.get("wifi"):
             self.opt["wifi"].set(True)
             # A quick run must be reproducible even after the Config tab was
@@ -1446,6 +1546,7 @@ class SimulatorUI:
     def _gpio_selection_changed(self, _event=None):
         self._gpio_selected = self._selected_gpio()
         self._update_gpio_control()
+        self._update_sleep_controls()
 
     def _gpio_double_click(self, event):
         iid = self.tree.identify_row(event.y)
@@ -1453,9 +1554,93 @@ class SimulatorUI:
             self.tree.selection_set(iid)
             self._gpio_selected = self._selected_gpio()
             self._update_gpio_control()
+            self._update_sleep_controls()
             if str(self.btn_gpio_press.cget("state")) != "disabled":
                 self._toggle_gpio_input()
         return "break"
+
+    def _sleep_wake_pins(self):
+        """Return ``{pin: active_level}`` when the chip is in deep sleep."""
+        st = getattr(self.emu, "state", None)
+        if st is None or not getattr(st, "in_deep_sleep", False):
+            return {}
+        return dict(getattr(st, "deep_sleep_wake_pins", {}))
+
+    def _update_sleep_controls(self):
+        """Update the Deep Sleep status label and manual RTC/GPIO wake buttons."""
+        st = getattr(self.emu, "state", None)
+        if st is None:
+            self.var_sleep.set("Sleep: AWAKE")
+            self.btn_wake_rtc.config(text="Wake RTC", state="disabled")
+            self.btn_wake_gpio.config(text="Wake GPIO", state="disabled")
+            return
+
+        in_sleep = bool(getattr(st, "in_deep_sleep", False))
+        sleep_count = int(getattr(st, "deep_sleep_count", 0))
+        rtc_sec = float(getattr(st, "deep_sleep_rtc_sec", 0.0))
+        wake_pins = dict(getattr(st, "deep_sleep_wake_pins", {}))
+        last_wake = getattr(st, "last_wake_reason", None)
+        last_pin = getattr(st, "last_wake_pin", None)
+        can_act = self._running() and not self._stop_requested
+
+        if in_sleep:
+            parts = []
+            if rtc_sec > 0:
+                parts.append("RTC=%.0fs" % rtc_sec)
+            if wake_pins:
+                p_list = ", ".join("P%d:%s" % (p, "HIGH" if lv else "LOW")
+                                   for p, lv in sorted(wake_pins.items()))
+                parts.append("GPIO=[%s]" % p_list)
+            detail = (" (%s)" % ", ".join(parts)) if parts else ""
+            self.var_sleep.set("DEEP SLEEP #%d%s" % (max(1, sleep_count), detail))
+            self.btn_wake_rtc.config(
+                text="Wake RTC",
+                state="normal" if can_act else "disabled")
+            sel = self._gpio_selected if self._gpio_selected is not None else self._selected_gpio()
+            if sel in wake_pins:
+                gpio_lbl = "Wake P%d" % sel
+            elif wake_pins:
+                gpio_lbl = "Wake P%d" % sorted(wake_pins.keys())[0]
+            else:
+                gpio_lbl = "Wake GPIO"
+            self.btn_wake_gpio.config(
+                text=gpio_lbl,
+                state="normal" if can_act else "disabled")
+        else:
+            if sleep_count > 0 and last_wake:
+                if last_wake == "gpio" and last_pin is not None:
+                    self.var_sleep.set("Sleep: AWAKE (woke #%d via GPIO P%d)"
+                                       % (sleep_count, last_pin))
+                else:
+                    self.var_sleep.set("Sleep: AWAKE (woke #%d via %s)"
+                                       % (sleep_count, str(last_wake).upper()))
+            else:
+                self.var_sleep.set("Sleep: AWAKE")
+            self.btn_wake_rtc.config(text="Wake RTC", state="disabled")
+            self.btn_wake_gpio.config(text="Wake GPIO", state="disabled")
+
+    def _wake_deep_sleep(self, reason="rtc"):
+        """Manually wake the sleeping device via RTC timer or GPIO wake pin."""
+        st = getattr(self.emu, "state", None)
+        if (st is None or not self._running() or self._stop_requested
+                or not getattr(st, "in_deep_sleep", False)):
+            self._update_sleep_controls()
+            return
+        wake_pins = dict(getattr(st, "deep_sleep_wake_pins", {}))
+        pin = None
+        if reason == "gpio":
+            sel = self._gpio_selected if self._gpio_selected is not None else self._selected_gpio()
+            if sel in wake_pins:
+                pin = sel
+            elif wake_pins:
+                pin = sorted(wake_pins.keys())[0]
+            else:
+                pin = sel
+        if hasattr(self.emu, "wake_from_deep_sleep"):
+            self.emu.wake_from_deep_sleep(reason=reason, pin=pin)
+        self._periph_key = None
+        self._refresh_periph()
+        self._update_state()
 
     def _update_gpio_control(self):
         pin = self._gpio_selected
@@ -1476,6 +1661,16 @@ class SimulatorUI:
                                      % (pin, "HIGH" if level else "LOW"))
             return
 
+        wake_pins = self._sleep_wake_pins()
+        if pin in wake_pins:
+            level = wake_pins[pin]
+            self.btn_gpio_press.config(
+                text="Press P%d" % pin,
+                state="normal" if (self._running() and not self._stop_requested) else "disabled")
+            self.var_gpio_action.set(
+                "P%d: deep-sleep wake pin (active %s); Press wakes the chip."
+                % (pin, "HIGH" if level else "LOW"))
+            return
 
         raw = self._gpio_config(pin)
         if not self._gpio_is_input(raw):
@@ -1504,11 +1699,15 @@ class SimulatorUI:
                 return
             del self._gpio_pressed[pin]
         else:
+            wake_pins = self._sleep_wake_pins()
             raw = self._gpio_config(pin)
-            if not self._gpio_is_input(raw):
+            if pin in wake_pins:
+                level = wake_pins[pin]
+            elif self._gpio_is_input(raw):
+                level, _why = self._gpio_press_level(pin, raw)
+            else:
                 self._update_gpio_control()
                 return
-            level, _why = self._gpio_press_level(pin, raw)
             try:
                 self.emu.set_gpio_input(pin, level)
             except (AttributeError, ValueError) as exc:
@@ -1532,8 +1731,139 @@ class SimulatorUI:
         self._periph_key = None
         self._update_gpio_control()
 
+    def _parsed_meter_values(self):
+        """Return (voltage_v, current_a, power_w) from the UI entry fields."""
+        def _num(var, default):
+            try:
+                return max(0.0, float(var.get().strip()))
+            except (ValueError, AttributeError):
+                return default
+        return (_num(self.var_meter_v, 230.0),
+                _num(self.var_meter_a, 1.5),
+                _num(self.var_meter_w, 345.0))
+
+    def _apply_energy_meter(self):
+        """Validate and push the UI's V/A/W readings into the running emulator."""
+        try:
+            v = float(self.var_meter_v.get().strip())
+            a = float(self.var_meter_a.get().strip())
+            w = float(self.var_meter_w.get().strip())
+            if v < 0 or a < 0 or w < 0:
+                raise ValueError("values must be non-negative")
+        except ValueError as exc:
+            self.var_state.set("Invalid energy meter reading: %s" % exc)
+            return
+        decoded = self._run_tuya_config if self._running() else self.tuya_config
+        info = periph.describe_peripherals(tuya_config=decoded, meter_values=(v, a, w))
+        m_cfg = info.get("meter") or {}
+        if self.emu is not None and hasattr(self.emu, "set_energy_meter"):
+            self.emu.set_energy_meter(
+                v, a, w,
+                cf_pin=m_cfg.get("cf_pin"),
+                cf1_pin=m_cfg.get("cf1_pin"),
+                sel_pin=m_cfg.get("sel_pin"),
+                sel_lv=m_cfg.get("sel_lv", 1),
+            )
+        self._periph_key = None
+        if self.emu is not None:
+            self._refresh_periph()
+        else:
+            self._refresh_static_periph()
+        self.var_state.set("Energy meter set to %.1f V, %.2f A, %.1f W" % (v, a, w))
+
+    def _draw_led_swatch(self, led_info):
+        """Render the current bulb/strip color(s) on ``self.led_swatch``."""
+        self.led_swatch.delete("all")
+        if not led_info:
+            self.led_swatch.configure(background=periph.LED_OFF_HEX)
+            return
+        hex_color = led_info.get("live_hex") or led_info.get("hex") or periph.LED_OFF_HEX
+        self.led_swatch.configure(background=hex_color)
+        pixels = led_info.get("pixels") or [hex_color]
+        w = int(self.led_swatch.cget("width") or 38)
+        h = int(self.led_swatch.cget("height") or 22)
+        n = len(pixels)
+        if n <= 1:
+            self.led_swatch.create_rectangle(0, 0, w, h, fill=hex_color, outline="")
+        else:
+            for idx, px in enumerate(pixels):
+                x0 = int(round(idx * w / float(n)))
+                x1 = int(round((idx + 1) * w / float(n)))
+                self.led_swatch.create_rectangle(x0, 0, max(x0 + 1, x1), h,
+                                                 fill=px, outline="")
+
+    def _update_camera_widget(self):
+        """Render the simulated DVP camera sensor preview and JPEG frame status."""
+        st = getattr(self.emu, "state", None)
+        if st is None:
+            self.var_camera.set("Camera: none detected")
+            self.cam_canvas.delete("all")
+            self._cam_photo = None
+            return
+
+        cam_sensor = getattr(st, "camera_sensor", None)
+        cam_w = int(getattr(st, "camera_width", 640))
+        cam_h = int(getattr(st, "camera_height", 480))
+        cam_i2c = int(getattr(st, "camera_i2c_writes", 0))
+        cam_frames = int(getattr(st, "camera_frame_count", 0))
+        cam_jpeg = bytes(getattr(st, "camera_last_jpeg", b""))
+        cam_rgb = bytes(getattr(st, "camera_frame_rgb", b""))
+
+        if cam_sensor or cam_frames > 0 or cam_i2c > 0:
+            name = cam_sensor or "GC0328C"
+            if cam_frames > 0:
+                self.var_camera.set(
+                    "Camera: %s %dx%d — %d frames (%d B JPEG, %d I2C reg)"
+                    % (name, cam_w, cam_h, cam_frames, len(cam_jpeg), cam_i2c))
+            else:
+                self.var_camera.set(
+                    "Camera: %s %dx%d (%d I2C reg configured)"
+                    % (name, cam_w, cam_h, cam_i2c))
+        else:
+            self.var_camera.set("Camera: none detected")
+
+        self.cam_canvas.delete("all")
+        self._cam_photo = None
+        if len(cam_rgb) == 64 * 48 * 3:
+            try:
+                ppm = b"P6\n64 48\n255\n" + cam_rgb
+                self._cam_photo = tk.PhotoImage(data=ppm)
+                self.cam_canvas.create_image(0, 0, anchor="nw", image=self._cam_photo)
+            except tk.TclError:
+                for gy in range(0, 48, 4):
+                    for gx in range(0, 64, 4):
+                        idx = (gy * 64 + gx) * 3
+                        r, g, b = cam_rgb[idx], cam_rgb[idx + 1], cam_rgb[idx + 2]
+                        self.cam_canvas.create_rectangle(
+                            gx, gy, gx + 4, gy + 4,
+                            fill="#%02x%02x%02x" % (r, g, b), outline="")
+
+    def _update_periph_widgets(self, led_info, meter_info, meter_vals):
+        """Update the LED driver swatch/label and Energy Meter summary label."""
+        if led_info:
+            self.var_led.set(led_info["summary"])
+        else:
+            self.var_led.set("LED driver: none detected")
+        self._draw_led_swatch(led_info)
+
+        if meter_info:
+            self.var_meter.set(meter_info["summary"])
+        else:
+            v, a, w = meter_vals
+            self.var_meter.set(
+                "Meter: BL0942 UART1 ready (%.0fV %.2fA %.0fW)" % (v, a, w))
+
+    def _refresh_static_periph(self):
+        """Show Tuya-configured LED driver / Energy Meter before a run starts."""
+        meter_vals = self._parsed_meter_values()
+        info = periph.describe_peripherals(
+            tuya_config=self.tuya_config, meter_values=meter_vals)
+        self._update_periph_widgets(info.get("led"), info.get("meter"), meter_vals)
+        self._update_camera_widget()
+        self._update_sleep_controls()
+
     def _refresh_periph(self):
-        """Redraw the GPIO/PWM table from the emulator's live registers.
+        """Redraw the GPIO/PWM table and LED/Meter widgets from live registers.
 
         The emulator records every GPIO and PWM register write into
         state.gpio_cfg / state.pwm_regs unconditionally (not only under
@@ -1541,20 +1871,41 @@ class SimulatorUI:
         periph.decode_state, the very function the HTML report renders from.
         """
         if self.emu is None:
+            self._refresh_static_periph()
             return
         try:
             gpio = dict(self.emu.state.gpio_cfg)
             pwm = dict(self.emu.state.pwm_regs)
+            i2c_frames = dict(getattr(self.emu.state, "i2c_frames", {}))
+            i2c_last_on = dict(getattr(self.emu.state, "i2c_last_on", {}))
+            ws2812_spi = bytes(getattr(self.emu.state, "ws2812_spi", b""))
+            bl0942_polls = int(getattr(self.emu.state, "bl0942_polls", 0))
+            in_sleep = bool(getattr(self.emu.state, "in_deep_sleep", False))
+            sleep_count = int(getattr(self.emu.state, "deep_sleep_count", 0))
+            wake_pins = dict(getattr(self.emu.state, "deep_sleep_wake_pins", {}))
+            cam_sensor = getattr(self.emu.state, "camera_sensor", None)
+            cam_i2c = int(getattr(self.emu.state, "camera_i2c_writes", 0))
+            cam_frames = int(getattr(self.emu.state, "camera_frame_count", 0))
         except RuntimeError:
             # The emulation thread was mid-write into the dict. Registers are
             # written tens of times per boot, so simply catching the next tick
             # is cheaper and safer than locking the write hook.
             return
 
+        meter_vals = (
+            float(getattr(self.emu, "meter_v", self._parsed_meter_values()[0])),
+            float(getattr(self.emu, "meter_a", self._parsed_meter_values()[1])),
+            float(getattr(self.emu, "meter_w", self._parsed_meter_values()[2])),
+        )
         key = (tuple(sorted(gpio.items())), tuple(sorted(pwm.items())),
-               self.var_all_pins.get(), tuple(sorted(self._gpio_pressed.items())))
+               tuple(sorted(i2c_frames.items())), ws2812_spi, bl0942_polls,
+               meter_vals, self.var_all_pins.get(),
+               tuple(sorted(self._gpio_pressed.items())),
+               in_sleep, sleep_count, tuple(sorted(wake_pins.items())),
+               cam_sensor, cam_i2c, cam_frames)
         if key == self._periph_key:
             self._update_gpio_control()
+            self._update_sleep_controls()
             return              # nothing moved; leave the widget alone
         self._periph_key = key
 
@@ -1564,31 +1915,54 @@ class SimulatorUI:
         # the live peripheral map with the running image/chip, not the next
         # image selected in the header.
         image = self._run_image or self.var_image.get()
+        tuya_cfg = self._run_tuya_config if self._running() else self.tuya_config
         if getattr(self.emu, "has_extended_gpio", False):
             chip = (getattr(self.emu, "chip_variant", "")
                     or ("BK7252" if getattr(self.emu, "is_bk7252", False)
                         else "BK7231U"))
         else:
             chip = periph.chip_from_name(image)
-        data = periph.decode_state(gpio, pwm, chip)
+        data = periph.decode_state(
+            gpio, pwm, chip,
+            i2c_frames=i2c_frames, i2c_last_on=i2c_last_on,
+            ws2812_spi=ws2812_spi, tuya_config=tuya_cfg,
+            bl0942_polls=bl0942_polls, meter_values=meter_vals)
         selected = self._gpio_selected
         self.tree.delete(*self.tree.get_children())
-        if not data:
+        if not data and not (in_sleep and wake_pins):
             self.var_pwm.set("firmware has not touched GPIO or PWM yet")
+            static_info = periph.describe_peripherals(
+                tuya_config=tuya_cfg, meter_values=meter_vals)
+            self._update_periph_widgets(static_info.get("led"),
+                                        static_info.get("meter"), meter_vals)
+            self._update_camera_widget()
             self._update_gpio_control()
+            self._update_sleep_controls()
             return
 
         show_all = self.var_all_pins.get()
-        for pin, alias, state, detail in data["gpio"]:
-            if state == "factory" and not show_all:
+        gpio_rows = list((data or {}).get("gpio", []))
+        raw_map = dict((data or {}).get("raw", {}))
+        seen_pins = {r[0] for r in gpio_rows}
+        if in_sleep and wake_pins:
+            for wpin in sorted(wake_pins):
+                if wpin not in seen_pins:
+                    gpio_rows.append((wpin, "", "factory", "INPUT (deep-sleep wake)"))
+            gpio_rows.sort(key=lambda r: r[0])
+
+        for pin, alias, state, detail in gpio_rows:
+            is_wake = in_sleep and (pin in wake_pins)
+            if state == "factory" and not show_all and not is_wake:
                 continue
-            if state == "factory":
+            if is_wake:
+                detail += " [WAKE %s]" % ("HIGH" if wake_pins[pin] else "LOW")
+            if state == "factory" and not is_wake:
                 tag = "factory"
             elif "OUTPUT" in detail:
                 tag = "out"
             else:
                 tag = "func"
-            raw = data["raw"].get(pin)
+            raw = raw_map.get(pin)
             if pin in self._gpio_pressed:
                 driven = self._gpio_pressed[pin]
                 detail += " — PRESSED %s" % ("HIGH" if driven else "LOW")
@@ -1596,21 +1970,25 @@ class SimulatorUI:
             self.tree.insert("", "end", iid="gpio:%d" % pin, tags=(tag,), values=(
                 pin, alias or "", detail, "" if raw is None else "0x%02X" % raw))
 
-        for name, value in data["func"]:
+        for name, value in (data or {}).get("func", []):
             self.tree.insert("", "end", tags=("func",), values=("", name, "function select", value))
 
         if selected is not None and self.tree.exists("gpio:%d" % selected):
             self.tree.selection_set("gpio:%d" % selected)
 
-        chans = data.get("pwm_channels") or []
+        chans = (data or {}).get("pwm_channels") or []
         if chans:
             self.var_pwm.set("PWM (%s layout), pins %s:  %s" % (
                 data["pwm_layout"], data["pwm_pins"] or "-",
                 "   ".join("ch%d %.0f Hz %.0f%%" % (c[0], c[3], c[4]) for c in chans)))
         else:
             self.var_pwm.set("PWM pins %s, no channels decoded"
-                             % (data["pwm_pins"] or "-"))
+                             % ((data or {}).get("pwm_pins") or "-"))
+        self._update_periph_widgets((data or {}).get("led"),
+                                    (data or {}).get("meter"), meter_vals)
+        self._update_camera_widget()
         self._update_gpio_control()
+        self._update_sleep_controls()
 
     def _render_uart2(self, data):
         """Firmware log text, optionally with the quicktick chatter dropped.
@@ -1711,6 +2089,8 @@ class SimulatorUI:
         """Which ink a network line gets: the link, the IP stack, or contents."""
         if line.startswith("[WIFI]"):
             return "wifi"
+        if line.startswith("[SLEEP]"):
+            return "payload"
         # Lines that carry what was actually sent, rather than the fact of it.
         for mark in (" sends: ", "MQTT PUBLISH", "MQTT -> device", "Tuya LAN broadcast",
                      "HTTP GET", "answered 200"):
@@ -1736,6 +2116,19 @@ class SimulatorUI:
             return
         self._run_tuya_config = self.tuya_config
         self._run_image = path
+        if getattr(self, "_pending_uart1_rx", None):
+            cfg["uart1_rx"] = self._pending_uart1_rx
+        self._pending_uart1_rx = None
+        meter_vals = self._parsed_meter_values()
+        m_info = periph.describe_peripherals(
+            tuya_config=self._run_tuya_config, meter_values=meter_vals).get("meter") or {}
+        cfg["meter"] = {
+            "v": meter_vals[0], "a": meter_vals[1], "w": meter_vals[2],
+            "cf_pin": m_info.get("cf_pin"),
+            "cf1_pin": m_info.get("cf1_pin"),
+            "sel_pin": m_info.get("sel_pin"),
+            "sel_lv": m_info.get("sel_lv", 1),
+        }
         # Snapshot private cloud credentials only for the offline TLS peer.
         # A real-cloud run is a transparent TCP relay and neither needs nor
         # should retain a second copy of the dump's secret in the host stack.
@@ -1790,6 +2183,7 @@ class SimulatorUI:
         emu = None
         try:
             key = None if cfg["key"] == "(none)" else parse_key(cfg["key"])
+            extra_kw = {"uart1_rx": cfg["uart1_rx"]} if cfg.get("uart1_rx") else {}
             emu = build_emulator(
                 path, key=key, chip=cfg["chip"],
                 with_boot=cfg["boot"],
@@ -1808,11 +2202,21 @@ class SimulatorUI:
                 uart_sink=self._sink,
                 # Writing app_decrypted.bin into the working directory is a
                 # command-line convenience, not something a GUI should do.
-                save_decrypted=False)
+                save_decrypted=False,
+                **extra_kw)
             # Whole [WIFI]/[NET] lines go to the network pane instead of being
             # spliced into UART2's byte stream as they are on the console.
             emu.net_sink = self._net_sink
             emu.net_frame_sink = self._frame_sink
+            m_cfg = cfg.get("meter")
+            if m_cfg and hasattr(emu, "set_energy_meter"):
+                emu.set_energy_meter(
+                    m_cfg["v"], m_cfg["a"], m_cfg["w"],
+                    cf_pin=m_cfg.get("cf_pin"),
+                    cf1_pin=m_cfg.get("cf1_pin"),
+                    sel_pin=m_cfg.get("sel_pin"),
+                    sel_lv=m_cfg.get("sel_lv", 1),
+                )
             if cfg["wifi"]:
                 emu.attach_wifi_peer(role=cfg["wifi_role"], ssid=cfg["wifi_ssid"],
                                      passphrase=cfg["wifi_pass"], forwards=cfg["forwards"],
@@ -2037,6 +2441,7 @@ class SimulatorUI:
         if self.emu is None:
             self._update_open_forward()
             self._update_gpio_control()
+            self._update_sleep_controls()
             return
 
         self._update_open_forward()
@@ -2067,6 +2472,8 @@ class SimulatorUI:
             what = "stopped"
         elif self.emu.is_paused():
             what = "PAUSED"
+        elif getattr(self.emu.state, "in_deep_sleep", False):
+            what = "DEEP SLEEP"
         else:
             what = "running"
 
@@ -2078,6 +2485,7 @@ class SimulatorUI:
                self.emu.state.last_pc, self._tx_count[1], self._tx_count[2],
                len(self.emu.uart1_rx), "ready" if ready else "not listening yet"))
         self._update_gpio_control()
+        self._update_sleep_controls()
 
     def _fmt_insns(self):
         n = self.emu.state.insn_count if self.emu else 0
@@ -2092,6 +2500,7 @@ class SimulatorUI:
 
     def _finish(self):
         self._release_gpio_inputs()
+        self._update_sleep_controls()
         self.btn_run.config(state="normal")
         self.btn_stop.config(state="disabled")
         self.btn_pause.config(state="disabled", text="Pause")
@@ -2365,9 +2774,11 @@ def _run_selftests():
     labels = [button.cget("text") for button in ui.interesting_buttons]
     check(labels == [profile["label"] for profile in INTERESTING_DUMPS]
           and {"OBK T", "OBK N", "OBK 7238", "MOES relay",
+               "OBK sleep", "PIR sleep", "Rain sleep", "TH01 sleep",
+               "HA15 cam", "Pinmei cam",
                "GBDQA breaker", "IR blaster", "LSC bulb"}
           <= set(labels),
-          "the launcher exposes the requested OpenBeken, relay and paired-cloud profiles")
+          "the launcher exposes the requested OpenBeken, relay, sleep, camera and paired-cloud profiles")
     check([label.cget("text") for label in ui.interesting_group_labels]
           == ["Quick run:", "Real Tuya reconnect (owned IDs only; sends to cloud):"],
           "proven paired callers have their own clearly labelled launcher row")
@@ -3050,6 +3461,142 @@ def _run_selftests():
     finally:
         ui._finish = real_finish
         ui.thread = ui.error = None
+
+    # LED driver color swatch and Energy Meter (BL0942 UART / BL0937 Pulse) UI:
+    try:
+        lsc_cfg = {
+            "pairs": [
+                ("dmod", "7"), ("cmod", "rgbcw"),
+                ("iicscl", "26"), ("iicsda", "24"),
+                ("iicr", "0"), ("iicg", "1"), ("iicb", "2"),
+                ("iicw", "3"), ("iicc", "4"),
+                ("2235ccur", "2"), ("2235wcur", "4"),
+            ]
+        }
+        sm2235_raw = bytes.fromhex("d82400000000000003a20000")
+        bp5758_raw = bytes.fromhex("b01f0808081e1ebcbfbcbfbcbfa0a0a0a0")
+        ws_spi = (b"\xf8" * 8 + b"\xc0" * 16) * 4    # 4 green WS2812 pixels
+
+        ui.tuya_config = lsc_cfg
+        ui._run_tuya_config = lsc_cfg
+        ui.emu = SimpleNamespace(
+            state=SimpleNamespace(
+                gpio_cfg={24: 0x02, 26: 0x02},
+                pwm_regs={},
+                i2c_frames={(26, 24): sm2235_raw},
+                i2c_last_on={(26, 24): sm2235_raw},
+                ws2812_spi=b"",
+                bl0942_polls=3,
+            ),
+            meter_v=230.0, meter_a=1.5, meter_w=345.0,
+            set_energy_meter=lambda v, a, w, **kw: setattr(ui.emu, "_meter_set", (v, a, w, kw)),
+        )
+        ui._periph_key = None
+        ui._refresh_periph()
+        check("SM2235" in ui.var_led.get() and "W:91%" in ui.var_led.get()
+              and ui.led_swatch.cget("background") != periph.LED_OFF_HEX,
+              "SM2235 I2C frame decodes Warm White 91% and lights the color swatch")
+        check("BL0942 UART1 (3 polls)" in ui.var_meter.get(),
+              "BL0942 UART1 poll count and V/A/W readings show in the meter summary")
+
+        ui.var_meter_v.set("240.5")
+        ui.var_meter_a.set("2.25")
+        ui.var_meter_w.set("541.0")
+        ui._apply_energy_meter()
+        check(getattr(ui.emu, "_meter_set", None)[:3] == (240.5, 2.25, 541.0),
+              "Set V/A/W pushes updated voltage, current and power into the emulator")
+
+        ui.tuya_config = None
+        ui._run_tuya_config = None
+        ui.emu.state.i2c_frames = {(24, 26): bp5758_raw}
+        ui.emu.state.i2c_last_on = {(24, 26): bp5758_raw}
+        ui._periph_key = None
+        ui._refresh_periph()
+        check("BP5758D" in ui.var_led.get() and "8/8/8/30/30 mA" in ui.var_led.get()
+              and "R:100% G:100% B:100%" in ui.var_led.get(),
+              "BP5758D I2C frame decodes per-channel mA currents and 100% RGB white")
+
+        ui.emu.state.i2c_frames = {}
+        ui.emu.state.i2c_last_on = {}
+        ui.emu.state.ws2812_spi = ws_spi
+        ui._periph_key = None
+        ui._refresh_periph()
+        check("WS2812 SPI" in ui.var_led.get() and "4 LEDs" in ui.var_led.get()
+              and "G:100%" in ui.var_led.get(),
+              "WS2812 SPI DMA buffer decodes pixel count and RGB color onto the swatch")
+
+        # Deep sleep status & wake controls:
+        wakes = []
+        ui.thread = Alive()
+        ui.started_at = time.time()
+        ui.emu = SimpleNamespace(
+            state=SimpleNamespace(
+                gpio_cfg={16: 0x0C, 20: 0x0C},
+                pwm_regs={},
+                i2c_frames={},
+                i2c_last_on={},
+                ws2812_spi=b"",
+                bl0942_polls=0,
+                in_deep_sleep=True,
+                deep_sleep_count=1,
+                deep_sleep_rtc_sec=28800.0,
+                deep_sleep_wake_pins={16: 1, 20: 0},
+                last_wake_reason=None,
+                last_wake_pin=None,
+                insn_count=500000,
+                last_pc=0x10000,
+            ),
+            uart1_rx_delay=0,
+            uart1_rx=bytearray(),
+            is_paused=lambda: False,
+            wake_from_deep_sleep=lambda reason="rtc", pin=None: (
+                wakes.append((reason, pin)),
+                setattr(ui.emu.state, "in_deep_sleep", False),
+                setattr(ui.emu.state, "last_wake_reason", reason),
+                setattr(ui.emu.state, "last_wake_pin", pin),
+            ),
+            set_gpio_input=lambda pin, lv: wakes.append(("pad", pin, lv)),
+        )
+        ui._periph_key = None
+        ui._refresh_periph()
+        ui._update_state()
+        check("DEEP SLEEP #1 (RTC=28800s, GPIO=[P16:HIGH, P20:LOW])" == ui.var_sleep.get()
+              and ui.var_state.get().startswith("DEEP SLEEP")
+              and str(ui.btn_wake_rtc.cget("state")) == "normal"
+              and str(ui.btn_wake_gpio.cget("state")) == "normal"
+              and ui.btn_wake_gpio.cget("text") == "Wake P16",
+              "Deep sleep state displays RTC timer and GPIO wake pins and enables Wake buttons")
+        ui.tree.selection_set("gpio:20")
+        ui._gpio_selection_changed()
+        check(ui.btn_wake_gpio.cget("text") == "Wake P20"
+              and "deep-sleep wake pin (active LOW)" in ui.var_gpio_action.get(),
+              "selecting a wake-enabled GPIO updates Wake button and Press prompt")
+        ui._wake_deep_sleep("gpio")
+        check(wakes[-1] == ("gpio", 20)
+              and "woke #1 via GPIO P20" in ui.var_sleep.get()
+              and str(ui.btn_wake_rtc.cget("state")) == "disabled",
+              "Wake GPIO triggers emulator wakeup on the selected wake pin and updates status")
+
+        # Camera sensor preview & EJPEG frame status:
+        test_rgb = b"".join(bytes((x * 3 & 0xFF, y * 5 & 0xFF, (x + y) * 2 & 0xFF))
+                            for y in range(48) for x in range(64))
+        ui.emu.state.camera_sensor = "GC0328C"
+        ui.emu.state.camera_width = 640
+        ui.emu.state.camera_height = 480
+        ui.emu.state.camera_i2c_writes = 374
+        ui.emu.state.camera_frame_count = 12
+        ui.emu.state.camera_last_jpeg = b"\xff\xd8" + b"\x00" * 1176 + b"\xff\xd9"
+        ui.emu.state.camera_frame_rgb = test_rgb
+        ui._periph_key = None
+        ui._refresh_periph()
+        check("Camera: GC0328C 640x480 — 12 frames (1180 B JPEG, 374 I2C reg)" == ui.var_camera.get()
+              and len(ui.cam_canvas.find_all()) >= 1,
+              "Camera widget displays GC0328C sensor resolution, JPEG frame count, and live preview")
+    finally:
+        ui.emu = None
+        ui.thread = None
+        ui.tuya_config = None
+        ui._run_tuya_config = None
 
     root.destroy()
     print("\nAll %d simulator UI self-tests passed." % n)

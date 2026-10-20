@@ -149,6 +149,21 @@ def parse_lines(lines):
     return gpio, pwm
 
 
+def parse_i2c_lines(lines):
+    """Collect {(scl, sda): raw_bytes} from [EMU_I2C] lines."""
+    frames = {}
+    for line in lines:
+        if line.startswith("[EMU_I2C]"):
+            parts = line.split()
+            if len(parts) >= 4:
+                try:
+                    scl, sda = int(parts[1]), int(parts[2])
+                    frames[(scl, sda)] = bytes.fromhex(parts[3])
+                except ValueError:
+                    pass
+    return frames
+
+
 def gpio_pin_values(gpio, chip=""):
     """Return a logical ``pin -> config`` map, excluding controller words."""
     pins = {pin: value for pin, value in gpio.items() if 0 <= pin < PIN_COUNT}
@@ -357,6 +372,404 @@ def pwm_registers(pwm):
     return [("+0x%02X" % off, "0x%08X" % val) for off, val in sorted(pwm.items())]
 
 
+# ---------------------------------------------------------------------------
+# LED driver & Energy Meter peripheral decoding (SM2135, SM2235/SM2135EJ,
+# BP5758D, BP1658CJ, WS2812 SPI, PWM lights, BL0942 UART, BL0937 Pulse).
+# ---------------------------------------------------------------------------
+
+LED_OFF_HEX = "#181C22"
+
+# Tuya user_param_key dmod values observed across TuyaOS/Tuya SDK dumps.
+TUYA_DMOD_NAMES = {
+    "0": "PWM",
+    "1": "SM16726B",
+    "2": "SM2135",
+    "3": "SM2135EH",
+    "4": "SM2135EJ",
+    "5": "BP1658CJ",
+    "6": "BP5758D",
+    "7": "SM2235",
+}
+
+
+def rgbcw_to_hex(r=0.0, g=0.0, b=0.0, c=0.0, w=0.0):
+    """Blend normalized (0.0..1.0) R, G, B, Cool-White, Warm-White into (#RRGGBB, is_lit).
+
+    Warm White (~2700K) contributes a warm golden-amber tint; Cool White
+    (~6500K) contributes a crisp daylight tint.  A gentle perceptual curve
+    keeps low-duty dimming visible on a UI swatch without clipping full scale.
+    """
+    r = max(0.0, min(1.0, float(r)))
+    g = max(0.0, min(1.0, float(g)))
+    b = max(0.0, min(1.0, float(b)))
+    c = max(0.0, min(1.0, float(c)))
+    w = max(0.0, min(1.0, float(w)))
+    level = max(r, g, b, c, w)
+    if level <= 0.001:
+        return LED_OFF_HEX, False
+
+    # Additive contribution from RGB + Cool White (6500K) + Warm White (2700K)
+    lin_r = r + 0.90 * c + 1.00 * w
+    lin_g = g + 0.96 * c + 0.78 * w
+    lin_b = b + 1.00 * c + 0.42 * w
+    peak = max(lin_r, lin_g, lin_b, 1.0)
+    lin_r /= peak
+    lin_g /= peak
+    lin_b /= peak
+
+    # Brightness envelope so 10% dimming is still clearly visible on screen
+    bright = 0.25 + 0.75 * (level ** 0.65)
+    out_r = int(round(max(0.0, min(1.0, lin_r * bright)) * 255))
+    out_g = int(round(max(0.0, min(1.0, lin_g * bright)) * 255))
+    out_b = int(round(max(0.0, min(1.0, lin_b * bright)) * 255))
+    return "#%02X%02X%02X" % (out_r, out_g, out_b), True
+
+
+def decode_i2c_led(scl, sda, raw_bytes, channel_map=None):
+    """Decode a bit-banged two-wire LED driver frame (SM2135, SM2235, BP5758D, BP1658CJ).
+
+    Returns a dict with driver name, raw channel values, mapped R/G/B/C/W
+    fractions, and blended ``hex`` color, or ``None`` when ``raw_bytes`` does
+    not match any known LED driver frame format.
+    """
+    b = bytes(raw_bytes or b"")
+    if len(b) < 2:
+        return None
+    b0 = b[0]
+    driver = None
+    max_val = 1023
+    cur_info = ""
+    outs = [0, 0, 0, 0, 0]
+
+    # 1. BP5758D: command byte 10_xx_xxxx (0x80 sleep, 0x90/0xB0 active)
+    if (b0 & 0xC0) == 0x80 and (len(b) == 17 or b0 == 0x80):
+        driver = "BP5758D"
+        max_val = 1023
+        if b0 == 0x80 or len(b) < 17:
+            cur_info = "sleep"
+        else:
+            en = b[1] & 0x1F
+            curs = []
+            for c_byte in b[2:7]:
+                # Bit 6 selects the upper current range (+30 mA above 0x40-0x1E)
+                ma = (c_byte & 0x3F) + 30 if (c_byte & 0x40) else (c_byte & 0x3F)
+                curs.append(ma)
+            cur_info = "%s mA" % "/".join(str(x) for x in curs)
+            for i in range(5):
+                if en & (1 << i):
+                    lo = b[7 + 2 * i] & 0x1F
+                    hi = b[8 + 2 * i] & 0x1F
+                    outs[i] = lo | (hi << 5)
+    # 2. SM2235 / SM2135EJ / SM2335: command byte 0xD0..0xEF, 12 bytes total from reg 0
+    elif (b0 & 0xF0) in (0xD0, 0xE0) and (b0 & 0x07) == 0 and len(b) == 12:
+        driver = "SM2235"
+        max_val = 1023
+        cur_info = "I=0x%02X" % b[1]
+        for i in range(5):
+            outs[i] = ((b[2 + 2 * i] & 0x03) << 8) | b[3 + 2 * i]
+    # 3. BP1658CJ: command byte 0xB0..0xBF (or 0x80 sleep), 12 bytes total from reg 0
+    elif (b0 & 0xF0) == 0xB0 and (b0 & 0x07) == 0 and len(b) == 12:
+        driver = "BP1658CJ"
+        max_val = 1023
+        cur_info = "I=0x%02X" % b[1]
+        for i in range(5):
+            lo = b[2 + 2 * i] & 0x1F
+            hi = b[3 + 2 * i] & 0x1F
+            outs[i] = lo | (hi << 5)
+    # 4. SM2135 / SM2135E: command byte 0xC0..0xC7, 8-bit channels at regs 2..6
+    elif (b0 & 0xF8) == 0xC0 and 3 <= len(b) <= 8:
+        driver = "SM2135"
+        max_val = 255
+        start_reg = b0 & 0x07
+        regs = {}
+        for idx, val in enumerate(b[1:]):
+            regs[start_reg + idx] = val
+        if 0 in regs:
+            cur_info = "I=0x%02X" % regs[0]
+        for i in range(5):
+            outs[i] = regs.get(2 + i, 0)
+    else:
+        return None
+
+    # Default channel ordering when no Tuya iicr..iicw mapping is supplied:
+    # BP5758D RGBCCT bulbs typically wire OUT1..5 as R, G, B, C, W;
+    # SM2235/SM2135 Tuya bulbs frequently wire OUT0..4 as R, G, B, W, C or R, G, B, C, W.
+    cmap = channel_map or {"r": 0, "g": 1, "b": 2, "c": 3, "w": 4}
+    def ch_frac(name):
+        idx = cmap.get(name)
+        if idx is None or not (0 <= idx < 5):
+            return 0.0
+        return min(1.0, max(0.0, outs[idx] / float(max_val)))
+
+    r, g, bl, c, w = ch_frac("r"), ch_frac("g"), ch_frac("b"), ch_frac("c"), ch_frac("w")
+    hex_color, is_lit = rgbcw_to_hex(r, g, bl, c, w)
+    return {
+        "driver": driver,
+        "scl": scl,
+        "sda": sda,
+        "raw_channels": outs,
+        "max_val": max_val,
+        "cur_info": cur_info,
+        "r": r, "g": g, "b": bl, "c": c, "w": w,
+        "hex": hex_color,
+        "is_lit": is_lit,
+        "raw_hex": b.hex(" "),
+    }
+
+
+def decode_ws2812_spi(buf):
+    """Decode SPI-DMA WS2812 bitstream (1 SPI byte per WS2812 bit, GRB order).
+
+    Returns a list of ``(r, g, b)`` tuples (0..255).
+    """
+    data = bytes(buf or b"")
+    if len(data) < 24:
+        return []
+    n_leds = len(data) // 24
+    pixels = []
+    for i in range(n_leds):
+        chunk = data[i * 24:(i + 1) * 24]
+        val = 0
+        for byte in chunk:
+            bit = 1 if bin(byte).count("1") >= 4 else 0
+            val = (val << 1) | bit
+        g = (val >> 16) & 0xFF
+        r = (val >> 8) & 0xFF
+        bl = val & 0xFF
+        pixels.append((r, g, bl))
+    return pixels
+
+
+def _tuya_pairs_dict(tuya_config):
+    if not tuya_config:
+        return {}
+    return dict((str(k), str(v)) for k, v in (tuya_config.get("pairs") or []))
+
+
+def tuya_i2c_channel_map(tuya_config):
+    """Extract {r,g,b,c,w -> 0..4} from Tuya user_param_key iicr/g/b/c/w."""
+    pairs = _tuya_pairs_dict(tuya_config)
+    cmap = {}
+    for ch in ("r", "g", "b", "c", "w"):
+        val = pairs.get("iic" + ch)
+        if val is not None:
+            try:
+                cmap[ch] = int(val, 0)
+            except ValueError:
+                pass
+    return cmap if len(cmap) >= 3 else None
+
+
+def describe_peripherals(tuya_config=None, decoded_state=None, i2c_frames=None,
+                         i2c_last_on=None, ws2812_spi=None, bl0942_polls=0,
+                         meter_values=None):
+    """Synthesize LED driver and Energy Meter state from Tuya config + live hardware.
+
+    Returns ``{"led": dict | None, "meter": dict | None}``.
+    """
+    pairs = _tuya_pairs_dict(tuya_config)
+    cmap = tuya_i2c_channel_map(tuya_config)
+    i2c_frames = dict(i2c_frames or {})
+    i2c_last_on = dict(i2c_last_on or {})
+
+    # --- 1. LED Driver detection & live color ---
+    led = None
+    # Check live I2C LED frames first
+    best_i2c = None
+    best_on = None
+    for (scl, sda), raw in sorted(i2c_frames.items()):
+        dec = decode_i2c_led(scl, sda, raw, cmap)
+        if dec is not None:
+            best_i2c = dec
+            on_raw = i2c_last_on.get((scl, sda))
+            if on_raw:
+                best_on = decode_i2c_led(scl, sda, on_raw, cmap)
+            break
+
+    ws_pixels = decode_ws2812_spi(ws2812_spi)
+    pwm_chans = (decoded_state or {}).get("pwm_channels") or []
+    pwm_by_ch = {ch: pct for ch, _per, _duty, _freq, pct in pwm_chans if pct is not None}
+
+    # Map PWM pins from Tuya config (r_pin, g_pin, b_pin, c_pin, w_pin)
+    pwm_pin_map = {}
+    for ch_name in ("r", "g", "b", "c", "w"):
+        p_str = pairs.get("%s_pin" % ch_name)
+        if p_str is not None:
+            try:
+                p_num = int(p_str, 0)
+                if p_num in PWM_PINS:
+                    pwm_pin_map[ch_name] = PWM_PINS[p_num]
+            except ValueError:
+                pass
+
+    if best_i2c is not None:
+        # If the bulb is blinking in pairing mode and currently on an OFF frame,
+        # keep the last-lit color accessible and note that it is blinking.
+        active = best_i2c
+        blinking_off = (not best_i2c["is_lit"]) and (best_on is not None and best_on["is_lit"])
+        shown = best_on if blinking_off else best_i2c
+        dmod_name = TUYA_DMOD_NAMES.get(pairs.get("dmod", ""), shown["driver"])
+        if dmod_name in ("SM2235", "SM2135EJ", "SM2135EH") and shown["driver"] == "SM2235":
+            drv_label = dmod_name
+        else:
+            drv_label = shown["driver"]
+        cur_part = (", %s" % shown["cur_info"]) if shown["cur_info"] else ""
+        pcts = "R:%.0f%% G:%.0f%% B:%.0f%% C:%.0f%% W:%.0f%%" % (
+            shown["r"] * 100, shown["g"] * 100, shown["b"] * 100,
+            shown["c"] * 100, shown["w"] * 100)
+        if blinking_off:
+            pcts += " (blink paused/off)"
+        led = {
+            "kind": drv_label,
+            "summary": "%s (SCL=P%d SDA=P%d%s)  %s  %s" % (
+                drv_label, shown["scl"], shown["sda"], cur_part, pcts, shown["hex"]),
+            "hex": shown["hex"],
+            "live_hex": active["hex"],
+            "is_lit": shown["is_lit"],
+            "pixels": [shown["hex"]],
+        }
+    elif ws_pixels:
+        # Addressable RGB strip (WS2812 over SPI DMA), optionally with PWM CW channels
+        hex_pixels = []
+        r_avg = sum(p[0] for p in ws_pixels) / (255.0 * len(ws_pixels))
+        g_avg = sum(p[1] for p in ws_pixels) / (255.0 * len(ws_pixels))
+        b_avg = sum(p[2] for p in ws_pixels) / (255.0 * len(ws_pixels))
+        for pr, pg, pb in ws_pixels:
+            hx, _ = rgbcw_to_hex(pr / 255.0, pg / 255.0, pb / 255.0)
+            hex_pixels.append(hx)
+        c_val = pwm_by_ch.get(pwm_pin_map.get("c", -1), 0.0) / 100.0
+        w_val = pwm_by_ch.get(pwm_pin_map.get("w", -1), 0.0) / 100.0
+        hex_color, is_lit = rgbcw_to_hex(r_avg, g_avg, b_avg, c_val, w_val)
+        mosi = pairs.get("mosi", "16")
+        extra_pwm = ""
+        if "c" in pwm_pin_map or "w" in pwm_pin_map:
+            extra_pwm = " + PWM C:%.0f%% W:%.0f%%" % (c_val * 100, w_val * 100)
+        led = {
+            "kind": "WS2812 SPI",
+            "summary": "WS2812 SPI (MOSI=P%s, %d LEDs)%s  R:%.0f%% G:%.0f%% B:%.0f%%  %s" % (
+                mosi, len(ws_pixels), extra_pwm, r_avg * 100, g_avg * 100, b_avg * 100, hex_color),
+            "hex": hex_color,
+            "live_hex": hex_color,
+            "is_lit": is_lit,
+            "pixels": hex_pixels,
+        }
+    elif "iicscl" in pairs and "iicsda" in pairs:
+        drv_label = TUYA_DMOD_NAMES.get(pairs.get("dmod", ""), "I2C LED")
+        scl_s, sda_s = pairs.get("iicscl", "?"), pairs.get("iicsda", "?")
+        cur_notes = []
+        for k in ("2135ccur", "2135wcur", "2235ccur", "2235wcur", "5758ccur", "5758wcur", "rgbcur", "wcur"):
+            if k in pairs:
+                cur_notes.append("%s=%s" % (k, pairs[k]))
+        cur_str = (", " + " ".join(cur_notes)) if cur_notes else ""
+        led = {
+            "kind": drv_label,
+            "summary": "%s (SCL=P%s SDA=P%s%s) — waiting for I2C frames" % (
+                drv_label, scl_s, sda_s, cur_str),
+            "hex": LED_OFF_HEX,
+            "live_hex": LED_OFF_HEX,
+            "is_lit": False,
+            "pixels": [LED_OFF_HEX],
+        }
+    elif "mosi" in pairs or "LedNum" in pairs:
+        mosi = pairs.get("mosi", "16")
+        led_num = pairs.get("LedNum", "?")
+        c_val = pwm_by_ch.get(pwm_pin_map.get("c", -1), 0.0) / 100.0
+        w_val = pwm_by_ch.get(pwm_pin_map.get("w", -1), 0.0) / 100.0
+        hex_color, is_lit = rgbcw_to_hex(0.0, 0.0, 0.0, c_val, w_val)
+        cw_note = ("  PWM C:%.0f%% W:%.0f%%  %s" % (c_val * 100, w_val * 100, hex_color)
+                   if (c_val > 0 or w_val > 0) else " — waiting for SPI/PWM output")
+        led = {
+            "kind": "WS2812 SPI",
+            "summary": "WS2812 SPI (MOSI=P%s, %s LEDs)%s" % (mosi, led_num, cw_note),
+            "hex": hex_color,
+            "live_hex": hex_color,
+            "is_lit": is_lit,
+            "pixels": [hex_color],
+        }
+    elif pwm_pin_map or pwm_chans:
+        # Pure PWM light (either with Tuya r/g/b/c/w_pin mapping or generic PWM channels)
+        if pwm_pin_map:
+            r = pwm_by_ch.get(pwm_pin_map.get("r", -1), 0.0) / 100.0
+            g = pwm_by_ch.get(pwm_pin_map.get("g", -1), 0.0) / 100.0
+            bl = pwm_by_ch.get(pwm_pin_map.get("b", -1), 0.0) / 100.0
+            c = pwm_by_ch.get(pwm_pin_map.get("c", -1), 0.0) / 100.0
+            w = pwm_by_ch.get(pwm_pin_map.get("w", -1), 0.0) / 100.0
+            pin_desc = " ".join("%s=P%s" % (k.upper(), pairs["%s_pin" % k])
+                                for k in ("r", "g", "b", "c", "w") if "%s_pin" % k in pairs)
+            hex_color, is_lit = rgbcw_to_hex(r, g, bl, c, w)
+            led = {
+                "kind": "PWM Light",
+                "summary": "PWM Light (%s)  R:%.0f%% G:%.0f%% B:%.0f%% C:%.0f%% W:%.0f%%  %s" % (
+                    pin_desc, r * 100, g * 100, bl * 100, c * 100, w * 100, hex_color),
+                "hex": hex_color,
+                "live_hex": hex_color,
+                "is_lit": is_lit,
+                "pixels": [hex_color],
+            }
+        elif pwm_chans:
+            # Generic PWM channels (e.g. OpenBeken or non-Tuya PWM bulb): map ch0..4 -> R,G,B,C,W
+            # or single channel -> Warm White
+            if len(pwm_chans) == 1:
+                r = g = bl = c = 0.0
+                w = (pwm_chans[0][4] or 0.0) / 100.0
+            elif len(pwm_chans) == 2:
+                r = g = bl = 0.0
+                c = (pwm_chans[0][4] or 0.0) / 100.0
+                w = (pwm_chans[1][4] or 0.0) / 100.0
+            else:
+                r = pwm_by_ch.get(0, 0.0) / 100.0
+                g = pwm_by_ch.get(1, 0.0) / 100.0
+                bl = pwm_by_ch.get(2, 0.0) / 100.0
+                c = pwm_by_ch.get(3, 0.0) / 100.0
+                w = pwm_by_ch.get(4, 0.0) / 100.0
+            hex_color, is_lit = rgbcw_to_hex(r, g, bl, c, w)
+            ch_str = " ".join("ch%d:%.0f%%" % (ch[0], ch[4] or 0.0) for ch in pwm_chans)
+            led = {
+                "kind": "PWM Output",
+                "summary": "PWM Output (%s)  %s" % (ch_str, hex_color),
+                "hex": hex_color,
+                "live_hex": hex_color,
+                "is_lit": is_lit,
+                "pixels": [hex_color],
+            }
+
+    # --- 2. Energy Meter detection (BL0942 UART / BL0937 Pulse) ---
+    meter = None
+    v_val, a_val, w_val = meter_values if meter_values else (230.0, 1.5, 345.0)
+    if bl0942_polls > 0:
+        meter = {
+            "kind": "BL0942 (UART1)",
+            "summary": "BL0942 UART1 (%d polls) — %.1fV  %.2fA  %.1fW" % (
+                bl0942_polls, v_val, a_val, w_val),
+            "cf_pin": None,
+            "cf1_pin": None,
+            "sel_pin": None,
+            "sel_lv": 1,
+        }
+    elif "ele_pin" in pairs or "vi_pin" in pairs:
+        def _pin_int(key):
+            try:
+                return int(pairs[key], 0)
+            except (KeyError, ValueError):
+                return None
+        cf_pin = _pin_int("ele_pin")
+        cf1_pin = _pin_int("vi_pin")
+        sel_pin = _pin_int("sel_pin_pin")
+        sel_lv = _pin_int("sel_pin_lv")
+        meter = {
+            "kind": "BL0937 (Pulse)",
+            "summary": "BL0937 Pulse (CF=P%s CF1=P%s SEL=P%s) — %.1fV  %.2fA  %.1fW" % (
+                pairs.get("ele_pin", "?"), pairs.get("vi_pin", "?"),
+                pairs.get("sel_pin_pin", "?"), v_val, a_val, w_val),
+            "cf_pin": cf_pin,
+            "cf1_pin": cf1_pin,
+            "sel_pin": sel_pin,
+            "sel_lv": 1 if sel_lv is None else sel_lv,
+        }
+
+    return {"led": led, "meter": meter}
+
+
 # Same captured offsets mean different peripherals per chip: 0x100+ is pwm_new
 # on the N family but AUDIO on 7252, so the chip selects the decoder. This
 # lives here rather than in the caller because it is a decoding decision, and
@@ -365,13 +778,15 @@ def pwm_registers(pwm):
 PWM_NEW_CHIPS = {"BK7231N", "BK7231M", "BL2028N", "BK7238"}
 
 
-def decode_state(gpio, pwm, chip=""):
+def decode_state(gpio, pwm, chip="", i2c_frames=None, i2c_last_on=None,
+                 ws2812_spi=None, tuya_config=None, bl0942_polls=0,
+                 meter_values=None):
     """Decode raw {pin: value} / {offset: value} register maps.
 
     Returns the dict the report and the GUI both render, or None when the
-    firmware has not touched either peripheral yet.
+    firmware has not touched any peripheral yet.
     """
-    if not gpio and not pwm:
+    if not gpio and not pwm and not i2c_frames and not ws2812_spi and not bl0942_polls:
         return None
     if chip in PWM_NEW_CHIPS and any(off >= 0x100 for off in pwm):
         channels = pwm_new_channels(pwm)
@@ -381,17 +796,25 @@ def decode_state(gpio, pwm, chip=""):
         layout = "old"
     logical_gpio = gpio_pin_values(gpio, chip)
     pin_count = BK7252_PIN_COUNT if chip in ("BK7231U", "BK7252") else PIN_COUNT
-    return {"gpio": gpio_table(logical_gpio, pin_count),
-            "pwm_layout": layout,
-            # Logical pin keys are what GUI actions and report assertions need;
-            # controller/function registers remain available through ``func``.
-            "raw": logical_gpio,
-            "pwm_pins": pwm_output_pins(gpio),
-            "func": func_rows(gpio),
-            "pwm_ctl": ctl,
-            "pwm_base": base,
-            "pwm_channels": channels,
-            "pwm_regs": pwm_registers(pwm)}
+    out = {"gpio": gpio_table(logical_gpio, pin_count),
+           "pwm_layout": layout,
+           # Logical pin keys are what GUI actions and report assertions need;
+           # controller/function registers remain available through ``func``.
+           "raw": logical_gpio,
+           "pwm_pins": pwm_output_pins(gpio),
+           "func": func_rows(gpio),
+           "pwm_ctl": ctl,
+           "pwm_base": base,
+           "pwm_channels": channels,
+           "pwm_regs": pwm_registers(pwm)}
+    periphs = describe_peripherals(
+        tuya_config=tuya_config, decoded_state=out,
+        i2c_frames=i2c_frames, i2c_last_on=i2c_last_on,
+        ws2812_spi=ws2812_spi, bl0942_polls=bl0942_polls,
+        meter_values=meter_values)
+    out["led"] = periphs["led"]
+    out["meter"] = periphs["meter"]
+    return out
 
 
 # Silicon name implied by a dump's filename. Report chip names (BK7231N,
@@ -405,3 +828,4 @@ def chip_from_name(filename):
     """Chip a dump's filename names, or "" when it says nothing."""
     m = CHIP_RE.search(os.path.basename(filename or ""))
     return m.group(1).upper() if m else ""
+

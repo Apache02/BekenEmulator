@@ -15,11 +15,13 @@ try:
     from . import blecore as _blecore
     from . import wifimac as _wifimac
     from . import gpio as _gpio
+    from . import periph as _periph
 except ImportError:
     import tuyamcu as _tuyamcu
     import blecore as _blecore
     import wifimac as _wifimac
     import gpio as _gpio
+    import periph as _periph
 
 # Known chip identities served from the SCTRL id registers (0x00800000 chip
 # id, 0x00800004 device id), selectable with --chip. Values extracted from
@@ -206,6 +208,17 @@ class SimulatorState:
         # changed, which removes the race and prints less than the snapshot.
         self.gpio_dirty = set()
         self.pwm_dirty = set()
+        # Bit-banged two-wire LED driver capture (SM2135, SM2235, BP5758D, BP1658CJ)
+        # and SPI-DMA WS2812 pixel buffer + BL0942 UART energy meter state.
+        self.i2c_last_pin = None
+        self.i2c_pair_counts = {}
+        self.i2c_buses = {}        # (scl, sda) -> [in_tx, cur_byte, bits, cur_frame]
+        self.i2c_frames = {}       # (scl, sda) -> latest raw frame bytes
+        self.i2c_last_on = {}      # (scl, sda) -> latest non-zero LED frame bytes
+        self.i2c_dirty = set()
+        self.ws2812_spi = b""
+        self.bl0942_polls = 0
+        self.uart1_tx_prev = -1
         # True while stdout sits at a line boundary. Report lines may only be
         # written then, so they never land inside a UART log line.
         self.uart_at_line_start = True
@@ -250,6 +263,76 @@ class SimulatorState:
         self.wdt_period_ms = 0
         self.wdt_clock_enabled = True
         self.wdt_deadline = None
+        # SCTRL / AON Deep Sleep & Wakeup registers:
+        # 0x00800104 SCTRL_SLEEP (deep sleep triggered when low 16 bits == 0xADC1)
+        # 0x0080011C SCTRL_ROSC_TIMER (bits 31:16 low ticks, bit 8 W1C int status, bit 0 enable)
+        # 0x00800120 SCTRL_GPIO_WAKEUP_EN (pins 0..31 wake mask)
+        # 0x00800124 SCTRL_GPIO_WAKEUP_TYPE (pins 0..31 wake polarity: 0=high/rising, 1=low/falling)
+        # 0x00800128 SCTRL_GPIO_WAKEUP_INT_STATUS (pins 0..31 W1C wake status)
+        # 0x00800140 SCTRL_ROSC_TIMER_H (bits 15:0 high ticks)
+        # 0x00800144 SCTRL_GPIO_WAKEUP_EN1 (pins 32..39 wake mask)
+        # 0x00800148 SCTRL_GPIO_WAKEUP_TYPE1 (pins 32..39 wake polarity)
+        # 0x0080014C SCTRL_GPIO_WAKEUP_INT_STATUS1 (pins 32..39 W1C wake status)
+        # 0x00808004 AON_PMU_WAKEUP_GPIO_STATUS (pins 0..31 wake status on BK7231N/BK7238)
+        self.sctrl_rosc_timer = 0
+        self.sctrl_rosc_timer_h = 0
+        self.sctrl_rosc_int_status = False
+        self.sctrl_gpio_wakeup_en = 0
+        self.sctrl_gpio_wakeup_type = 0
+        self.sctrl_gpio_wakeup_int_status = 0
+        self.sctrl_gpio_wakeup_en1 = 0
+        self.sctrl_gpio_wakeup_type1 = 0
+        self.sctrl_gpio_wakeup_int_status1 = 0
+        self.aon_gpio_wakeup_status = 0
+        self.sctrl_reset_retention = 0
+        self.in_deep_sleep = False
+        self.deep_sleep_count = 0
+        self.deep_sleep_info = None
+        self.deep_sleep_rtc_sec = 0.0
+        self.deep_sleep_wake_pins = {}
+        self.last_wake_reason = None
+        self.last_wake_pin = None
+        self.wake_pulse_pin = None
+        self.wake_pulse_restore = None
+        self.wake_pulse_reads_left = 0
+        self.wake_reg_sampled = False
+        self.rtt_boot_seen = False
+        self.obk_boot_seen = False
+        self.msh_prompt_seen = False
+        self.msh_uart_port = None
+        self.rx_next_line_insn = 0
+        self.audio_fifo_conf = 0
+        self.audio_dac_writes = 0
+        # Hardware I2C1 (0x00802300, IRQ bit 2) / I2C2 (0x00802600, IRQ bit 5),
+        # GC0328C DVP camera sensor, and EJPEG encoder (0x0080A000, FIQ bit 29/23).
+        self.gdma_remain = {}
+        self.hw_i2c = {
+            1: {"cfg": 0, "sta": 0, "last_dat": 0, "read_dat": 0, "slave": 0,
+                "reg": 0, "phase": 0, "v2": False},
+            2: {"cfg": 0, "sta": 0, "last_dat": 0, "read_dat": 0, "slave": 0,
+                "reg": 0, "phase": 0, "v2": True},
+        }
+        self.camera_sensor = None
+        self.camera_sensor_probed = False
+        self.camera_sensor_regs = {}
+        self.camera_i2c_writes = 0
+        self.camera_last_i2c_insn = 0
+        self.ejpeg_reg0 = 0
+        self.ejpeg_reg1 = 0
+        self.ejpeg_reg2 = 0
+        self.ejpeg_reg3 = 0
+        self.ejpeg_int_stat = 0
+        self.ejpeg_frame_len = 0
+        self.ejpeg_dma_ch = None
+        self.ejpeg_dma_dst = 0
+        self.ejpeg_dma_node_len = 1460
+        self.ejpeg_tick_div = 0
+        self.camera_frame_count = 0
+        self.camera_last_jpeg = b""
+        self.camera_frame_rgb = b""
+        self.camera_width = 640
+        self.camera_height = 480
+
 
 class FlashState:
     def __init__(self):
@@ -280,13 +363,13 @@ class BekenEmulator:
     PWM_CPU_REGS = (0x00802B24, 0x00802B64, 0x00802BA4)
     PWMN_INT_STAT = (1 << 30) | (1 << 31)     # per-channel status, write 1 to clear
     PWMN_CFG_UPDATA = (1 << 7) | (1 << 15)    # per-channel config latch, self-clearing
-    # General DMA (beken378/driver/general_dma/general_dma.h). Four channels,
-    # eight 32-bit registers each: CONF, DST_START, SRC_START, DSTLOOP_END,
-    # DSTLOOP_START, SRCLOOP_END, SRCLOOP_START, REMAIN_LEN.
+    # General DMA (beken378/driver/general_dma/general_dma.h). Six channels on
+    # v1 (0x00809000 + ch*0x20, remain at 0x008090C0 + ch*4), eight channels on
+    # v2 (BK7252N: 0x00809040 + ch*0x40, remain at 0x00809070 + ch*0x40).
     GDMA_BASE = 0x00809000
-    GDMA_CHANNELS = 4
+    GDMA_CHANNELS = 6
     GDMA_CH_STRIDE = 0x20
-    GDMA_END = GDMA_BASE + GDMA_CHANNELS * GDMA_CH_STRIDE
+    GDMA_END = GDMA_BASE + 0x240
     GDMA_EN = 1 << 0            # GDMA_X_DMA_EN, cleared by hardware when done
     GDMA_SRCADDR_INC = 1 << 8
     GDMA_DSTADDR_INC = 1 << 9
@@ -332,7 +415,7 @@ class BekenEmulator:
     WDT_SECOND_KEY = 0xA5
     WDT_INSNS_PER_MS = SLOW_TICK_INSNS // SLOW_TICK_MS
 
-    def __init__(self, raw_flash, bootloader, app, with_boot=False, only_uart=False, chip_identity=None, uart1_hex=False, physical_flash=None, uart1_rx=b"", uart1_rx_delay=CONSOLE_RX_HOLDOFF_INSNS, tuyamcu_enabled=False, tuyamcu_pid=None, tuyamcu_raw=False, xvr_selfclear=False, tuyamcu_dps=None, tuyamcu_injects=None, uart_sink=None, ble_core=None, wifi=False, exception_vector_base=0, chip_variant=None):
+    def __init__(self, raw_flash, bootloader, app, with_boot=False, only_uart=False, chip_identity=None, uart1_hex=False, physical_flash=None, uart1_rx=b"", uart1_rx_delay=CONSOLE_RX_HOLDOFF_INSNS, tuyamcu_enabled=False, tuyamcu_pid=None, tuyamcu_raw=False, xvr_selfclear=False, tuyamcu_dps=None, tuyamcu_injects=None, uart_sink=None, ble_core=None, wifi=False, exception_vector_base=0, chip_variant=None, deep_sleep_wakes=None, gpio_inputs=None):
         self.raw_flash = raw_flash
         self.xvr_selfclear = xvr_selfclear
         self.chip_variant = (chip_variant or "").strip().upper()
@@ -540,6 +623,7 @@ class BekenEmulator:
         # other supported chip 0x900000 is the XVR register block instead. So
         # this flag switches that window between "RAM" and "XVR registers".
         self.is_bk7252 = (self.chip_id_value == CHIP_FAMILIES["BK7252"][0])
+        self.is_bk7252n = (self.chip_id_value == CHIP_FAMILIES["BK7252N"][0])
         self.has_extended_gpio = (self.is_bk7252 or self.chip_variant == "BK7231U")
         self.gpio_pin_count = (self.GPIO_EXT_PIN_FIRST + self.GPIO_EXT_PIN_COUNT
                                if self.has_extended_gpio else self.GPIO_PIN_COUNT)
@@ -552,9 +636,31 @@ class BekenEmulator:
         self.is_bk7231 = self.chip_id_value in BK7231_CHIP_IDS
 
         self.state = SimulatorState()
+        if self.is_bk7252n:
+            self.state.hw_i2c[1]["v2"] = True
         if self.gpio_pin_count != self.state.gpio_hw.pin_count:
             self.state.gpio_hw = _gpio.GpioModel(self.gpio_pin_count)
+        if gpio_inputs:
+            for pin, level in gpio_inputs.items():
+                self.state.gpio_hw.check_pin(int(pin))
+                lvl = _gpio.GpioModel.check_level(level)
+                if lvl is not None:
+                    self.state.gpio_hw.inputs[int(pin)] = lvl
+        self._deep_sleep_wake_queue = list(deep_sleep_wakes or [])
+        self._deep_sleep_wake_pending = None
         self.flash_state = FlashState()
+        # Simulated Energy Meter (BL0942 UART1 / BL0937 GPIO pulse) readings.
+        self.meter_v = 230.0
+        self.meter_a = 1.5
+        self.meter_w = 345.0
+        self.meter_cf_pin = None
+        self.meter_cf1_pin = None
+        self.meter_sel_pin = None
+        self.meter_sel_lv = 1
+        self._meter_cf_ticks = 0
+        self._meter_cf1_ticks = 0
+        self._meter_cf_lv = 0
+        self._meter_cf1_lv = 0
         # The unstripped dump. Flash reads are normally served from the
         # CRC-stripped (logical) image, but a 2MB physical dump only yields
         # ~1.88MB of logical space, and some firmware addresses data above
@@ -620,9 +726,41 @@ class BekenEmulator:
         if start < end:
             buf[start:end] = b"\xff" * (end - start)
 
+    def _use_uart2_rx(self):
+        """True when RT-Thread FinSH (msh />) listens on UART2 instead of UART1."""
+        state = self.state
+        if self.tuyamcu is not None:
+            return False
+        if state.msh_uart_port in (1, 2):
+            return state.msh_uart_port == 2
+        if not ((state.uart2_int_enable & 0x42) and (state.icu_int_enable & (1 << 1))):
+            return False
+        return not ((state.uart1_int_enable & 0x42) and (state.icu_int_enable & (1 << 0)))
+
+    def _rx_ready_for_console(self):
+        """Hold back console commands on RT-Thread until FinSH prints msh />."""
+        state = self.state
+        if state.rtt_boot_seen or ((self.is_bk7252 or self.is_bk7252n) and not state.obk_boot_seen):
+            if state.msh_prompt_seen:
+                return True
+            if state.rx_next_line_insn:
+                return state.insn_count >= state.rx_next_line_insn
+            return state.insn_count >= max(self.uart1_rx_delay, 25_000_000)
+        return state.insn_count >= self.uart1_rx_delay
+
     def _rx_active(self):
-        """True while queued UART1 RX bytes should be delivered to the guest."""
-        return bool(self.uart1_rx) and self.state.insn_count >= self.uart1_rx_delay
+        """True while queued UART1 RX bytes should be delivered to UART1."""
+        if not self.uart1_rx or self._use_uart2_rx():
+            return False
+        if self.tuyamcu is not None:
+            return self.state.insn_count >= self.uart1_rx_delay
+        return self._rx_ready_for_console()
+
+    def _rx_active_uart2(self):
+        """True while queued console RX bytes should be delivered to UART2."""
+        if not self.uart1_rx or not self._use_uart2_rx():
+            return False
+        return self._rx_ready_for_console()
 
     def feed_uart1(self, data):
         """Queue bytes for the guest to read back on UART1. Thread-safe.
@@ -633,6 +771,121 @@ class BekenEmulator:
         """
         with self._rx_lock:
             self.uart1_rx += bytes(data)
+            self.state.msh_prompt_seen = True
+
+    def set_energy_meter(self, voltage_v=230.0, current_a=1.5, power_w=345.0,
+                         cf_pin=None, cf1_pin=None, sel_pin=None, sel_lv=1):
+        """Update simulated BL0942 (UART1) / BL0937 (GPIO pulse) readings.
+
+        Safe to call from a GUI thread while the emulator is running.
+        """
+        self.meter_v = max(0.0, float(voltage_v))
+        self.meter_a = max(0.0, float(current_a))
+        self.meter_w = max(0.0, float(power_w))
+        if cf_pin is not None:
+            self.meter_cf_pin = int(cf_pin)
+        if cf1_pin is not None:
+            self.meter_cf1_pin = int(cf1_pin)
+        if sel_pin is not None:
+            self.meter_sel_pin = int(sel_pin)
+        if sel_lv is not None:
+            self.meter_sel_lv = 1 if int(sel_lv) else 0
+
+    def _bl0942_reply_packet(self):
+        """Build a 23-byte BL0942 full-data packet (0x55 header + checksum).
+
+        Scale factors match OpenBeken's ``drv_bl0942.c`` defaults
+        (``BL0942_VREF = 15188``, ``BL0942_IREF = 251210``, ``BL0942_PREF = 598``).
+        """
+        v_rms = max(0, min(0xFFFFFF, int(round(self.meter_v * 15188.0))))
+        i_rms = max(0, min(0xFFFFFF, int(round(self.meter_a * 251210.0))))
+        watt = max(0, min(0x7FFFFF, int(round(self.meter_w * 598.0))))
+        cf_cnt = max(1, min(0xFFFFFF, self.state.bl0942_polls * 10))
+        freq = int(1000000 // 50)
+        pkt = bytearray(23)
+        pkt[0] = 0x55
+        pkt[1:4] = i_rms.to_bytes(3, "little")
+        pkt[4:7] = v_rms.to_bytes(3, "little")
+        pkt[7:10] = i_rms.to_bytes(3, "little")
+        pkt[10:13] = watt.to_bytes(3, "little")
+        pkt[13:16] = cf_cnt.to_bytes(3, "little")
+        pkt[16:18] = freq.to_bytes(2, "little")
+        pkt[22] = ((0x58 + sum(pkt[:22])) & 0xFF) ^ 0xFF
+        return bytes(pkt)
+
+    def _tick_energy_meter_pulses(self, state):
+        """Drive simulated BL0937/HLW8012 CF (power) and CF1 (V/I) pulses."""
+        cf_pin = self.meter_cf_pin
+        cf1_pin = self.meter_cf1_pin
+        if cf_pin is not None and 0 <= cf_pin < self.gpio_pin_count and self.meter_w > 0.1:
+            self._meter_cf_ticks += 1
+            period = max(1, int(round(600.0 / max(5.0, min(3000.0, self.meter_w)))))
+            if self._meter_cf_ticks >= period:
+                self._meter_cf_ticks = 0
+                self._meter_cf_lv ^= 1
+                state.gpio_hw.drive(cf_pin, self._meter_cf_lv, self._gpio_config_word(cf_pin))
+        if cf1_pin is not None and 0 <= cf1_pin < self.gpio_pin_count:
+            self._meter_cf1_ticks += 1
+            sel_v = True
+            if self.meter_sel_pin is not None and 0 <= self.meter_sel_pin < self.gpio_pin_count:
+                sel_cfg = self._gpio_config_word(self.meter_sel_pin)
+                sel_out = 0 if (not (sel_cfg & 0x08) and not (sel_cfg & 0x02)) else 1
+                sel_v = (sel_out == self.meter_sel_lv)
+            rate = self.meter_v if sel_v else (self.meter_a * 100.0)
+            if rate > 0.1:
+                period = max(1, int(round(300.0 / max(5.0, min(1500.0, rate)))))
+                if self._meter_cf1_ticks >= period:
+                    self._meter_cf1_ticks = 0
+                    self._meter_cf1_lv ^= 1
+                    state.gpio_hw.drive(cf1_pin, self._meter_cf1_lv, self._gpio_config_word(cf1_pin))
+
+    def _i2c_pin_edge(self, state, pin, old_cfg, new_cfg):
+        """Track bit-banged two-wire LED driver frames (SM2135/SM2235/BP5758D/BP1658CJ)."""
+        old_lv = 0 if (not (old_cfg & 0x08) and not (old_cfg & 0x02)) else 1
+        new_lv = 0 if (not (new_cfg & 0x08) and not (new_cfg & 0x02)) else 1
+        if pin != state.i2c_last_pin:
+            if state.i2c_last_pin is not None:
+                pair = (min(pin, state.i2c_last_pin), max(pin, state.i2c_last_pin))
+                cnt = state.i2c_pair_counts.get(pair, 0) + 1
+                state.i2c_pair_counts[pair] = cnt
+                if cnt == 32:
+                    state.i2c_buses[(pair[0], pair[1])] = [False, 0, 0, bytearray()]
+                    state.i2c_buses[(pair[1], pair[0])] = [False, 0, 0, bytearray()]
+            state.i2c_last_pin = pin
+        if not state.i2c_buses or old_lv == new_lv:
+            return
+        for (scl, sda), bstate in state.i2c_buses.items():
+            if pin == sda:
+                scl_cfg = state.gpio_cfg.get(self._gpio_slot(scl), 0x3C)
+                scl_lv = 0 if (not (scl_cfg & 0x08) and not (scl_cfg & 0x02)) else 1
+                if scl_lv == 1:
+                    if old_lv == 1 and new_lv == 0:
+                        bstate[0] = True
+                        bstate[1] = 0
+                        bstate[2] = 0
+                        bstate[3] = bytearray()
+                    elif old_lv == 0 and new_lv == 1:
+                        if bstate[0] and len(bstate[3]) >= 2:
+                            raw = bytes(bstate[3])
+                            dec = _periph.decode_i2c_led(scl, sda, raw)
+                            if dec is not None:
+                                state.i2c_frames[(scl, sda)] = raw
+                                if dec["is_lit"]:
+                                    state.i2c_last_on[(scl, sda)] = raw
+                                if self._emit_insns:
+                                    state.i2c_dirty.add((scl, sda))
+                        bstate[0] = False
+            elif pin == scl and bstate[0]:
+                if old_lv == 0 and new_lv == 1:
+                    sda_cfg = state.gpio_cfg.get(self._gpio_slot(sda), 0x3C)
+                    sda_lv = 0 if (not (sda_cfg & 0x08) and not (sda_cfg & 0x02)) else 1
+                    if bstate[2] < 8:
+                        bstate[1] = ((bstate[1] << 1) | sda_lv) & 0xFF
+                        bstate[2] += 1
+                    else:
+                        bstate[3].append(bstate[1])
+                        bstate[1] = 0
+                        bstate[2] = 0
 
     def set_gpio_input(self, pin, level):
         """Drive one GPIO input from a host thread, or release it with ``None``.
@@ -822,6 +1075,8 @@ class BekenEmulator:
         self.mu.mem_write(self.PERIPH_BASE, b"\x00" * self.PERIPH_SIZE)
         self.mu.mem_write(self.XVR_BASE,
                           b"\x00" * (0x40000 if self.is_bk7252 else 0x1000))
+        if self.is_bk7252n:
+            self.mu.mem_write(0x00A00000, b"\x00" * 0x10000)
         self.mu.mem_write(self.ACCEL_BASE, b"\x00" * 0x1000)
         self.mu.mem_write(self.UART1_FIFO_STATUS,
                           struct.pack("<I", 1 << 17 | 1 << 19 | 1 << 20))
@@ -832,6 +1087,8 @@ class BekenEmulator:
         self.mu.context_restore(self._power_on_context)
 
         self.state = SimulatorState()
+        if self.is_bk7252n:
+            self.state.hw_i2c[1]["v2"] = True
         if self.gpio_pin_count != self.state.gpio_hw.pin_count:
             self.state.gpio_hw = _gpio.GpioModel(self.gpio_pin_count)
         self.state.gpio_hw.inputs.update(gpio_inputs)
@@ -847,6 +1104,254 @@ class BekenEmulator:
         self.reset_count += 1
         self._exc_epoch += 1
         self.net_log("[WDT] watchdog expired; device reset #%d" % self.reset_count)
+
+    def _decode_deep_sleep_info(self, state, sleep_reg_val):
+        """Decode SCTRL RTC timer and GPIO wakeup configuration at deep sleep entry."""
+        rosc_en = bool(state.sctrl_rosc_timer & 1)
+        ticks = (((state.sctrl_rosc_timer_h & 0xFFFF) << 16)
+                 | ((state.sctrl_rosc_timer >> 16) & 0xFFFF))
+        if not rosc_en or ticks == 0:
+            rtc_seconds = None
+        elif ticks % 32000 == 0:
+            rtc_seconds = ticks / 32000.0
+        elif ticks % 32768 == 0:
+            rtc_seconds = ticks / 32768.0
+        elif (state.sctrl_rosc_timer_h & 0xFFFF) == 0 and ticks < 3200:
+            rtc_seconds = round(ticks / 32.7, 1)
+        else:
+            rtc_seconds = round(ticks / 32768.0, 1)
+
+        wake_mask = ((state.sctrl_gpio_wakeup_en & 0xFFFFFFFF)
+                     | ((state.sctrl_gpio_wakeup_en1 & 0xFF) << 32))
+        wake_type = ((state.sctrl_gpio_wakeup_type & 0xFFFFFFFF)
+                     | ((state.sctrl_gpio_wakeup_type1 & 0xFF) << 32))
+        wake_pins = []
+        for p in range(self.gpio_pin_count):
+            if (wake_mask >> p) & 1:
+                active_lv = 0 if ((wake_type >> p) & 1) else 1
+                wake_pins.append((p, active_lv))
+        return {
+            "sleep_reg": sleep_reg_val & 0xFFFFFFFF,
+            "rtc_enabled": bool(rosc_en and ticks > 0),
+            "rtc_ticks": ticks,
+            "rtc_seconds": rtc_seconds,
+            "wake_gpio_mask": wake_mask,
+            "wake_gpio_type": wake_type,
+            "wake_pins": wake_pins,
+            "insn_count": state.insn_count,
+        }
+
+    def _resolve_wake_spec(self, spec, info=None):
+        """Resolve a wake specification ('rtc', 'gpio', 'gpio:16', 'auto') to (reason, pin)."""
+        if info is None:
+            info = self.state.deep_sleep_info or {}
+        if isinstance(spec, tuple) and len(spec) == 2:
+            reason, pin = spec
+        else:
+            text = str(spec or "auto").strip().lower()
+            if text.startswith("gpio:"):
+                reason = "gpio"
+                pin = int(text.split(":", 1)[1], 0)
+            elif text in ("rtc", "gpio", "auto"):
+                reason = text
+                pin = None
+            else:
+                raise ValueError("bad deep-sleep wake spec %r (want rtc, gpio, gpio:PIN, or auto)" % spec)
+        wake_pins = info.get("wake_pins") or []
+        if reason == "auto":
+            if info.get("rtc_enabled"):
+                return ("rtc", None)
+            if wake_pins:
+                return ("gpio", wake_pins[0][0])
+            return ("rtc", None)
+        if reason == "gpio" and pin is None:
+            pin = wake_pins[0][0] if wake_pins else 0
+        return (reason, pin)
+
+    def wake_from_deep_sleep(self, reason="auto", pin=None):
+        """Request a wakeup from deep sleep (callable from GUI/host thread)."""
+        spec = ("gpio", int(pin)) if (reason == "gpio" and pin is not None) else reason
+        self._deep_sleep_wake_pending = self._resolve_wake_spec(spec)
+        self.pause(False)
+
+    def _flush_report_periph(self, state):
+        """Flush any pending [EMU_GPIO]/[EMU_PWM]/[EMU_I2C]/[EMU_UART1] lines."""
+        if not self._emit_insns:
+            return
+        if not (state.gpio_dirty or state.pwm_dirty or state.i2c_dirty or state.uart1_events):
+            return
+        buf = sys.__stdout__.buffer
+        if not state.uart_at_line_start:
+            buf.write(b"\n")
+            state.uart_at_line_start = True
+        periph_changed = bool(state.gpio_dirty or state.pwm_dirty or state.i2c_dirty)
+        for pin in sorted(state.gpio_dirty):
+            buf.write(b"[EMU_GPIO] %d %08x\n" % (pin, state.gpio_cfg[pin]))
+        for off in sorted(state.pwm_dirty):
+            buf.write(b"[EMU_PWM] %03x %08x\n" % (off, state.pwm_regs[off]))
+        for scl, sda in sorted(state.i2c_dirty):
+            raw = state.i2c_frames.get((scl, sda), b"")
+            if raw:
+                buf.write(b"[EMU_I2C] %d %d %s\n" % (scl, sda, raw.hex().encode("ascii")))
+        if periph_changed:
+            buf.write(b"[EMU_PERIPH]\n")
+        for _t, _d, _b in state.uart1_events:
+            buf.write(b"[EMU_UART1] %d %c %02x\n" % (_t, ord(_d), _b))
+        state.gpio_dirty.clear()
+        state.pwm_dirty.clear()
+        state.i2c_dirty.clear()
+        state.uart1_events.clear()
+        buf.flush()
+
+    def _enter_deep_sleep(self, sleep_reg_val):
+        """Transition into deep sleep when SCTRL_SLEEP (0x00800104) is written with 0xADC1."""
+        state = self.state
+        if state.in_deep_sleep:
+            return
+        self._flush_report_periph(state)
+        state.in_deep_sleep = True
+        state.deep_sleep_count += 1
+        info = self._decode_deep_sleep_info(state, sleep_reg_val)
+        state.deep_sleep_info = info
+        state.deep_sleep_rtc_sec = float(info["rtc_seconds"] or 0.0)
+        state.deep_sleep_wake_pins = dict(info["wake_pins"])
+        parts = []
+        if info["rtc_enabled"] and info["rtc_seconds"] is not None:
+            parts.append("RTC=%gs" % info["rtc_seconds"])
+        if info["wake_pins"]:
+            pins_str = ", ".join("P%d:%s" % (p, "HIGH" if lv else "LOW")
+                                 for p, lv in info["wake_pins"])
+            parts.append("GPIO=[%s]" % pins_str)
+        summary = ", ".join(parts) if parts else "no wake source armed"
+        self.net_log("[SLEEP] entered deep sleep (%s)" % summary)
+        if self._deep_sleep_wake_queue:
+            spec = self._deep_sleep_wake_queue.pop(0)
+            self._deep_sleep_wake_pending = self._resolve_wake_spec(spec, info)
+        try:
+            self.mu.emu_stop()
+        except Exception:
+            pass
+
+    def _wait_in_deep_sleep(self):
+        """Park while in deep sleep until a wake event (RTC/GPIO) or stop occurs."""
+        while self.state.in_deep_sleep and not self.stopping:
+            if self._gpio_events:
+                with self._gpio_lock:
+                    events, self._gpio_events = self._gpio_events, []
+                info = self.state.deep_sleep_info or {}
+                wake_map = dict(info.get("wake_pins") or ())
+                for pin, level in events:
+                    self.state.gpio_hw.drive(pin, level, self._gpio_config_word(pin))
+                    if pin in wake_map and level is not None and level == wake_map[pin]:
+                        self._deep_sleep_wake_pending = ("gpio", pin)
+            if self._deep_sleep_wake_pending is not None:
+                reason, pin = self._deep_sleep_wake_pending
+                self._deep_sleep_wake_pending = None
+                self._deep_sleep_reset(reason, pin)
+                return True
+            time.sleep(0.01)
+        return False
+
+    def _deep_sleep_reset(self, reason="rtc", pin=None):
+        """Wake the chip from deep sleep via warm SCTRL/AON reset."""
+        if self._power_on_context is None:
+            raise RuntimeError("deep sleep reset requested before emulator setup")
+
+        old = self.state
+        gpio_inputs = dict(old.gpio_hw.inputs)
+        info = old.deep_sleep_info or self._decode_deep_sleep_info(old, 0xADC1)
+        reason, pin = self._resolve_wake_spec((reason, pin), info)
+        self._network_insn_offset += old.insn_count
+
+        self.mu.mem_write(self.RAM_BASE, b"\x00" * self.RAM_SIZE)
+        self.mu.mem_write(self.MMIO_BASE, b"\x00" * self.MMIO_SIZE)
+        self.mu.mem_write(self.PERIPH_BASE, b"\x00" * self.PERIPH_SIZE)
+        self.mu.mem_write(self.XVR_BASE,
+                          b"\x00" * (0x40000 if self.is_bk7252 else 0x1000))
+        if self.is_bk7252n:
+            self.mu.mem_write(0x00A00000, b"\x00" * 0x10000)
+        self.mu.mem_write(self.ACCEL_BASE, b"\x00" * 0x1000)
+        self.mu.mem_write(self.UART1_FIFO_STATUS,
+                          struct.pack("<I", 1 << 17 | 1 << 19 | 1 << 20))
+        self.mu.mem_write(self.UART2_FIFO_STATUS,
+                          struct.pack("<I", 1 << 17 | 1 << 19 | 1 << 20))
+        self.mu.mem_write(0x00802c00, struct.pack("<I", 1 << 28 | 1 << 30))
+        self.mu.mem_write(self.WDT_CTRL, struct.pack("<I", 0))
+        self.mu.context_restore(self._power_on_context)
+
+        new_state = SimulatorState()
+        if self.is_bk7252n:
+            new_state.hw_i2c[1]["v2"] = True
+        if self.gpio_pin_count != new_state.gpio_hw.pin_count:
+            new_state.gpio_hw = _gpio.GpioModel(self.gpio_pin_count)
+        new_state.gpio_hw.inputs.update(gpio_inputs)
+
+        # Always-On (AON) SCTRL wakeup configuration survives deep sleep reset.
+        new_state.sctrl_rosc_timer = old.sctrl_rosc_timer
+        new_state.sctrl_rosc_timer_h = old.sctrl_rosc_timer_h
+        new_state.sctrl_gpio_wakeup_en = old.sctrl_gpio_wakeup_en
+        new_state.sctrl_gpio_wakeup_type = old.sctrl_gpio_wakeup_type
+        new_state.sctrl_gpio_wakeup_en1 = old.sctrl_gpio_wakeup_en1
+        new_state.sctrl_gpio_wakeup_type1 = old.sctrl_gpio_wakeup_type1
+        new_state.sctrl_reset_retention = old.sctrl_reset_retention
+        new_state.deep_sleep_count = old.deep_sleep_count
+        new_state.deep_sleep_info = info
+        new_state.deep_sleep_rtc_sec = float(info.get("rtc_seconds") or 0.0)
+        new_state.deep_sleep_wake_pins = dict(info.get("wake_pins") or ())
+
+        if reason == "rtc":
+            new_state.sctrl_rosc_int_status = True
+            new_state.last_wake_reason = "rtc"
+            new_state.last_wake_pin = None
+            wake_desc = "RTC timer"
+        else:
+            pin = int(pin or 0)
+            wake_type = info.get("wake_gpio_type", 0)
+            active_lv = 0 if ((wake_type >> pin) & 1) else 1
+            if pin < 32:
+                new_state.sctrl_gpio_wakeup_int_status = 1 << pin
+                new_state.aon_gpio_wakeup_status = 1 << pin
+            else:
+                new_state.sctrl_gpio_wakeup_int_status1 = 1 << (pin - 32)
+            prev_lv = gpio_inputs.get(pin)
+            new_state.gpio_hw.inputs[pin] = active_lv
+            new_state.wake_pulse_pin = pin
+            new_state.wake_pulse_restore = (prev_lv if prev_lv is not None
+                                            and prev_lv != active_lv
+                                            else (1 - active_lv))
+            new_state.wake_pulse_reads_left = 4
+            new_state.wake_reg_sampled = False
+            new_state.last_wake_reason = "gpio"
+            new_state.last_wake_pin = pin
+            wake_desc = "GPIO P%d=%d" % (pin, active_lv)
+
+        # Mirror retained SCTRL words into mapped MMIO memory as well.
+        self.mu.mem_write(0x0080011c, struct.pack("<I",
+            (new_state.sctrl_rosc_timer & ~0x100)
+            | (0x100 if new_state.sctrl_rosc_int_status else 0)))
+        self.mu.mem_write(0x00800120, struct.pack("<I", new_state.sctrl_gpio_wakeup_en))
+        self.mu.mem_write(0x00800124, struct.pack("<I", new_state.sctrl_gpio_wakeup_type))
+        self.mu.mem_write(0x00800128, struct.pack("<I", new_state.sctrl_gpio_wakeup_int_status))
+        self.mu.mem_write(0x00800140, struct.pack("<I", new_state.sctrl_rosc_timer_h))
+        self.mu.mem_write(0x00800144, struct.pack("<I", new_state.sctrl_gpio_wakeup_en1))
+        self.mu.mem_write(0x00800148, struct.pack("<I", new_state.sctrl_gpio_wakeup_type1))
+        self.mu.mem_write(0x0080014c, struct.pack("<I", new_state.sctrl_gpio_wakeup_int_status1))
+        self.mu.mem_write(0x00808004, struct.pack("<I", new_state.aon_gpio_wakeup_status))
+
+        self.state = new_state
+        self.flash_state = FlashState()
+        self._uart_src = None
+        self._resume_at = None
+        self._ble_adv_seen.clear()
+        self._watchdog_reset_pending = False
+        self.run_error = None
+        if self.wifimac is not None:
+            self.trng_state = 0x2545F491
+        self._reset_peripheral_models()
+        self.reset_count += 1
+        self._exc_epoch += 1
+        self.net_log("[SLEEP] waking from deep sleep (%s); device reset #%d"
+                     % (wake_desc, self.reset_count))
 
     def net_log(self, msg):
         """Print a [WIFI]/[NET] line of our own without splitting a UART line.
@@ -995,12 +1500,259 @@ class BekenEmulator:
         if data:
             self.state.uart_at_line_start = data.endswith(b"\n")
             self.state.last_uart_insn = self.state.insn_count
-            if self.state.uart_at_line_start:
-                self.state.uart_line_tail = b""
-            else:
-                self.state.uart_line_tail = (self.state.uart_line_tail + data)[-16:]
             if self._snapshot_marker is not None:
                 self._snapshot_check_uart(data)
+
+    def _note_uart_tx(self, port, b_val):
+        state = self.state
+        state.last_uart_insn = state.insn_count
+        if b_val == 0x0A:
+            state.uart_at_line_start = True
+            state.uart_line_tail = b""
+        else:
+            state.uart_at_line_start = False
+            state.uart_line_tail = (state.uart_line_tail + bytes([b_val]))[-24:]
+            if any(m in state.uart_line_tail for m in (b"Info:MAIN:", b"Warn:CFG:")):
+                state.obk_boot_seen = True
+            if any(m in state.uart_line_tail for m in (b"RT -     ", b"rt-thread", b"[I/FAL]", b"[D/FAL]")):
+                state.rtt_boot_seen = True
+            if b"msh />" in state.uart_line_tail:
+                state.rtt_boot_seen = True
+                state.msh_prompt_seen = True
+                state.msh_uart_port = port
+
+    def _camera_i2c_read(self, slave_id, reg_addr):
+        """Read one register from the simulated DVP camera sensor (GC0328C at 0x21)."""
+        state = self.state
+        state.camera_last_i2c_insn = state.insn_count
+        reg_addr &= 0xFF
+        if slave_id in (0x21, 0x42):
+            if reg_addr == 0xF0:
+                if state.camera_sensor is None:
+                    state.camera_sensor = "GC0328C"
+                state.camera_sensor_probed = True
+                return 0x9D
+            if reg_addr == 0xF1:
+                return 0x28
+            if reg_addr == 0x00:
+                return 0x00
+        return state.camera_sensor_regs.get((slave_id, reg_addr), 0x00)
+
+    def _camera_i2c_write(self, slave_id, reg_addr, data_byte):
+        """Write one register to the simulated DVP camera sensor."""
+        state = self.state
+        state.camera_last_i2c_insn = state.insn_count
+        if state.camera_sensor is None and slave_id in (0x21, 0x42):
+            state.camera_sensor = "GC0328C"
+            state.camera_sensor_probed = True
+        state.camera_sensor_regs[(slave_id, reg_addr & 0xFF)] = data_byte & 0xFF
+        state.camera_i2c_writes += 1
+
+    def _hw_i2c_write(self, bus_num, offset, value):
+        """Handle MMIO writes to I2C1 (0x00802300, IRQ 2) or I2C2 (0x00802600, IRQ 5)."""
+        state = self.state
+        bus = state.hw_i2c[bus_num]
+        irq_bit = (1 << 2) if bus_num == 1 else (1 << 5)
+        if offset == 0x08 or (offset == 0x00 and (value & 0x80000000)):
+            bus["v2"] = True
+
+        if not bus["v2"]:
+            # 2-register I2C1 layout (BK7252 / BK7231): +0x00 CONFIG, +0x04 DAT
+            if offset == 0x04:
+                bus["last_dat"] = value & 0xFF
+            elif offset == 0x00:
+                if not (value & 1) or (value & (1 << 2)):
+                    bus["cfg"] = value & ~((1 << 1) | (1 << 2) | (1 << 16) | (1 << 19))
+                    bus["phase"] = 0
+                    state.pending_irqs &= ~irq_bit
+                elif value & (1 << 1):
+                    slave_id = (bus["last_dat"] >> 1) & 0x7F
+                    is_read = bool(bus["last_dat"] & 1)
+                    bus["slave"] = slave_id
+                    bus["phase"] = 3 if is_read else 1
+                    bus["cfg"] = (value & ~(1 << 19)) | (1 << 16) | (1 << 17) | (1 << 1)
+                    state.pending_irqs |= irq_bit
+                elif bus["phase"] != 0:
+                    if bus["phase"] == 1:
+                        bus["reg"] = bus["last_dat"] & 0xFF
+                        bus["phase"] = 2
+                    elif bus["phase"] == 2:
+                        self._camera_i2c_write(bus["slave"], bus["reg"], bus["last_dat"])
+                        bus["reg"] = (bus["reg"] + 1) & 0xFF
+                    bus["cfg"] = (value & ~((1 << 1) | (1 << 19))) | (1 << 16) | (1 << 17)
+                    state.pending_irqs |= irq_bit
+                else:
+                    bus["cfg"] = value & ~((1 << 16) | (1 << 19))
+        else:
+            # 3-register I2C2 / BK7252N-I2C1 layout: +0x00 CONFIG, +0x04 STA, +0x08 DAT
+            if offset == 0x00:
+                bus["cfg"] = value & 0xFFFFFFFF
+                if not (value & 0x80000000):
+                    bus["phase"] = 0
+                    bus["sta"] = 0
+                    state.pending_irqs &= ~irq_bit
+            elif offset == 0x08:
+                bus["last_dat"] = value & 0xFF
+            elif offset == 0x04:
+                if value & (1 << 9):
+                    bus["sta"] = value & ~((1 << 0) | (1 << 9) | (1 << 10) | (1 << 14) | (1 << 15))
+                    bus["phase"] = 0
+                    state.pending_irqs &= ~irq_bit
+                elif value & (1 << 10):
+                    slave_id = (bus["last_dat"] >> 1) & 0x7F
+                    is_read = bool(bus["last_dat"] & 1)
+                    bus["slave"] = slave_id
+                    bus["phase"] = 3 if is_read else 1
+                    bus["sta"] = (value & ~(1 << 15)) | (1 << 0) | (1 << 8) | (1 << 10) | (1 << 14)
+                    state.pending_irqs |= irq_bit
+                elif bus["phase"] != 0:
+                    if bus["phase"] == 1:
+                        bus["reg"] = bus["last_dat"] & 0xFF
+                        bus["phase"] = 2
+                    elif bus["phase"] == 2:
+                        self._camera_i2c_write(bus["slave"], bus["reg"], bus["last_dat"])
+                        bus["reg"] = (bus["reg"] + 1) & 0xFF
+                    bus["sta"] = (value & ~((1 << 10) | (1 << 15))) | (1 << 0) | (1 << 8) | (1 << 14)
+                    state.pending_irqs |= irq_bit
+                else:
+                    bus["sta"] = value & ~((1 << 0) | (1 << 15))
+
+    def _hw_i2c_read(self, bus_num, offset):
+        """Handle MMIO reads from I2C1 (0x00802300) or I2C2 (0x00802600)."""
+        bus = self.state.hw_i2c[bus_num]
+        if not bus["v2"]:
+            if offset == 0x00:
+                return bus["cfg"]
+            if offset == 0x04:
+                val = self._camera_i2c_read(bus["slave"], bus["reg"])
+                bus["reg"] = (bus["reg"] + 1) & 0xFF
+                return val & 0xFF
+            return 0
+        if offset == 0x00:
+            return bus["cfg"]
+        if offset == 0x04:
+            return bus["sta"]
+        if offset == 0x08:
+            val = self._camera_i2c_read(bus["slave"], bus["reg"])
+            bus["reg"] = (bus["reg"] + 1) & 0xFF
+            return val & 0xFF
+        return 0
+
+    def _build_camera_frame(self, frame_idx, target_len=1180):
+        """Synthesize a baseline JFIF JPEG frame and matching 64x48 RGB preview."""
+        w_prev, h_prev = 64, 48
+        rgb = bytearray(w_prev * h_prev * 3)
+        sun_x = 14 + (frame_idx * 3) % 36
+        sun_y = 12
+        bars = (
+            (235, 235, 235), (235, 220, 40), (40, 210, 220), (45, 205, 75),
+            (215, 55, 205), (225, 50, 50), (45, 75, 230), (35, 35, 45),
+        )
+        for y in range(h_prev):
+            for x in range(w_prev):
+                idx = (y * w_prev + x) * 3
+                if y >= 38:
+                    r, g, b = bars[(x * len(bars)) // w_prev]
+                else:
+                    dx = x - sun_x
+                    dy = y - sun_y
+                    if dx * dx + dy * dy <= 25:
+                        r, g, b = 255, 225, 70
+                    elif y < 24:
+                        r = 35 + (y * 3)
+                        g = 115 + (y * 4)
+                        b = 215 + (y * 1)
+                    else:
+                        hill = 24 + ((x * 5 + frame_idx * 2) % 7)
+                        if y < hill:
+                            r, g, b = 95, 175, 235
+                        else:
+                            r = 35 + ((x + y) % 25)
+                            g = 140 + ((y - 24) * 4)
+                            b = 55 + ((x * 2) % 30)
+                rgb[idx] = r & 0xFF
+                rgb[idx + 1] = g & 0xFF
+                rgb[idx + 2] = b & 0xFF
+
+        width = self.state.camera_width or 640
+        height = self.state.camera_height or 480
+        # Standard baseline JFIF header + quantization + SOF0 + Huffman tables.
+        # Byte offsets 0x2B..0x2E fall inside DQT table entries (all non-zero),
+        # satisfying Naxclow_MiniCam's non-zero header check at 0x59572.
+        q_val = max(4, 16 - (frame_idx % 8))
+        dqt = bytes([q_val] * 64)
+        header = (
+            b"\xff\xd8"
+            b"\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00\x48\x00\x48\x00\x00"
+            b"\xff\xdb\x00\x43\x00" + dqt +
+            b"\xff\xc0\x00\x0b\x08" + struct.pack(">HH", height, width) + b"\x01\x01\x11\x00"
+            b"\xff\xc4\x00\x1f\x00\x00\x01\x05\x01\x01\x01\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00"
+            b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b"
+            b"\xff\xc4\x00\x14\x10\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+        )
+        sos_and_scan = (
+            b"\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00"
+            + bytes([0x7F ^ ((frame_idx + i) & 0x3F) for i in range(64)])
+            + b"\xff\xd9"
+        )
+        meta = ("BekenSimulator %s %dx%d Frame #%04d "
+                % (self.state.camera_sensor or "GC0328C", width, height, frame_idx)).encode("ascii")
+        pad_needed = max(32, target_len - len(header) - len(sos_and_scan) - 4)
+        if len(meta) < pad_needed:
+            pattern = bytes([0x41 + ((frame_idx + i) % 26) for i in range(pad_needed - len(meta))])
+            com_payload = meta + pattern
+        else:
+            com_payload = meta[:pad_needed]
+        com_seg = b"\xff\xfe" + struct.pack(">H", len(com_payload) + 2) + com_payload
+        return header + com_seg + sos_and_scan, bytes(rgb)
+
+    def _tick_camera_ejpeg(self, state):
+        """Deliver periodic EJPEG DMA frames while the camera encoder is active."""
+        enc_en = bool((state.ejpeg_reg0 & 0x3)
+                      or (state.ejpeg_reg0 & ((1 << 4) | (1 << 31)))
+                      or (state.ejpeg_reg1 & (1 << 4)))
+        if not enc_en:
+            return
+        fiq_mask = (1 << 23) if self.is_bk7252n else ((1 << 23) | (1 << 29))
+        fiq_bits = state.icu_int_enable & fiq_mask
+        if not fiq_bits:
+            return
+        if state.ejpeg_dma_ch is None or state.ejpeg_dma_dst < 0x00400000:
+            return
+        if state.camera_last_i2c_insn and (state.insn_count - state.camera_last_i2c_insn) < 20_000:
+            return
+        state.ejpeg_tick_div += 1
+        if state.ejpeg_tick_div < 5:
+            return
+        state.ejpeg_tick_div = 0
+
+        node_len = max(512, state.ejpeg_dma_node_len or 1460)
+        target_len = min(1180, max(1050, node_len - 64))
+        jpeg_bytes, rgb_bytes = self._build_camera_frame(state.camera_frame_count, target_len)
+        state.camera_frame_count += 1
+        state.camera_last_jpeg = jpeg_bytes
+        state.camera_frame_rgb = rgb_bytes
+
+        if state.ejpeg_reg1 & (1 << 16):
+            dma_payload = jpeg_bytes + b"\x00" + struct.pack("<I", len(jpeg_bytes))
+        else:
+            dma_payload = jpeg_bytes
+        try:
+            self.mu.mem_write(state.ejpeg_dma_dst, dma_payload)
+        except UcError:
+            return
+        state.ejpeg_frame_len = len(jpeg_bytes)
+        state.gdma_remain[state.ejpeg_dma_ch] = max(0, node_len - len(dma_payload))
+        state.ejpeg_int_stat |= (1 << 1)
+        if state.ejpeg_reg0 & (1 << 2):
+            state.ejpeg_int_stat |= (1 << 0)
+        state.pending_irqs |= fiq_bits
+        if state.camera_frame_count == 1:
+            self.net_log(
+                "[CAMERA] %s streaming %dx%d JPEG (%d bytes/frame, DMA ch%d -> 0x%08x)"
+                % (state.camera_sensor or "GC0328C", state.camera_width,
+                   state.camera_height, len(jpeg_bytes), state.ejpeg_dma_ch,
+                   state.ejpeg_dma_dst))
 
     def trigger_irq(self):
         if self.state.icu_global_int_en == 0:
@@ -1133,6 +1885,9 @@ class BekenEmulator:
         # Slow tick: raise the periodic sources' pending.
         if state.insn_count - state.last_slow >= SLOW_TICK_INSNS:
             state.last_slow = state.insn_count
+            if self.meter_cf_pin is not None or self.meter_cf1_pin is not None:
+                self._tick_energy_meter_pulses(state)
+                self._sync_gpio_irq(state)
             # Report-only: emit the running instruction estimate a few times per
             # boot. Guarded by _emit_insns (off unless the harness asks) and
             # throttled, so this costs nothing on a normal run.
@@ -1143,7 +1898,8 @@ class BekenEmulator:
                 # close the prompt line so pending [EMU_GPIO]/[EMU_PERIPH]/
                 # [EMU_INSNS] lines can flush without splitting any other stream.
                 if (not state.uart_at_line_start
-                        and state.uart_line_tail.rstrip(b" ").endswith(b"msh />")
+                        and (state.uart_line_tail.rstrip(b" ").endswith(b"msh />")
+                             or b"WSL02810" in state.uart_line_tail)
                         and state.insn_count - state.last_uart_insn >= 500_000):
                     buf = sys.__stdout__.buffer
                     buf.write(b"\n")
@@ -1156,14 +1912,21 @@ class BekenEmulator:
                 # it is killed once the harness has what it needs - so whatever
                 # has not been emitted by then is simply lost. The harness
                 # filters these lines out of the displayed log.
-                if ((state.gpio_dirty or state.pwm_dirty or state.uart1_events)
+                if ((state.gpio_dirty or state.pwm_dirty or state.i2c_dirty
+                     or state.uart1_events)
                         and state.uart_at_line_start):
                     buf = sys.__stdout__.buffer
-                    periph_changed = bool(state.gpio_dirty or state.pwm_dirty)
+                    periph_changed = bool(state.gpio_dirty or state.pwm_dirty
+                                          or state.i2c_dirty)
                     for pin in sorted(state.gpio_dirty):
                         buf.write(b"[EMU_GPIO] %d %08x\n" % (pin, state.gpio_cfg[pin]))
                     for off in sorted(state.pwm_dirty):
                         buf.write(b"[EMU_PWM] %03x %08x\n" % (off, state.pwm_regs[off]))
+                    for scl, sda in sorted(state.i2c_dirty):
+                        raw = state.i2c_frames.get((scl, sda), b"")
+                        if raw:
+                            buf.write(b"[EMU_I2C] %d %d %s\n"
+                                      % (scl, sda, raw.hex().encode("ascii")))
                     # Delimit the writes from one slow tick. The test harness
                     # judges a state here, never midway through a multi-register
                     # update that only happens to match by combining old/new data.
@@ -1177,6 +1940,7 @@ class BekenEmulator:
                         buf.write(b"[EMU_UART1] %d %c %02x\n" % (_t, ord(_d), _b))
                     state.gpio_dirty.clear()
                     state.pwm_dirty.clear()
+                    state.i2c_dirty.clear()
                     state.uart1_events.clear()
                     buf.flush()
                 # Same line-boundary rule as the lines above, and for the same
@@ -1207,8 +1971,17 @@ class BekenEmulator:
             if state.icu_int_enable & (1 << 9) and not state.pwmn_seen:
                 pwm_ctl = state.pwm_regs.get(0, 0)
                 state.pwm_status |= self._old_pwm_timer_status_mask(pwm_ctl)
-            if state.icu_int_enable & (1 << 8): # BKTIMER (OpenBK)
-                state.timer3_5_ctl |= (1 << 7)
+            if state.icu_int_enable & (1 << 8): # BKTIMER (OpenBK + BK7252 camera Timer 5)
+                if self.is_bk7252 or self.is_bk7252n:
+                    state.timer3_5_ctl |= (((state.timer3_5_ctl & 0x7) or 0x1) << 7)
+                else:
+                    state.timer3_5_ctl |= (1 << 7) # Set Timer 3 Int Status
+            if ((self.is_bk7252 or self.is_bk7252n)
+                    and (state.icu_int_enable & (1 << 10))
+                    and (state.audio_fifo_conf & 0x3C)):
+                state.audio_dac_writes = 0
+                state.pending_irqs |= (1 << 10)
+            self._tick_camera_ejpeg(state)
             # Pulse the SARADC interrupt (ICU bit 11) while samples pend, paced
             # here - NOT re-raised every block - so it costs one interrupt per
             # tick period like the timer, never an IRQ storm. The generic
@@ -1298,7 +2071,9 @@ class BekenEmulator:
         uart1 = bool(state.icu_int_enable & (1 << 0)) and bool(
             (state.uart1_int_enable & 0x01)
             or (self._rx_active() and (state.uart1_int_enable & 0x42)))
-        uart2 = bool(state.uart2_int_enable & 0x01) and bool(state.icu_int_enable & (1 << 1))
+        uart2 = bool(state.icu_int_enable & (1 << 1)) and bool(
+            (state.uart2_int_enable & 0x01)
+            or (self._rx_active_uart2() and (state.uart2_int_enable & 0x42)))
         return uart1, uart2
 
     def _fast_tick_idle(self, state):
@@ -1339,6 +2114,11 @@ class BekenEmulator:
 
     def _gdma_channel(self, address):
         """Channel number if address is a GDMA CONF register, else None."""
+        if self.is_bk7252n:
+            if not (0x00809040 <= address < 0x00809240):
+                return None
+            channel, within = divmod(address - 0x00809040, 0x40)
+            return channel if within == 0 else None
         if not (self.GDMA_BASE <= address
                 < self.GDMA_BASE + self.GDMA_CHANNELS * self.GDMA_CH_STRIDE):
             return None
@@ -1362,7 +2142,9 @@ class BekenEmulator:
         run again until the copy is finished anyway.
         """
         length = ((conf >> self.GDMA_TRANS_LEN_POSI) & 0xFFFF) + 1
-        base = self.GDMA_BASE + channel * self.GDMA_CH_STRIDE
+        base = (0x00809040 + channel * 0x40
+                if self.is_bk7252n
+                else self.GDMA_BASE + channel * self.GDMA_CH_STRIDE)
         try:
             dst = struct.unpack("<I", mu.mem_read(base + 0x04, 4))[0]
             src = struct.unpack("<I", mu.mem_read(base + 0x08, 4))[0]
@@ -1381,6 +2163,21 @@ class BekenEmulator:
             except UcError as e:
                 self._print("[GDMA] ch%d copy 0x%08x -> 0x%08x (%d bytes) failed: %s"
                             % (channel, src, dst, length, e))
+        elif ((conf & self.GDMA_SRCADDR_INC) and not (conf & self.GDMA_DSTADDR_INC)
+              and dst == 0x0080270c and 24 <= length <= 8192):
+            # SPI_DAT (0x0080270c) fixed-destination DMA: used by WS2812 /
+            # SM16703P addressable RGB LED strip drivers (1 SPI byte per bit).
+            try:
+                self.state.ws2812_spi = bytes(mu.mem_read(src, length))
+            except UcError:
+                pass
+        elif (not (conf & self.GDMA_SRCADDR_INC) and (conf & self.GDMA_DSTADDR_INC)
+              and (src in (0x0080A014, 0x00A03014) or dst >= 0x00400000)):
+            # EJPEG RX FIFO (0x0080A014 / 0x00A03014) -> circular RAM/SDRAM destination buffer.
+            self.state.ejpeg_dma_ch = channel
+            self.state.ejpeg_dma_dst = dst
+            self.state.ejpeg_dma_node_len = length
+            self.state.gdma_remain[channel] = length
 
     def hook_mem_write_mmio(self, mu, access, address, size, value, user_data):
         # Bounds test inlined rather than calling _gdma_channel(): this hook
@@ -1395,6 +2192,70 @@ class BekenEmulator:
                 # transfer above already happened.
                 self.state.gdma_conf[channel] = value & ~self.GDMA_EN
                 return
+        if 0x00802300 <= address < 0x0080230C:
+            self._hw_i2c_write(1, address - 0x00802300, value)
+            return
+        if 0x00802600 <= address < 0x0080260C:
+            self._hw_i2c_write(2, address - 0x00802600, value)
+            return
+        if 0x0080A000 <= address < 0x0080A100:
+            off = address - 0x0080A000
+            if off == 0x00:
+                self.state.ejpeg_reg0 = value & 0xFFFFFFFF
+                x_code = (value >> 8) & 0x3
+                if x_code:
+                    self.state.camera_width = {1: 640, 2: 320, 3: 1280}.get(x_code, 640)
+            elif off == 0x04:
+                self.state.ejpeg_reg1 = value & 0xFFFFFFFF
+                x_pix = (value >> 8) & 0xFF
+                y_pix = (value >> 24) & 0xFF
+                if x_pix >= 20:
+                    self.state.camera_width = x_pix * 8
+                if y_pix >= 15:
+                    self.state.camera_height = y_pix * 8
+                elif y_pix in (1, 2, 3):
+                    self.state.camera_height = {1: 480, 2: 240, 3: 720}[y_pix]
+            elif off == 0x08:
+                self.state.ejpeg_reg2 = value & 0xFFFFFFFF
+            elif off == 0x0C:
+                self.state.ejpeg_reg3 = value & 0xFFFFFFFF
+            elif off == 0x18:
+                self.state.ejpeg_int_stat &= ~(value & 0xFFFFFFFF)
+                if not self.state.ejpeg_int_stat:
+                    self.state.pending_irqs &= ~((1 << 23) | (1 << 29))
+            try:
+                mu.mem_write(address, struct.pack("<I", value & 0xFFFFFFFF))
+            except Exception:
+                pass
+            return
+        if 0x00A03000 <= address < 0x00A05000:
+            if address < 0x00A03100:
+                off = address - 0x00A03000
+                if off == 0x08:
+                    self.state.ejpeg_reg0 = value & 0xFFFFFFFF
+                elif off == 0x18:
+                    self.state.ejpeg_int_stat &= ~(value & 0xFFFFFFFF)
+                    if not self.state.ejpeg_int_stat:
+                        self.state.pending_irqs &= ~((1 << 23) | (1 << 29))
+                elif off == 0x34:
+                    if value & 0x2:
+                        self.state.ejpeg_reg1 |= (1 << 16)
+                    else:
+                        self.state.ejpeg_reg1 &= ~(1 << 16)
+            elif 0x00A04000 <= address < 0x00A04100:
+                off = address - 0x00A04000
+                if off == 0x14:
+                    x_pix = value & 0xFF
+                    y_pix = (value >> 8) & 0xFF
+                    if x_pix >= 20:
+                        self.state.camera_width = x_pix * 8
+                    if y_pix >= 15:
+                        self.state.camera_height = y_pix * 8
+            try:
+                mu.mem_write(address, struct.pack("<I", value & 0xFFFFFFFF))
+            except Exception:
+                pass
+            return
         if self.wifimac is not None and _wifimac.CORE <= address < _wifimac.CORE + _wifimac.SIZE:
             self.wifimac.write(address, value, self.state.insn_count)
             self.state.pending_irqs = ((self.state.pending_irqs & ~_wifimac.LINE_MASK)
@@ -1451,6 +2312,7 @@ class BekenEmulator:
             _new = value & 0xFFFFFFFF
             self.state.gpio_hw.config_changed(_pin, _old, _new)
             self.state.gpio_cfg[_slot] = _new
+            self._i2c_pin_edge(self.state, _pin, _old, _new)
             if self._emit_insns:
                 self.state.gpio_dirty.add(_slot)
             self._sync_gpio_irq(self.state)
@@ -1505,6 +2367,14 @@ class BekenEmulator:
             if self._emit_insns:
                 self.state.pwm_dirty.add(_off)
 
+        if self.is_bk7252 or self.is_bk7252n:
+            if address == 0x00802B08:
+                self.state.audio_fifo_conf = value & 0xFFFFFFFF
+                if not (value & 0x3C):
+                    self.state.pending_irqs &= ~(1 << 10)
+            elif address == 0x00802B1C:
+                self.state.audio_dac_writes += 1
+
         if address == 0x00802A04:
             w1c_mask = value & 0x3F
             self.state.pwm_status = (self.state.pwm_status & ~0x3F) | (value & ~0x3F)
@@ -1525,37 +2395,49 @@ class BekenEmulator:
         # shown as tagged hex so the 55 AA protocol frames are readable instead
         # of printing as garbage characters mixed into the log.
         if address == self.UART1_FIFO_PORT:
+            b_val = value & 0xFF
+            self._note_uart_tx(1, b_val)
             if self._emit_insns:
-                self.state.uart1_events.append((self.state.insn_count, 'T', value & 0xFF))
+                self.state.uart1_events.append((self.state.insn_count, 'T', b_val))
             if self.tuyamcu is not None:
                 # Feed this transmitted byte to the simulated MCU; when it has a
                 # whole frame it answers, and the answer is queued for the guest
                 # to read back over UART1 RX (delivered by the RX interrupt path).
-                reply = self.tuyamcu.react_stream(bytes([value & 0xFF]))
+                reply = self.tuyamcu.react_stream(bytes([b_val]))
                 if reply:
                     with self._rx_lock:
                         self.uart1_rx += reply
+            elif self.state.uart1_tx_prev == 0x58 and b_val == 0xAA:
+                # BL0942 UART energy-meter read-all request (0x58 0xAA).
+                self.state.bl0942_polls += 1
+                self.uart1_rx_delay = 0
+                reply = self._bl0942_reply_packet()
+                with self._rx_lock:
+                    self.uart1_rx += reply
+            self.state.uart1_tx_prev = b_val
             if self.uart_sink is not None:
                 # A GUI shows each UART in its own pane and formats it there,
                 # so none of the stdout interleaving below applies.
-                self.uart_sink(1, value & 0xFF)
+                self.uart_sink(1, b_val)
                 return
             if self.uart1_hex:
                 if self._uart_src != 'u1':
                     self._uart_write(b'\n[UART1/MCU] ')
                     self._uart_src = 'u1'
-                self._uart_write(b'%02x ' % (value & 0xFF))
+                self._uart_write(b'%02x ' % b_val)
             else:
-                self._uart_write(bytes([value & 0xFF]))
+                self._uart_write(bytes([b_val]))
             return
         if address == self.UART2_FIFO_PORT:
+            b_val = value & 0xFF
+            self._note_uart_tx(2, b_val)
             if self.uart_sink is not None:
-                self.uart_sink(2, value & 0xFF)
+                self.uart_sink(2, b_val)
                 return
             if self.uart1_hex and self._uart_src == 'u1':
                 self._uart_write(b'\n')
                 self._uart_src = 'u2'
-            self._uart_write(bytes([value & 0xFF]))
+            self._uart_write(bytes([b_val]))
             return
             
         # REG_FLASH_CONF. CRC_EN (bit 26) selects whether flash reads go through
@@ -1659,6 +2541,42 @@ class BekenEmulator:
         if address == 0x00800074:
             self.state.efuse_ctrl = value & ~1
 
+        # SCTRL / AON Deep Sleep & Wakeup registers.
+        if address == 0x00800070:
+            self.state.sctrl_reset_retention = value & 0xFFFFFFFF
+        elif address == 0x0080011c:
+            # Bit 8 (0x100) is ROSC_TIMER_INT_STATUS_BIT (write-1-to-clear).
+            if value & 0x100:
+                self.state.sctrl_rosc_int_status = False
+            self.state.sctrl_rosc_timer = value & ~0x100
+        elif address == 0x00800140:
+            self.state.sctrl_rosc_timer_h = value & 0xFFFF
+        elif address == 0x00800120:
+            self.state.sctrl_gpio_wakeup_en = value & 0xFFFFFFFF
+        elif address == 0x00800124:
+            self.state.sctrl_gpio_wakeup_type = value & 0xFFFFFFFF
+        elif address == 0x00800128:
+            # Write-1-to-clear GPIO 0..31 wakeup status.
+            self.state.sctrl_gpio_wakeup_int_status &= ~(value & 0xFFFFFFFF)
+        elif address == 0x00800144:
+            self.state.sctrl_gpio_wakeup_en1 = value & 0xFFFFFFFF
+        elif address == 0x00800148:
+            self.state.sctrl_gpio_wakeup_type1 = value & 0xFFFFFFFF
+        elif address == 0x0080014c:
+            # Write-1-to-clear GPIO 32..39 wakeup status.
+            self.state.sctrl_gpio_wakeup_int_status1 &= ~(value & 0xFFFFFFFF)
+        elif address == 0x00808004:
+            # AON_PMU wakeup GPIO status (write-1-to-clear on BK7231N/BK7238).
+            self.state.aon_gpio_wakeup_status &= ~(value & 0xFFFFFFFF)
+        elif address == 0x00800104:
+            if (value & 0xFFFF) == 0xADC1:
+                try:
+                    mu.mem_write(address, struct.pack("<I", value & 0xFFFFFFFF))
+                except Exception:
+                    pass
+                self._enter_deep_sleep(value)
+                return
+
 
         try:
             mu.mem_write(address, struct.pack("<I" if size == 4 else "<H" if size == 2 else "B", value))
@@ -1676,6 +2594,37 @@ class BekenEmulator:
             if served is not None:
                 mu.mem_write(address, struct.pack("<I", served & 0xFFFFFFFF))
             return
+        if 0x00802300 <= address < 0x0080230C:
+            val = self._hw_i2c_read(1, address - 0x00802300)
+            mu.mem_write(address, struct.pack("<I", val & 0xFFFFFFFF))
+            return
+        if 0x00802600 <= address < 0x0080260C:
+            val = self._hw_i2c_read(2, address - 0x00802600)
+            mu.mem_write(address, struct.pack("<I", val & 0xFFFFFFFF))
+            return
+        if 0x0080A000 <= address < 0x0080A100:
+            off = address - 0x0080A000
+            if off == 0x00:
+                mu.mem_write(address, struct.pack("<I", self.state.ejpeg_reg0))
+            elif off == 0x04:
+                mu.mem_write(address, struct.pack("<I", self.state.ejpeg_reg1))
+            elif off == 0x08:
+                mu.mem_write(address, struct.pack("<I", self.state.ejpeg_reg2))
+            elif off == 0x0C:
+                mu.mem_write(address, struct.pack("<I", self.state.ejpeg_reg3))
+            elif off == 0x18:
+                mu.mem_write(address, struct.pack("<I", self.state.ejpeg_int_stat))
+            elif off == 0x1C:
+                mu.mem_write(address, struct.pack("<I", self.state.ejpeg_frame_len))
+            return
+        if 0x00A03000 <= address < 0x00A05000:
+            if address == 0x00A03008:
+                mu.mem_write(address, struct.pack("<I", self.state.ejpeg_reg0))
+            elif address == 0x00A03018:
+                mu.mem_write(address, struct.pack("<I", self.state.ejpeg_int_stat))
+            elif address == 0x00A0301C:
+                mu.mem_write(address, struct.pack("<I", max(0, self.state.ejpeg_frame_len - 1)))
+            return
         if address == self.TRNG_DATA and self.trng_state is not None:
             x = self.trng_state
             x ^= (x << 13) & 0xFFFFFFFF
@@ -1690,6 +2639,43 @@ class BekenEmulator:
             return
         if address == 0x00800004:
             mu.mem_write(address, struct.pack("<I", self.device_id_value))
+            return
+        if address == 0x00800070:
+            mu.mem_write(address, struct.pack("<I", self.state.sctrl_reset_retention))
+            return
+        if address == 0x0080011c:
+            val = ((self.state.sctrl_rosc_timer & ~0x100)
+                   | (0x100 if self.state.sctrl_rosc_int_status else 0))
+            mu.mem_write(address, struct.pack("<I", val & 0xFFFFFFFF))
+            return
+        if address == 0x00800140:
+            mu.mem_write(address, struct.pack("<I", self.state.sctrl_rosc_timer_h & 0xFFFF))
+            return
+        if address == 0x00800120:
+            mu.mem_write(address, struct.pack("<I", self.state.sctrl_gpio_wakeup_en))
+            return
+        if address == 0x00800124:
+            self.state.wake_reg_sampled = True
+            mu.mem_write(address, struct.pack("<I", self.state.sctrl_gpio_wakeup_type))
+            return
+        if address == 0x00800128:
+            self.state.wake_reg_sampled = True
+            mu.mem_write(address, struct.pack("<I", self.state.sctrl_gpio_wakeup_int_status))
+            return
+        if address == 0x00800144:
+            mu.mem_write(address, struct.pack("<I", self.state.sctrl_gpio_wakeup_en1))
+            return
+        if address == 0x00800148:
+            self.state.wake_reg_sampled = True
+            mu.mem_write(address, struct.pack("<I", self.state.sctrl_gpio_wakeup_type1))
+            return
+        if address == 0x0080014c:
+            self.state.wake_reg_sampled = True
+            mu.mem_write(address, struct.pack("<I", self.state.sctrl_gpio_wakeup_int_status1))
+            return
+        if address == 0x00808004:
+            self.state.wake_reg_sampled = True
+            mu.mem_write(address, struct.pack("<I", self.state.aon_gpio_wakeup_status))
             return
         # BK7252 SCTRL_USB_PLUG_WAKEUP (0x00800084): bit 21 (USB_PLUG_IN_STATUS)
         # reports USB 5V power present so battery-powered cameras (CYCAM/T99)
@@ -1713,6 +2699,18 @@ class BekenEmulator:
                 except Exception:
                     cfg = 0
             cfg = self.state.gpio_hw.read_config(_pin, cfg)
+            if (_pin == self.state.wake_pulse_pin
+                    and self.state.wake_reg_sampled
+                    and self.state.wake_pulse_reads_left > 0):
+                self.state.wake_pulse_reads_left -= 1
+                if self.state.wake_pulse_reads_left == 0:
+                    self.state.gpio_hw.inputs[_pin] = self.state.wake_pulse_restore
+                    self.state.wake_pulse_pin = None
+            if self.state.i2c_buses and (cfg & 0x08):
+                for (_scl, sda), bstate in self.state.i2c_buses.items():
+                    if _pin == sda and bstate[0] and bstate[2] == 8:
+                        cfg &= ~1
+                        break
             mu.mem_write(address, struct.pack("<I", cfg & 0xFFFFFFFF))
             return
         if address == self.GPIO_INTEN:
@@ -1772,6 +2770,10 @@ class BekenEmulator:
             return
         if address == 0x00802A0C:
             mu.mem_write(address, struct.pack("<I", self.state.timer0_2_ctl))
+            return
+        if address == 0x00802A10 or address == 0x00802A50:
+            cur = struct.unpack("<I", mu.mem_read(address, 4))[0]
+            mu.mem_write(address, struct.pack("<I", cur & ~0x1))
             return
         if address == 0x00802A4C:
             mu.mem_write(address, struct.pack("<I", self.state.timer3_5_ctl))
@@ -1926,6 +2928,20 @@ class BekenEmulator:
                 # wait-for-completion spin exits.
                 mu.mem_write(address, struct.pack("<I", self.state.gdma_conf[channel]))
                 return
+            if self.is_bk7252n and 0x00809040 <= address < 0x00809240:
+                ch, within = divmod(address - 0x00809040, 0x40)
+                if within == 0x30:
+                    mu.mem_write(address, struct.pack("<I", self.state.gdma_remain.get(ch, 0) & 0x1FFFF))
+                    return
+            elif 0x008090C0 <= address < 0x008090D8:
+                ch = (address - 0x008090C0) // 4
+                mu.mem_write(address, struct.pack("<I", self.state.gdma_remain.get(ch, 0) & 0x1FFFF))
+                return
+            elif address < self.GDMA_BASE + self.GDMA_CHANNELS * self.GDMA_CH_STRIDE:
+                ch, within = divmod(address - self.GDMA_BASE, self.GDMA_CH_STRIDE)
+                if within == 0x1C:
+                    mu.mem_write(address, struct.pack("<I", self.state.gdma_remain.get(ch, 0) & 0x1FFFF))
+                    return
 
         if address == self.ICU_INT_ENABLE:
             mu.mem_write(address, struct.pack("<I", self.state.icu_int_enable))
@@ -1952,6 +2968,11 @@ class BekenEmulator:
             mu.mem_write(address, struct.pack("<I", sta))
             return
 
+        if address == 0x00802214:
+            sta = ((1 << 1) | (1 << 6)) if self._rx_active_uart2() else 0
+            mu.mem_write(address, struct.pack("<I", sta))
+            return
+
         if address == self.UART1_FIFO_PORT and self._rx_active():
             # RX path: hand the firmware the next queued byte. (The write side of
             # this same address, TX, is in the write hook.) Only intercept the
@@ -1961,20 +2982,43 @@ class BekenEmulator:
             # as (reg >> 8) & 0xFF - so the byte is shifted up here. TX, in
             # contrast, is bits [7:0].
             b = self.uart1_rx.pop(0)
+            if (b == 0x0A and self.uart1_rx and self.tuyamcu is None
+                    and (self.state.rtt_boot_seen
+                         or ((self.is_bk7252 or self.is_bk7252n) and not self.state.obk_boot_seen))):
+                self.state.msh_prompt_seen = False
+                self.state.rx_next_line_insn = self.state.insn_count + 3_000_000
             if self._emit_insns:
                 self.state.uart1_events.append((self.state.insn_count, 'R', b & 0xFF))
+            mu.mem_write(address, struct.pack("<I", (b & 0xFF) << 8))
+            return
+
+        if address == self.UART2_FIFO_PORT and self._rx_active_uart2():
+            b = self.uart1_rx.pop(0)
+            if (b == 0x0A and self.uart1_rx and self.tuyamcu is None
+                    and (self.state.rtt_boot_seen
+                         or ((self.is_bk7252 or self.is_bk7252n) and not self.state.obk_boot_seen))):
+                self.state.msh_prompt_seen = False
+                self.state.rx_next_line_insn = self.state.insn_count + 3_000_000
             mu.mem_write(address, struct.pack("<I", (b & 0xFF) << 8))
             return
 
         if address == self.UART1_FIFO_STATUS or address == self.UART2_FIFO_STATUS:
             # TX bits: TX_FIFO_EMPTY (17), FIFO_WR_READY (20) - always ready.
             status = (1 << 17) | (1 << 20)
-            if address == self.UART1_FIFO_STATUS and self._rx_active():
+            if ((address == self.UART1_FIFO_STATUS and self._rx_active())
+                    or (address == self.UART2_FIFO_STATUS and self._rx_active_uart2())):
                 # RX pending: FIFO_RD_READY (21) set, RX_FIFO_EMPTY (19) clear.
                 status |= (1 << 21)
             else:
                 status |= (1 << 19)   # RX_FIFO_EMPTY: nothing to receive
             mu.mem_write(address, struct.pack("<I", status))
+            return
+
+        if (self.is_bk7252 or self.is_bk7252n) and address == 0x00802B38:
+            sta = ((1 << 18) | (1 << 19)) if (self.state.audio_fifo_conf & 0x3C) else 0
+            if self.state.audio_dac_writes >= 256:
+                sta |= 0x4000 | 0x8000
+            mu.mem_write(address, struct.pack("<I", sta))
             return
 
         if address == 0x00803008:
@@ -2086,6 +3130,8 @@ class BekenEmulator:
             self.mu.mem_map(self.XVR_BASE, 0x40000)  # 256K SDRAM (heap)
         else:
             self.mu.mem_map(self.XVR_BASE, 0x1000)
+        if self.is_bk7252n:
+            self.mu.mem_map(0x00A00000, 0x10000)
         # Accelerator block just past the main MMIO window (0x810000); mapped
         # and hooked so the 0x81001c transaction trigger can be served.
         self.mu.mem_map(self.ACCEL_BASE, 0x1000)
@@ -2097,6 +3143,9 @@ class BekenEmulator:
         if not self.is_bk7252:
             self.mu.hook_add(UC_HOOK_MEM_WRITE, self.hook_mem_write_mmio, begin=self.XVR_BASE, end=self.XVR_BASE + 0x1000)
             self.mu.hook_add(UC_HOOK_MEM_READ, self.hook_mem_read_mmio, begin=self.XVR_BASE, end=self.XVR_BASE + 0x1000)
+        if self.is_bk7252n:
+            self.mu.hook_add(UC_HOOK_MEM_WRITE, self.hook_mem_write_mmio, begin=0x00A00000, end=0x00A10000)
+            self.mu.hook_add(UC_HOOK_MEM_READ, self.hook_mem_read_mmio, begin=0x00A00000, end=0x00A10000)
         self.mu.hook_add(UC_HOOK_MEM_WRITE, self.hook_mem_write_mmio, begin=self.ACCEL_BASE, end=self.ACCEL_BASE + 0x1000)
         self.mu.hook_add(UC_HOOK_MEM_READ, self.hook_mem_read_mmio, begin=self.ACCEL_BASE, end=self.ACCEL_BASE + 0x1000)
         self.mu.hook_add(UC_HOOK_MEM_UNMAPPED, self.hook_unmapped)
@@ -2218,7 +3267,35 @@ class BekenEmulator:
         # the watchdog model simply resume with a reset-value, idle watchdog.
         for name, value in (("wdt_first_period", None), ("wdt_period_ms", 0),
                             ("wdt_clock_enabled", True), ("wdt_deadline", None),
-                            ("last_uart_insn", 0), ("uart_line_tail", b"")):
+                            ("last_uart_insn", 0), ("uart_line_tail", b""),
+                            ("i2c_last_pin", None), ("i2c_pair_counts", {}),
+                            ("i2c_buses", {}), ("i2c_frames", {}),
+                            ("i2c_last_on", {}), ("i2c_dirty", set()),
+                            ("ws2812_spi", b""), ("bl0942_polls", 0),
+                            ("uart1_tx_prev", -1),
+                            ("sctrl_rosc_timer", 0), ("sctrl_rosc_timer_h", 0),
+                            ("sctrl_rosc_int_status", False),
+                            ("sctrl_gpio_wakeup_en", 0), ("sctrl_gpio_wakeup_type", 0),
+                            ("sctrl_gpio_wakeup_int_status", 0),
+                            ("sctrl_gpio_wakeup_en1", 0), ("sctrl_gpio_wakeup_type1", 0),
+                            ("sctrl_gpio_wakeup_int_status1", 0),
+                            ("aon_gpio_wakeup_status", 0), ("sctrl_reset_retention", 0),
+                            ("in_deep_sleep", False), ("deep_sleep_count", 0),
+                            ("deep_sleep_info", None), ("last_wake_reason", None),
+                            ("wake_pulse_pin", None), ("wake_pulse_restore", None),
+                            ("wake_pulse_reads_left", 0), ("wake_reg_sampled", False),
+                            ("rtt_boot_seen", False), ("msh_prompt_seen", False),
+                            ("rx_next_line_insn", 0), ("hw_i2c", {}),
+                            ("camera_sensor", None), ("camera_sensor_probed", False),
+                            ("camera_sensor_regs", {}), ("camera_i2c_writes", 0),
+                            ("camera_last_i2c_insn", 0), ("ejpeg_reg0", 0),
+                            ("ejpeg_reg1", 0), ("ejpeg_reg2", 0), ("ejpeg_reg3", 0),
+                            ("ejpeg_int_stat", 0), ("ejpeg_frame_len", 0),
+                            ("ejpeg_dma_ch", None), ("ejpeg_dma_dst", 0),
+                            ("ejpeg_dma_node_len", 0), ("ejpeg_tick_div", 0),
+                            ("camera_frame_count", 0), ("camera_last_jpeg", b""),
+                            ("camera_frame_rgb", b""), ("camera_width", 640),
+                            ("camera_height", 480), ("gdma_remain", {})):
             if not hasattr(self.state, name):
                 setattr(self.state, name, value)
         if not hasattr(self.state, "gpio_hw"):
@@ -2346,7 +3423,7 @@ class BekenEmulator:
             epoch = self._exc_epoch
             armed = self._snapshot_path is not None
             pacing(state)
-            if self.stopping or self._watchdog_reset_pending:
+            if self.stopping or self._watchdog_reset_pending or state.in_deep_sleep:
                 break
             if self._exc_epoch != epoch:
                 # The pacing work took an IRQ or FIQ: PC is now the vector and
@@ -2437,7 +3514,7 @@ class BekenEmulator:
         # moves, or a pending timer tick would wait for the next one and the
         # two merge, losing the guest RTOS a tick.
         pacing(state)
-        if self.stopping or self._watchdog_reset_pending:
+        if self.stopping or self._watchdog_reset_pending or state.in_deep_sleep:
             return True
         if self._exc_epoch != epoch:
             return False
@@ -2459,7 +3536,7 @@ class BekenEmulator:
             left -= n
             self.idle_chunks_skipped += n
             pacing(state)
-            if self.stopping or self._watchdog_reset_pending:
+            if self.stopping or self._watchdog_reset_pending or state.in_deep_sleep:
                 return True
             if self._exc_epoch != epoch:
                 break
@@ -2503,8 +3580,12 @@ class BekenEmulator:
         vector_base = 0x00010000
         try:
             val = struct.unpack("<I", self.mu.mem_read(vector_base, 4))[0]
-            if val == 0xFFFFFFFF or val == 0x94b5072f:
-                vector_base = 0x00011000
+            if (val & 0xFE000000) != 0xEA000000 and (val & 0xFFFFF000) != 0xE59FF000:
+                val100 = struct.unpack("<I", self.mu.mem_read(0x00010100, 4))[0]
+                if (val100 & 0xFE000000) == 0xEA000000 or (val100 & 0xFFFFF000) == 0xE59FF000:
+                    vector_base = 0x00010100
+                elif val == 0xFFFFFFFF or val == 0x94b5072f:
+                    vector_base = 0x00011000
         except Exception:
             pass
         return vector_base
@@ -2531,7 +3612,15 @@ class BekenEmulator:
                     self.mu.emu_start(vector_base, 0xFFFFFFFF, count=1000000000)
                 else:
                     self._run_chunked(vector_base)
-                if not self._watchdog_reset_pending or self.stopping:
+                if self.stopping:
+                    break
+                if self.state.in_deep_sleep:
+                    if not self._wait_in_deep_sleep():
+                        break
+                    vector_base = self._cold_vector_base()
+                    self._print(f"Restarting emulation after deep sleep at 0x{vector_base:08x}...")
+                    continue
+                if not self._watchdog_reset_pending:
                     break
                 self._watchdog_reset()
                 if self.stopping:
@@ -2558,3 +3647,4 @@ class BekenEmulator:
         print(f"Time taken: {elapsed:.2f} seconds.")
 
         print("\nDone.")
+

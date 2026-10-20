@@ -307,11 +307,14 @@ def detect_bk7252_app_only(data: bytes):
     # by an ARM LDR-PC imm12 vector.  Do not CRC-scan a megabyte merely to
     # decide precedence.
     full_app, _ = decode_crc_prefix(data, 0x11000, max_blocks=130)
-    if _looks_like_linked_app_vectors(full_app):
+    if (_looks_like_linked_app_vectors(full_app)
+            or _looks_like_linked_app_vectors(full_app, 0x100, 0x10100)):
         return None
 
     app, encoded_size = decode_crc_prefix(data)
-    if len(app) < 0x10000 or not _looks_like_linked_app_vectors(app):
+    if len(app) < 0x10000 or not (
+            _looks_like_linked_app_vectors(app)
+            or _looks_like_linked_app_vectors(app, 0x100, 0x10100)):
         return None
     return app, encoded_size
 
@@ -370,8 +373,8 @@ def extract_and_decrypt(data: bytes, target_name: str = "bootloader", coefs=None
         payload, mapped_address = data[0:0x10000], 0x00000000
         vector_offsets = (0,)          # bootloader vectors at 0x0
     else:
-        payload, mapped_address = data[0x10000:0x110000], 0x00010000
-        vector_offsets = (0, 0x1000)   # app vectors at 0x10000 or 0x11000
+        payload, mapped_address = data[0x10000:0x200000], 0x00010000
+        vector_offsets = (0, 0x100, 0x1000)   # app vectors at 0x10000, 0x10100, or 0x11000
 
     if coefs is None:
         print(f"Warning: '{target_name}' RBL container not found. No key given, using raw slice without decryption.")
