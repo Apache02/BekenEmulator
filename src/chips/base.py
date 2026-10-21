@@ -52,8 +52,12 @@ class Chip:
     # v1: BK7231 die. v2: BK7252 (SOC_BK7221U), same CHNL_EN model but no state
     # register at 0x802c0c. v3: BK7238/BK7252N layout, served via 0x802c0c.
     saradc: str = "v1"
+    # Hardware timers at 0x802A00 / 0x802A40. v1: the fixed periodic tick every
+    # slow tick, whatever the firmware programs. v2: six timers counted in device
+    # time from their counter, clock divider and enable bits.
+    timer: str = "v1"
     # One-off quirks, plain flags until a second chip needs a variant name.
-    bktimer_v2: bool = False       # timer 3-5 interrupt status layout
+    bktimer_v2: bool = False       # timer 3-5 interrupt status layout (timer v1)
     rtthread_console: bool = False  # hold console input until RT-Thread's msh />
     usb_plug_wake: bool = False    # SCTRL_USB_PLUG_WAKEUP reports 5V present
 

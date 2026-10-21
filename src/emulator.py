@@ -137,6 +137,8 @@ class SimulatorState:
         self.pwm_status = 0
         self.timer0_2_ctl = 0
         self.timer3_5_ctl = 0
+        self.hw_timer_counter = [0] * 6    # counter[] of both banks (Chip.timer "v2")
+        self.hw_timer_due = [None] * 6     # insn_count of each running timer's next expiry
         self.efuse_ctrl = 0
         self.saradc_cfg = 0        # shadow of SARADC_ADC_CONFIG (0x802c00)
         self.saradc_pending = 0    # samples waiting in the emulated ADC FIFO
@@ -369,6 +371,13 @@ class BekenEmulator:
     WDT_FIRST_KEY = 0x5A
     WDT_SECOND_KEY = 0xA5
     WDT_INSNS_PER_MS = SLOW_TICK_INSNS // SLOW_TICK_MS
+    # Hardware timers (Chip.timer "v2", soc/timer.h): two banks of three, each
+    # counter[3] then a ctl word (enable [2:0], clk_divider [6:3], irq_status
+    # [9:7], write-1-to-clear). Bank 0 counts the 26 MHz crystal, bank 1 the
+    # 32 kHz low-power clock; the period is counter * (divider + 1) / clock.
+    TIMER_BANK_BASE = (0x00802A00, 0x00802A40)
+    TIMER_SOURCE_HZ = (26_000_000, 32_000)
+    TIMER_INSNS_PER_SEC = SLOW_TICK_INSNS * 1000 // SLOW_TICK_MS
 
     def __init__(self, raw_flash, bootloader, app, with_boot=False, only_uart=False, chip=None, uart1_hex=False, physical_flash=None, uart1_rx=b"", uart1_rx_delay=CONSOLE_RX_HOLDOFF_INSNS, tuyamcu_enabled=False, tuyamcu_pid=None, tuyamcu_raw=False, xvr_selfclear=False, tuyamcu_dps=None, tuyamcu_injects=None, uart_sink=None, ble_core=None, wifi=False, exception_vector_base=0, deep_sleep_wakes=None, gpio_inputs=None):
         self.raw_flash = raw_flash
@@ -1924,7 +1933,8 @@ class BekenEmulator:
             if state.icu_int_enable & (1 << 9) and not state.pwmn_seen:
                 pwm_ctl = state.pwm_regs.get(0, 0)
                 state.pwm_status |= self._old_pwm_timer_status_mask(pwm_ctl)
-            if state.icu_int_enable & (1 << 8): # BKTIMER (OpenBK + BK7252 camera Timer 5)
+            if state.icu_int_enable & (1 << 8) and self.chip.timer == "v1":
+                # BKTIMER (OpenBK + BK7252N camera Timer 5): a fixed tick whatever is programmed
                 if self.chip.bktimer_v2:
                     state.timer3_5_ctl |= (((state.timer3_5_ctl & 0x7) or 0x1) << 7)
                 else:
@@ -1972,6 +1982,8 @@ class BekenEmulator:
         else:
             state.pending_irqs &= ~(1 << 9)
 
+        if self.chip.timer == "v2":
+            self._tick_hw_timers(state)
         if (state.timer0_2_ctl & (0x7 << 7)) or (state.timer3_5_ctl & (0x7 << 7)):
             state.pending_irqs |= (1 << 8)
         else:
@@ -2028,6 +2040,52 @@ class BekenEmulator:
             (state.uart2_int_enable & 0x01)
             or (self._rx_active_uart2() and (state.uart2_int_enable & 0x42)))
         return uart1, uart2
+
+    def _timer_period(self, idx):
+        """Instructions between expiries of hardware timer idx (0-2 bank 0, 3-5 bank 1)."""
+        bank = idx // 3
+        ctl = self.state.timer3_5_ctl if bank else self.state.timer0_2_ctl
+        divider = ((ctl >> 3) & 0xF) + 1
+        return max(1, self.state.hw_timer_counter[idx] * divider
+                   * self.TIMER_INSNS_PER_SEC // self.TIMER_SOURCE_HZ[bank])
+
+    def _timer_enable_changed(self, bank, old_enable):
+        """A bank's ctl was written: start the timers just enabled, stop the ones cleared."""
+        if self.chip.timer != "v2":
+            return
+        state = self.state
+        enable = (state.timer3_5_ctl if bank else state.timer0_2_ctl) & 0x7
+        for n in range(3):
+            idx = 3 * bank + n
+            if enable & (1 << n):
+                if not old_enable & (1 << n):
+                    state.hw_timer_due[idx] = state.insn_count + self._timer_period(idx)
+            else:
+                state.hw_timer_due[idx] = None
+
+    def _tick_hw_timers(self, state):
+        """Raise the irq_status of every timer whose period has elapsed.
+
+        Runs at the pacing grain, so a period shorter than one chunk expires
+        once per chunk: the missed expiries merge into a single pending status,
+        as they would for a firmware that was not scheduled for a while.
+        """
+        now = state.insn_count
+        for idx, due in enumerate(state.hw_timer_due):
+            if due is None or now < due:
+                continue
+            status = 1 << (7 + idx % 3)
+            if idx < 3:
+                state.timer0_2_ctl |= status
+            else:
+                state.timer3_5_ctl |= status
+            period = self._timer_period(idx)
+            state.hw_timer_due[idx] = due + period if due + period > now else now + period
+
+    def _next_timer_due(self, state):
+        """insn_count of the soonest hardware timer expiry, or None."""
+        dues = [due for due in state.hw_timer_due if due is not None]
+        return min(dues) if dues else None
 
     def _fast_tick_idle(self, state):
         """True when the fast tick would do nothing at all: no transmission in
@@ -2334,14 +2392,23 @@ class BekenEmulator:
             self.state.pwm_status &= ~w1c_mask
             
         if address == 0x00802A0C:
+            old_enable = self.state.timer0_2_ctl & 0x7
             w1c_mask = value & (0x7 << 7)
             self.state.timer0_2_ctl = (value & ~(0x7 << 7)) | (self.state.timer0_2_ctl & (0x7 << 7))
             self.state.timer0_2_ctl &= ~w1c_mask
-            
+            self._timer_enable_changed(0, old_enable)
+
         if address == 0x00802A4C:
+            old_enable = self.state.timer3_5_ctl & 0x7
             w1c_mask = value & (0x7 << 7)
             self.state.timer3_5_ctl = (value & ~(0x7 << 7)) | (self.state.timer3_5_ctl & (0x7 << 7))
             self.state.timer3_5_ctl &= ~w1c_mask
+            self._timer_enable_changed(1, old_enable)
+
+        if self.chip.timer == "v2":
+            for bank, base in enumerate(self.TIMER_BANK_BASE):
+                if base <= address < base + 12:
+                    self.state.hw_timer_counter[3 * bank + (address - base) // 4] = value & 0xFFFFFFFF
 
         # UART output. UART2 is the firmware's debug/log port (text). UART1 is
         # the TuyaMCU link to the external device MCU; with --uart1-hex it is
@@ -3207,6 +3274,7 @@ class BekenEmulator:
         for name, value in (("wdt_first_period", None), ("wdt_period_ms", 0),
                             ("wdt_clock_enabled", True), ("wdt_deadline", None),
                             ("last_uart_insn", 0), ("uart_line_tail", b""),
+                            ("hw_timer_counter", [0] * 6), ("hw_timer_due", [None] * 6),
                             ("i2c_last_pin", None), ("i2c_pair_counts", {}),
                             ("i2c_buses", {}), ("i2c_frames", {}),
                             ("i2c_last_on", {}), ("i2c_dirty", set()),
@@ -3466,6 +3534,10 @@ class BekenEmulator:
             n = 1
             if self._fast_tick_idle(state):
                 target = state.last_slow + SLOW_TICK_INSNS
+                # A running hardware timer can expire before the next slow tick.
+                timer_due = self._next_timer_due(state)
+                if timer_due is not None:
+                    target = min(target, timer_due)
                 # Queued UART1 bytes held back by uart1_rx_delay become due
                 # at that point; land on it so the fast tick sees them then.
                 if self.uart1_rx and state.insn_count < self.uart1_rx_delay:

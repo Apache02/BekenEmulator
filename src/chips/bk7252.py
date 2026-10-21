@@ -16,7 +16,7 @@ CHIP = Chip(
     ejpeg="v1",
     audio="v1",
     saradc="v2",
-    bktimer_v2=True,
+    timer="v2",
     rtthread_console=True,
     usb_plug_wake=True,
 )
