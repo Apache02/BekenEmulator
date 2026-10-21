@@ -26,17 +26,20 @@ def block_crc_check(block: bytes, crc_bytes: bytes) -> bool:
     unpacked_crc = struct.unpack(">H", crc_bytes)[0] & 0xFFFF
     return calculated == unpacked_crc
 
-def strip_crcs(data: bytes) -> bytes:
+def detect_stripe_offset(data: bytes):
+    """Find where the 34-byte CRC stripe grid starts (0 or 2), or None if flat."""
     if len(data) < 36:
-        return data
-    offset = 0
+        return None
     if block_crc_check(data[:32], data[32:34]):
-        offset = 0
-    elif block_crc_check(data[2:34], data[34:36]):
-        offset = 2
-    else:
+        return 0
+    if block_crc_check(data[2:34], data[34:36]):
+        return 2
+    return None
+
+def strip_crcs(data: bytes) -> bytes:
+    offset = detect_stripe_offset(data)
+    if offset is None:
         return data
-        
     out = bytearray()
     for i in range(offset, len(data), 34):
         out.extend(data[i:i+32])

@@ -289,6 +289,7 @@ class SimulatorUI:
         # otherwise replace every Treeview row while the button is held).
         self._gpio_pressed = {}
         self._gpio_selected = None
+        self._adc_overrides = {}
         # The image selector describes the *next* run and may change while the
         # current firmware is still executing.  Keep the running image's
         # decoded wiring separate so a Browse cannot silently invert a held
@@ -478,6 +479,33 @@ class SimulatorUI:
         ttk.Label(peri, textvariable=self.var_pwm, anchor="w",
                   wraplength=300, justify="left").pack(side="bottom", fill="x", pady=(4, 0),
                                                        before=pf)
+
+        # SARADC analog input channels (ch0..ch7 / P20..P26, battery / temp / light).
+        self.adc_frame = ttk.Frame(peri)
+        self.adc_frame.pack(side="bottom", fill="x", pady=(4, 0), before=pf)
+        self.var_adc = tk.StringVar(
+            value="ADC: idle (default %d / %.2fV)"
+            % (periph.DEFAULT_ADC_RAW, periph.DEFAULT_ADC_RAW * 3.3 / 1023.0))
+        ttk.Label(self.adc_frame, textvariable=self.var_adc, anchor="w",
+                  wraplength=300, justify="left").pack(side="top", fill="x")
+        adc_inputs_row = ttk.Frame(self.adc_frame)
+        adc_inputs_row.pack(side="top", fill="x", pady=(2, 0))
+        ttk.Label(adc_inputs_row, text="Ch:").pack(side="left", padx=(0, 2))
+        self.var_adc_ch = tk.StringVar(value="3")
+        self.cmb_adc_ch = ttk.Combobox(
+            adc_inputs_row, textvariable=self.var_adc_ch,
+            values=("0 (VBAT)", "1 (P4)", "2 (P5)", "3 (P23)", "4 (P2)", "5 (P3)",
+                    "6 (P12)", "7 (P13)", "P26", "P24", "P20"),
+            width=9)
+        self.cmb_adc_ch.pack(side="left", padx=(0, 6))
+        ttk.Label(adc_inputs_row, text="Val:").pack(side="left", padx=(0, 2))
+        self.var_adc_val = tk.StringVar(value=str(periph.DEFAULT_ADC_RAW))
+        adc_ent = ttk.Entry(adc_inputs_row, textvariable=self.var_adc_val, width=8)
+        adc_ent.pack(side="left", padx=(0, 6))
+        adc_ent.bind("<Return>", lambda _e: self._apply_adc_input())
+        self.btn_adc_apply = ttk.Button(adc_inputs_row, text="Set ADC", width=9,
+                                        command=self._apply_adc_input)
+        self.btn_adc_apply.pack(side="right")
 
         # Energy Meter (BL0942 UART1 / BL0937 Pulse) simulated inputs.
         self.meter_frame = ttk.Frame(peri)
@@ -1523,6 +1551,11 @@ class SimulatorUI:
         # presenting a guess as decoded hardware metadata.
         return 0, "no pull; defaulting the simulated press to LOW"
 
+    def _emu_chip_name(self):
+        """Name of the running emulator's chip, or None when nothing is running."""
+        chip = getattr(self.emu, "chip", None)
+        return chip.name if chip is not None else None
+
     def _emu_gpio_pins(self):
         """GPIO pin count of the running emulator's chip (base bank if unknown)."""
         chip = getattr(self.emu, "chip", None)
@@ -1532,9 +1565,7 @@ class SimulatorUI:
         """Return one logical pin's live config, including BK7252's upper bank."""
         if self.emu is None:
             return None
-        slot = pin
-        if pin >= periph.PIN_COUNT and self._emu_gpio_pins() > periph.PIN_COUNT:
-            slot = periph.BK7252_EXT_SLOT + pin - periph.PIN_COUNT
+        slot = periph.gpio_slot(pin, self._emu_gpio_pins())
         return getattr(self.emu.state, "gpio_cfg", {}).get(slot)
 
     def _selected_gpio(self):
@@ -1777,6 +1808,37 @@ class SimulatorUI:
             self._refresh_static_periph()
         self.var_state.set("Energy meter set to %.1f V, %.2f A, %.1f W" % (v, a, w))
 
+    def _apply_adc_input(self):
+        """Parse and apply the UI's SARADC channel + sample value."""
+        ch_tok = self.var_adc_ch.get().strip().split()[0] if self.var_adc_ch.get().strip() else "0"
+        val_tok = self.var_adc_val.get().strip()
+        chip = self._emu_chip_name() or self.var_chip.get()
+        try:
+            ch, raw = periph.parse_adc_spec("%s:%s" % (ch_tok, val_tok), chip=chip)
+        except ValueError as exc:
+            self.var_state.set("Invalid ADC input: %s" % exc)
+            return
+        self._adc_overrides[ch] = raw
+        if self.emu is not None and hasattr(self.emu, "set_adc_input"):
+            self.emu.set_adc_input(ch, raw)
+        self._periph_key = None
+        if self.emu is not None:
+            self._refresh_periph()
+        else:
+            self._refresh_static_periph()
+        volts = raw * 3.3 / 1023.0
+        self.var_state.set("ADC %s set to %d (0x%03X, %.2fV)"
+                           % (periph.adc_channel_label(ch, chip), raw, raw, volts))
+
+    def _update_adc_widget(self, adc_info=None):
+        """Update the SARADC summary line from decoded or static state."""
+        if adc_info and adc_info.get("summary"):
+            self.var_adc.set(adc_info["summary"])
+            return
+        chip = self._emu_chip_name() or self.var_chip.get()
+        info = periph.describe_adc(adc_inputs=self._adc_overrides, chip=chip)
+        self.var_adc.set(info["summary"])
+
     def _draw_led_swatch(self, led_info):
         """Render the current bulb/strip color(s) on ``self.led_swatch``."""
         self.led_swatch.delete("all")
@@ -1860,11 +1922,13 @@ class SimulatorUI:
                 "Meter: BL0942 UART1 ready (%.0fV %.2fA %.0fW)" % (v, a, w))
 
     def _refresh_static_periph(self):
-        """Show Tuya-configured LED driver / Energy Meter before a run starts."""
+        """Show Tuya-configured LED driver / Energy Meter / ADC before a run starts."""
         meter_vals = self._parsed_meter_values()
         info = periph.describe_peripherals(
-            tuya_config=self.tuya_config, meter_values=meter_vals)
+            tuya_config=self.tuya_config, meter_values=meter_vals,
+            adc_inputs=self._adc_overrides, chip=self.var_chip.get())
         self._update_periph_widgets(info.get("led"), info.get("meter"), meter_vals)
+        self._update_adc_widget(info.get("adc"))
         self._update_camera_widget()
         self._update_sleep_controls()
 
@@ -1892,6 +1956,12 @@ class SimulatorUI:
             cam_sensor = getattr(self.emu.state, "camera_sensor", None)
             cam_i2c = int(getattr(self.emu.state, "camera_i2c_writes", 0))
             cam_frames = int(getattr(self.emu.state, "camera_frame_count", 0))
+            saradc_ch = getattr(self.emu.state, "saradc_channel", None)
+            saradc_raw = getattr(self.emu.state, "saradc_last_raw", None)
+            saradc_convs = int(getattr(self.emu.state, "saradc_conversions", 0))
+            saradc_reads = int(getattr(self.emu.state, "saradc_reads", 0))
+            adc_samples = dict(getattr(self.emu.state, "adc_samples", {}))
+            adc_inputs = dict(getattr(self.emu, "adc_inputs", self._adc_overrides))
         except RuntimeError:
             # The emulation thread was mid-write into the dict. Registers are
             # written tens of times per boot, so simply catching the next tick
@@ -1908,7 +1978,9 @@ class SimulatorUI:
                meter_vals, self.var_all_pins.get(),
                tuple(sorted(self._gpio_pressed.items())),
                in_sleep, sleep_count, tuple(sorted(wake_pins.items())),
-               cam_sensor, cam_i2c, cam_frames)
+               cam_sensor, cam_i2c, cam_frames,
+               saradc_ch, saradc_raw, saradc_convs, saradc_reads,
+               tuple(sorted(adc_samples.items())), tuple(sorted(adc_inputs.items())))
         if key == self._periph_key:
             self._update_gpio_control()
             self._update_sleep_controls()
@@ -1925,20 +1997,27 @@ class SimulatorUI:
         if self._emu_gpio_pins() > periph.PIN_COUNT:
             chip = self.emu.chip.name
         else:
-            chip = periph.chip_from_name(image)
+            chip = periph.chip_from_name(image) or self._emu_chip_name() or ""
         data = periph.decode_state(
             gpio, pwm, chip,
             i2c_frames=i2c_frames, i2c_last_on=i2c_last_on,
             ws2812_spi=ws2812_spi, tuya_config=tuya_cfg,
-            bl0942_polls=bl0942_polls, meter_values=meter_vals)
+            bl0942_polls=bl0942_polls, meter_values=meter_vals,
+            saradc_channel=saradc_ch, saradc_last_raw=saradc_raw,
+            saradc_conversions=saradc_convs, saradc_reads=saradc_reads,
+            adc_samples=adc_samples, adc_inputs=adc_inputs)
         selected = self._gpio_selected
         self.tree.delete(*self.tree.get_children())
         if not data and not (in_sleep and wake_pins):
             self.var_pwm.set("firmware has not touched GPIO or PWM yet")
             static_info = periph.describe_peripherals(
-                tuya_config=tuya_cfg, meter_values=meter_vals)
+                tuya_config=tuya_cfg, meter_values=meter_vals,
+                saradc_channel=saradc_ch, saradc_last_raw=saradc_raw,
+                saradc_conversions=saradc_convs, saradc_reads=saradc_reads,
+                adc_samples=adc_samples, adc_inputs=adc_inputs, chip=chip)
             self._update_periph_widgets(static_info.get("led"),
                                         static_info.get("meter"), meter_vals)
+            self._update_adc_widget(static_info.get("adc"))
             self._update_camera_widget()
             self._update_gpio_control()
             self._update_sleep_controls()
@@ -1990,6 +2069,7 @@ class SimulatorUI:
                              % ((data or {}).get("pwm_pins") or "-"))
         self._update_periph_widgets((data or {}).get("led"),
                                     (data or {}).get("meter"), meter_vals)
+        self._update_adc_widget((data or {}).get("adc"))
         self._update_camera_widget()
         self._update_gpio_control()
         self._update_sleep_controls()
@@ -2133,6 +2213,7 @@ class SimulatorUI:
             "sel_pin": m_info.get("sel_pin"),
             "sel_lv": m_info.get("sel_lv", 1),
         }
+        cfg["adc_inputs"] = dict(self._adc_overrides)
         # Snapshot private cloud credentials only for the offline TLS peer.
         # A real-cloud run is a transparent TCP relay and neither needs nor
         # should retain a second copy of the dump's secret in the host stack.
@@ -2141,13 +2222,9 @@ class SimulatorUI:
         # The byte-exact packet viewer is intentionally different: if firmware
         # sends credential material in clear, its warning explains that the raw
         # frame and any exported PCAP preserve those bytes.
-        if cfg.get("net_out"):
-            cfg["tls_psks"] = ()
-            cfg["tuya_legacy_identity_psk"] = False
-        else:
-            cfg["tls_psks"] = tuya_config.tls_psk_candidates(self._run_tuya_config)
-            cfg["tuya_legacy_identity_psk"] = (
-                tuya_config.uses_tuya_legacy_identity_psk(self._run_tuya_config))
+        cfg["tls_psks"], cfg["tuya_legacy_identity_psk"] = (
+            tuya_config.offline_tls_config(
+                self._run_tuya_config, net_out=cfg.get("net_out")))
         self._active_forward_url = ("http://127.0.0.1:%d/" % cfg["forwards"][0][0]
                                     if cfg.get("forwards") else None)
         # Loading and setup happen on the worker. The button is enabled from
@@ -2204,6 +2281,7 @@ class SimulatorUI:
                 ble_core=True if cfg["blecore"] else None,
                 wifi=cfg["wifi"],
                 uart_sink=self._sink,
+                adc_inputs=cfg.get("adc_inputs"),
                 # Writing app_decrypted.bin into the working directory is a
                 # command-line convenience, not something a GUI should do.
                 save_decrypted=False,
@@ -3592,11 +3670,32 @@ def _run_selftests():
         check("Camera: GC0328C 640x480 — 12 frames (1180 B JPEG, 374 I2C reg)" == ui.var_camera.get()
               and len(ui.cam_canvas.find_all()) >= 1,
               "Camera widget displays GC0328C sensor resolution, JPEG frame count, and live preview")
+
+        # SARADC analog input controls & live status:
+        adc_pushed = []
+        ui.emu.chip = SimpleNamespace(name="BK7231T", gpio_pins=32)
+        ui.emu.set_adc_input = lambda ch, val: adc_pushed.append((ch, val))
+        ui.var_adc_ch.set("3 (P23)")
+        ui.var_adc_val.set("512")
+        ui._apply_adc_input()
+        check(adc_pushed == [(3, 512)] and ui._adc_overrides.get(3) == 512
+              and "ADC ch3(P23) set to 512" in ui.var_state.get(),
+              "Set ADC parses channel and sample value and pushes to the running emulator")
+        ui.emu.state.saradc_channel = 3
+        ui.emu.state.saradc_last_raw = 512
+        ui.emu.state.saradc_conversions = 4
+        ui.emu.state.saradc_reads = 4
+        ui.emu.state.adc_samples = {3: 512}
+        ui._periph_key = None
+        ui._refresh_periph()
+        check("ch3(P23)=512" in ui.var_adc.get() and "4 conv" in ui.var_adc.get(),
+              "ADC widget shows live SARADC channel, raw sample, voltage and conversion count")
     finally:
         ui.emu = None
         ui.thread = None
         ui.tuya_config = None
         ui._run_tuya_config = None
+        ui._adc_overrides.clear()
 
     root.destroy()
     print("\nAll %d simulator UI self-tests passed." % n)

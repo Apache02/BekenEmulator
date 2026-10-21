@@ -25,7 +25,7 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.crypto import block_crc_check, crc16
+from src.crypto import block_crc_check, crc16, detect_stripe_offset
 
 # BK_PARTITION_NET_PARAM start, as a PHYSICAL offset into the dump - which is
 # what the firmware asks the flash controller for. Confirmed against a real
@@ -127,16 +127,6 @@ def build_config(startup_command, flags=(), ssid=None, password=None, mqtt_host=
     cfg[3] = tiny_crc8_signed(cfg[4:CONFIG_SIZE])
     return bytes(cfg)
 
-
-def detect_stripe_offset(raw):
-    """Find where the 34-byte CRC stripe grid starts (0 or 2), or None if flat."""
-    if len(raw) < 36:
-        return None
-    if block_crc_check(raw[:32], raw[32:34]):
-        return 0
-    if block_crc_check(raw[2:34], raw[34:36]):
-        return 2
-    return None
 
 
 def extend_striped(raw, offset, needed_stripped):

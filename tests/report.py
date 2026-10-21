@@ -148,7 +148,7 @@ def _gpio_html(r):
             ctl_note = ('<p class="cfg-note">PWM_CTL = 0x%X enables %s, %s.</p>'
                         % (per.get("pwm_ctl") or 0,
                            ", ".join("PWM%d" % c for c in ctl_on), agree))
-        canon = {0: 6, 1: 7, 2: 8, 3: 9, 4: 24, 5: 26}
+        canon = periph.PWM_CHANNEL_PINS
         chans = "".join(
             '<tr><td><code>PWM%d</code></td><td>%s</td>'
             '<td>%s</td><td>%s</td><td><code>0x%X</code></td></tr>'

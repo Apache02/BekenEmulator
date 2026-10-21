@@ -115,6 +115,18 @@ TEST_CASES = [
         ]
     },
     {
+        # Guards parse_adc_specs(): a malformed --adc spec must be refused up
+        # front with the expected CH:VALUE shape before emulation starts.
+        "name": "CLI: malformed --adc is rejected",
+        "binary": os.path.join(ROOT_DIR, "firmwares", "OpenBK7231T_QIO_1.18.300.bin"),
+        "args": ["--only-uart", "-key", "TUYA", "--adc", "P26"],
+        "timeout": 60,
+        "expected_strings": [
+            "bad --adc 'P26'",
+            "want CH:VALUE",
+        ]
+    },
+    {
         # The Wi-Fi path end to end, IP traffic into the firmware's own stack.
         # --wifi-peer auto models the MAC (src/wifimac.py) and puts a virtual
         # station (src/wifipeer.py) plus a user-mode IP network
@@ -478,6 +490,26 @@ TEST_CASES = [
             "Info:CMD:BacklogOne",
             # ...and the second, from the same injected UART1 line.
             "Info:CMD:BacklogTwo",
+        ]
+    },
+    {
+        # End-to-end SARADC input test: --adc P23:2150 configures SARADC channel
+        # 3 (P23 on BK7231T) to return raw sample 2150. Over the UART1 command
+        # console, we bind P23 to channel 8 and set its role to ADC; on the next
+        # per-second tick PIN_OnEverySecond() calls HAL_ADC_Read(23), which
+        # triggers a SARADC conversion on channel 3, drains the emulated FIFO
+        # via saradc_isr, and publishes 2150 to channel 8.
+        "name": "UART1 Command Console: SetPinRole P23 ADC reads --adc P23:2150 into channel 8",
+        "binary": os.path.join(ROOT_DIR, "firmwares",
+                               "OpenBK7231T_QIO_1.18.300_mathDemo_obkStartupCommand_uartConsole.bin"),
+        "args": ["--only-uart", "-key", "TUYA", "--adc", "P23:2150", "--uart1-rx",
+                 "backlog SetPinChannel 23 8; SetPinRole 23 ADC"],
+        "timeout": 300,
+        "tags": ["SARADC"],
+        "expected_strings": [
+            "CFG_InitAndLoad: Correct config has been loaded",
+            "Info:CMD:StartupBeforeConsole",
+            "Info:MQTT:Channel has changed! Publishing 2150 to channel 8",
         ]
     },
     {
@@ -5322,6 +5354,13 @@ DESCRIPTIONS = {
     "CLI: encrypted image without a key warns":
         "Running an encrypted image with no key must warn that the decrypted slice does not look "
         "like ARM code and suggest -key TUYA, instead of silently emulating garbage.",
+    "CLI: malformed --adc is rejected":
+        "A malformed --adc specification must be rejected up front by parse_adc_specs() with the "
+        "expected CH:VALUE syntax, rather than starting emulation with unparsed ADC overrides.",
+    "UART1 Command Console: SetPinRole P23 ADC reads --adc P23:2150 into channel 8":
+        "End-to-end SARADC input test on BK7231T: --adc P23:2150 sets SARADC channel 3 (P23) to "
+        "raw sample 2150, and 'backlog SetPinChannel 23 8; SetPinRole 23 ADC' over the UART1 "
+        "console makes PIN_OnEverySecond() read HAL_ADC_Read(23) and publish 2150 to channel 8.",
     "OpenBK7231T_QIO_1.18.300 Boot to MQTT and 1s timers":
         "Full OpenBeken boot on the flagship BK7231T image, then ten Main_OnEverySecond ticks - "
         "proving the timer keeps firing, not just starts. Also proves the tick interrupt, the "
@@ -6015,6 +6054,26 @@ PCAP_FRAME_KINDS = {
 }
 
 
+def _read_pcap_frames(path, expected_link):
+    """Read raw frame payloads from a little-endian pcap 2.4 file."""
+    import struct
+    with open(path, "rb") as f:
+        raw = f.read()
+    if len(raw) < 24:
+        raise ValueError("%d bytes, no pcap header" % len(raw))
+    magic, vmaj, vmin, _, _, _, link = struct.unpack("<IHHiIII", raw[:24])
+    if magic != 0xA1B2C3D4 or (vmaj, vmin) != (2, 4) or link != expected_link:
+        raise ValueError("header magic 0x%08X v%d.%d link type %d" % (magic, vmaj, vmin, link))
+    frames, off = [], 24
+    while off + 16 <= len(raw):
+        incl = struct.unpack("<I", raw[off + 8:off + 12])[0]
+        if off + 16 + incl > len(raw):
+            break
+        frames.append(raw[off + 16:off + 16 + incl])
+        off += 16 + incl
+    return frames
+
+
 def _pcap_frames(path):
     """The 802.11 frames in a capture written by --pcap.
 
@@ -6022,42 +6081,12 @@ def _pcap_frames(path):
     105. A record cut short at the end - the emulator is killed mid-run - is
     ignored rather than failing the file.
     """
-    import struct
-    with open(path, "rb") as f:
-        raw = f.read()
-    if len(raw) < 24:
-        raise ValueError("%d bytes, no pcap header" % len(raw))
-    magic, vmaj, vmin, _, _, _, link = struct.unpack("<IHHiIII", raw[:24])
-    if magic != 0xA1B2C3D4 or (vmaj, vmin) != (2, 4) or link != 105:
-        raise ValueError("header magic 0x%08X v%d.%d link type %d" % (magic, vmaj, vmin, link))
-    frames, off = [], 24
-    while off + 16 <= len(raw):
-        incl = struct.unpack("<I", raw[off + 8:off + 12])[0]
-        if off + 16 + incl > len(raw):
-            break
-        frames.append(raw[off + 16:off + 16 + incl])
-        off += 16 + incl
-    return frames
+    return _read_pcap_frames(path, 105)
 
 
 def _ip_pcap_frames(path):
     """The Ethernet frames in a capture written by --pcap-ip (link type 1)."""
-    import struct
-    with open(path, "rb") as f:
-        raw = f.read()
-    if len(raw) < 24:
-        raise ValueError("%d bytes, no pcap header" % len(raw))
-    magic, vmaj, vmin, _, _, _, link = struct.unpack("<IHHiIII", raw[:24])
-    if magic != 0xA1B2C3D4 or (vmaj, vmin) != (2, 4) or link != 1:
-        raise ValueError("header magic 0x%08X v%d.%d link type %d" % (magic, vmaj, vmin, link))
-    frames, off = [], 24
-    while off + 16 <= len(raw):
-        incl = struct.unpack("<I", raw[off + 8:off + 12])[0]
-        if off + 16 + incl > len(raw):
-            break
-        frames.append(raw[off + 16:off + 16 + incl])
-        off += 16 + incl
-    return frames
+    return _read_pcap_frames(path, 1)
 
 
 def _check_ip_pcap(path, expect, checks):
@@ -6673,7 +6702,7 @@ def main():
     if jobs > 1 and len(selected) > 1:
         from concurrent.futures import ThreadPoolExecutor
         indexed = sorted(enumerate(selected),
-                         key=lambda it: (-int(bool(it[1].get("snapshot_roundtrip"))),
+                         key=lambda it: (-int(it[1].get("kind") == "snapshot_roundtrip"),
                                          -it[1].get("timeout", 60),
                                          it[0]))
         with ThreadPoolExecutor(max_workers=jobs) as pool:

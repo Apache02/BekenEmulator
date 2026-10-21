@@ -235,6 +235,16 @@ TLS_MAX_CIPHERTEXT = TLS_MAX_PLAINTEXT + 2048
 TLS_MAX_FRAGMENT_LENGTHS = {1: 512, 2: 1024, 3: 2048, 4: 4096}
 
 
+def _get_aes():
+    """Return the pycryptodome AES module under either Crypto or Cryptodome."""
+    try:
+        from Crypto.Cipher import AES
+        return AES
+    except ImportError:
+        from Cryptodome.Cipher import AES
+        return AES
+
+
 class TLSProtocolError(ValueError):
     """A malformed, unexpected, or unauthenticated TLS record.
 
@@ -316,7 +326,7 @@ class TLS12PSKGCMServer:
         ciphertext, tag = sealed[:-16], sealed[-16:]
         aad = struct.pack("!Q", seq) + bytes([content_type]) + version + struct.pack("!H", len(ciphertext))
         try:
-            from Crypto.Cipher import AES
+            AES = _get_aes()
             cipher = AES.new(key, AES.MODE_GCM, nonce=implicit_iv + explicit, mac_len=16)
             cipher.update(aad)
             return cipher.decrypt_and_verify(ciphertext, tag)
@@ -334,7 +344,7 @@ class TLS12PSKGCMServer:
         explicit = seq_bytes
         aad = seq_bytes + bytes([content_type]) + version + struct.pack("!H", len(plaintext))
         try:
-            from Crypto.Cipher import AES
+            AES = _get_aes()
             cipher = AES.new(key, AES.MODE_GCM, nonce=implicit_iv + explicit, mac_len=16)
             cipher.update(aad)
             ciphertext, tag = cipher.encrypt_and_digest(bytes(plaintext))
@@ -581,7 +591,7 @@ def tuya_lan_decode(data):
     if len(body) < 16 or len(body) % 16:
         return None
     try:
-        from Crypto.Cipher import AES
+        AES = _get_aes()
     except ImportError:
         return None
     try:
@@ -3087,7 +3097,7 @@ def _run_selftests():
     check(TUYA_BROADCAST_KEY.hex() == "6c1ec8e2bb9bb59ab50b0daf649b410a",
           "the shared broadcast key is the md5 every Tuya device uses")
     try:
-        from Crypto.Cipher import AES
+        AES = _get_aes()
         raw = real.encode()
         pad = 16 - len(raw) % 16
         enc = AES.new(TUYA_BROADCAST_KEY, AES.MODE_ECB).encrypt(raw + bytes([pad]) * pad)
