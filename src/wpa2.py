@@ -117,7 +117,10 @@ def key_mic(kck, frame):
 
 
 def _aes_ecb(key):
-    from Crypto.Cipher import AES
+    try:
+        from Crypto.Cipher import AES
+    except ImportError:
+        from Cryptodome.Cipher import AES
     return AES.new(key, AES.MODE_ECB)
 
 

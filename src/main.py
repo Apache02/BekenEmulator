@@ -9,6 +9,7 @@ from src.crypto import (extract_and_decrypt, strip_crcs, parse_key, KNOWN_KEYS,
                         detect_bk7252_app_only)
 from src.emulator import BekenEmulator, CHIP_FAMILIES, CONSOLE_RX_HOLDOFF_INSNS
 from src import tuyamcu, tuya_config
+from src.periph import parse_adc_specs
 from src.wifipeer import WIFI_ROLES
 
 # Data-point type names accepted by --tuyamcu-dp, mapped to the wire type codes.
@@ -300,6 +301,11 @@ def parse_args():
                         help="Drive physical GPIO pin PIN to LEVEL (0 or 1) from power-on. "
                              "Repeatable, e.g. --gpio-input 20:1 holds an active-low reset "
                              "button high at its external pull-up idle state.")
+    parser.add_argument("--adc", dest="adc_inputs", action="append", default=[],
+                        metavar="CH:VALUE",
+                        help="Set SARADC analog input channel CH (0..15, chN, or P<pin>) to "
+                             "VALUE (raw 10-bit 0..1023 or voltage with 'V'/'mV' suffix, e.g. "
+                             "--adc 3:512 or --adc P26:1.65V). Repeatable.")
     parser.add_argument("--deep-sleep-wake", dest="deep_sleep_wakes", action="append", default=[],
                         metavar="SPEC",
                         help="Automatically wake the chip when it enters deep sleep (0x800104=0xADC1). "
@@ -319,7 +325,7 @@ def build_emulator(dump_path, key=None, chip="BK7231", with_boot=False, only_uar
                    tuyamcu_pid=None, tuyamcu_raw=False, tuyamcu_dps=None,
                    tuyamcu_injects=None, xvr_selfclear=False, uart_sink=None,
                    save_decrypted=True, log=None, ble_core=None, wifi=False,
-                   deep_sleep_wakes=None, gpio_inputs=None):
+                   deep_sleep_wakes=None, gpio_inputs=None, adc_inputs=None):
     """Load a dump and return a configured, not-yet-started BekenEmulator.
 
     Everything between "here is an image and some options" and "start running"
@@ -416,7 +422,8 @@ def build_emulator(dump_path, key=None, chip="BK7231", with_boot=False, only_uar
                          exception_vector_base=0x10000 if app_window is not None else 0,
                          chip_variant=chip_name,
                          deep_sleep_wakes=deep_sleep_wakes,
-                         gpio_inputs=gpio_inputs)
+                         gpio_inputs=gpio_inputs,
+                         adc_inputs=adc_inputs)
 
 
 def main():
@@ -451,19 +458,15 @@ def main():
             xvr_selfclear=args.xvr_selfclear, ble_core=args.ble_core,
             wifi=args.wifi or want_peer,
             deep_sleep_wakes=parse_deep_sleep_wakes(args.deep_sleep_wakes),
-            gpio_inputs=parse_gpio_inputs(args.gpio_inputs))
+            gpio_inputs=parse_gpio_inputs(args.gpio_inputs),
+            adc_inputs=parse_adc_specs(args.adc_inputs, chip=args.chip))
         if want_peer:
             # The offline TLS peer needs the image's PSK to authenticate its
             # local broker session.  --net-out is an opaque end-to-end relay,
             # so do not recover or retain a redundant host-side copy there.
-            if args.net_out:
-                tls_psks = ()
-                tuya_legacy_identity_psk = False
-            else:
-                decoded_config = tuya_config.extract(args.dump_file)
-                tls_psks = tuya_config.tls_psk_candidates(decoded_config)
-                tuya_legacy_identity_psk = (
-                    tuya_config.uses_tuya_legacy_identity_psk(decoded_config))
+            decoded_config = None if args.net_out else tuya_config.extract(args.dump_file)
+            tls_psks, tuya_legacy_identity_psk = tuya_config.offline_tls_config(
+                decoded_config, net_out=args.net_out)
             emu.attach_wifi_peer(role=args.wifi_peer or "auto", ssid=args.wifi_ssid,
                                  channel=args.wifi_channel, peer_mac=parse_mac(args.wifi_mac),
                                  passphrase=check_wifi_pass(args.wifi_pass),

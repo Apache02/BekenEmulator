@@ -21,8 +21,11 @@ import struct
 
 try:
     from Crypto.Cipher import AES
-except ImportError:                     # extraction is optional; tests never depend on it
-    AES = None
+except ImportError:
+    try:
+        from Cryptodome.Cipher import AES
+    except ImportError:                 # extraction is optional; tests never depend on it
+        AES = None
 
 KEY_MASTER = b"qwertyuiopasdfgh"
 KEY_PART_1 = b"8710_2M"
@@ -564,6 +567,18 @@ def uses_tuya_legacy_identity_psk(decoded):
     return len(candidate) == 37 and candidate.isalnum()
 
 
+def offline_tls_config(decoded, net_out=False):
+    """Return ``(tls_psks, tuya_legacy_identity_psk)`` for an offline Wi-Fi peer.
+
+    ``--net-out`` is an opaque end-to-end relay, so no local TLS-PSK candidates
+    or legacy identity-key trial are enabled when ``net_out`` is true.
+    """
+    if net_out:
+        return (), False
+    return (tls_psk_candidates(decoded),
+            uses_tuya_legacy_identity_psk(decoded))
+
+
 def _run_selftests():
     n = 0
 
@@ -611,7 +626,7 @@ def _run_selftests():
     from_loose = _collect(
         b"\x00psk30_key=" + psk30.encode("ascii") + b"\x00")
     check(from_loose["ids"].get("psk30_key") == psk30,
-          "the bounded loose-storage fallback preserves the same full value")
+          "the loose-storage fallback preserves the same full value")
     too_long = b"A" * (_MAX_STORED_ID_LEN + 1)
     overrun = _collect(b"psk30_key=" + too_long + b"\x00")
     check("psk30_key" not in overrun["ids"],
@@ -645,6 +660,9 @@ def _run_selftests():
     }
     check(uses_tuya_legacy_identity_psk(legacy_cfg),
           "Tuya TLS mode 2 with its exact legacy PSK shape enables identity-key trial")
+    check(offline_tls_config(legacy_cfg, net_out=False) == ((b"A" * 37,), True)
+          and offline_tls_config(legacy_cfg, net_out=True) == ((), False),
+          "offline_tls_config returns PSK candidates and legacy flag only when offline")
     check(not uses_tuya_legacy_identity_psk({
               "tls_mode": 2,
               "ids": {"psk_key": "A" * 37, "psk30_key": "B" * 44},

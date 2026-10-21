@@ -164,12 +164,21 @@ def parse_i2c_lines(lines):
     return frames
 
 
+def gpio_slot(pin, extended=True):
+    """Return the GPIO register slot for logical ``pin``, or ``None`` if invalid."""
+    if 0 <= pin < PIN_COUNT:
+        return pin
+    if extended and PIN_COUNT <= pin < BK7252_PIN_COUNT:
+        return BK7252_EXT_SLOT + (pin - PIN_COUNT)
+    return None
+
+
 def gpio_pin_values(gpio, chip=""):
     """Return a logical ``pin -> config`` map, excluding controller words."""
     pins = {pin: value for pin, value in gpio.items() if 0 <= pin < PIN_COUNT}
     if chip in ("BK7231U", "BK7252"):
         for pin in range(PIN_COUNT, BK7252_PIN_COUNT):
-            slot = BK7252_EXT_SLOT + pin - PIN_COUNT
+            slot = gpio_slot(pin, extended=True)
             if slot in gpio:
                 pins[pin] = gpio[slot]
     return pins
@@ -351,6 +360,197 @@ def ctl_channels(ctl):
 
 # PWM-capable pads, from OpenBeken's HAL_PIN_GetPinNameAlias table.
 PWM_PINS = {6: 0, 7: 1, 8: 2, 9: 3, 24: 4, 26: 5}
+PWM_CHANNEL_PINS = {ch: pin for pin, ch in PWM_PINS.items()}
+
+# ---------------------------------------------------------------------------
+# SARADC (Successive Approximation ADC) channel <-> GPIO pad mapping & decoding
+# ---------------------------------------------------------------------------
+# Default raw sample value returned when no per-channel override is configured
+# (330 corresponds to ~+30 C on BK7231N's internal temperature formula and
+# satisfies battery-monitor thresholds on BK7252 camera firmwares).
+DEFAULT_ADC_RAW = 330
+
+ADC_CHANNEL_PINS_BK7231 = {1: 26, 2: 24, 3: 23, 4: 28, 5: 22, 6: 21, 7: 13}
+ADC_CHANNEL_PINS_BK7231N = {1: 26, 2: 24, 3: 23, 4: 28, 5: 22, 6: 21, 7: 13}
+ADC_CHANNEL_PINS_BK7238 = {1: 20, 2: 22, 3: 23, 4: 26, 5: 24, 6: 28}
+ADC_CHANNEL_PINS_BK7252N = {1: 26, 2: 24, 3: 20, 4: 28, 5: 1, 6: 10, 7: 13}
+
+# Fallback pad -> channel table covering legacy BK7231Q and all newer families.
+ADC_PIN_TO_CHANNEL = {
+    4: 1, 26: 1,
+    5: 2, 24: 2,
+    23: 3, 20: 3,
+    2: 4, 28: 4,
+    3: 5, 22: 5, 1: 5,
+    12: 6, 21: 6, 10: 6,
+    13: 7,
+}
+
+
+def adc_channel_pins(chip=""):
+    """Return ``{channel: gpio_pin}`` for external ADC channels on ``chip``."""
+    c = (chip or "").strip().upper()
+    if c in ("BK7231N", "BK7231M", "BL2028N"):
+        return dict(ADC_CHANNEL_PINS_BK7231N)
+    if c == "BK7238":
+        return dict(ADC_CHANNEL_PINS_BK7238)
+    if c == "BK7252N":
+        return dict(ADC_CHANNEL_PINS_BK7252N)
+    return dict(ADC_CHANNEL_PINS_BK7231)
+
+
+def adc_channel_label(channel, chip=""):
+    """Human-readable label for a SARADC channel (e.g. ``'ch3(P23)'``)."""
+    ch = int(channel)
+    if ch == 0:
+        return "ch0(VBAT)"
+    c = (chip or "").strip().upper()
+    pin = adc_channel_pins(c).get(ch)
+    if ch == 7 and c in ("BK7231N", "BK7231M", "BL2028N", "BK7238"):
+        return "ch7(TEMP/P13)" if pin is not None else "ch7(TEMP)"
+    if pin is not None:
+        return "ch%d(P%d)" % (ch, pin)
+    if ch == 8:
+        return "ch8(TEMP/TSSI)"
+    if ch == 9:
+        return "ch9(TEMP)"
+    return "ch%d" % ch
+
+
+def parse_adc_channel(target, chip=""):
+    """Resolve a channel number, ``'ADCn'``, ``'CHn'``, ``'Pn'``, ``'vbat'`` or ``'temp'`` to 0..15."""
+    if isinstance(target, int):
+        if 0 <= target <= 15:
+            return target
+        raise ValueError("ADC channel %d out of range 0..15" % target)
+    text = str(target or "").strip()
+    if not text:
+        raise ValueError("empty ADC channel specification")
+    # Drop trailing parenthetical label from GUI combobox items like "3 (P23/P20)"
+    head = text.split()[0].strip().lower()
+    if "(" in head:
+        head = head.split("(", 1)[0].strip()
+    if head == "vbat":
+        return 0
+    if head == "temp":
+        c = (chip or "").strip().upper()
+        if c == "BK7252":
+            return 8
+        if c == "BK7252N":
+            return 9
+        return 7
+    if head.startswith(("p", "gpio")):
+        pin_s = head[4:] if head.startswith("gpio") else head[1:]
+        try:
+            pin = int(pin_s, 0)
+        except ValueError:
+            raise ValueError("bad ADC GPIO pin %r (want e.g. P23, P26)" % target)
+        pin_map = {p: ch for ch, p in adc_channel_pins(chip).items()}
+        ch = pin_map.get(pin, ADC_PIN_TO_CHANNEL.get(pin))
+        if ch is None:
+            raise ValueError("GPIO P%d is not an ADC input pad" % pin)
+        return ch
+    if head.startswith("adc"):
+        head = head[3:]
+    elif head.startswith("ch"):
+        head = head[2:]
+    try:
+        ch = int(head, 0)
+    except ValueError:
+        raise ValueError("bad ADC channel %r (want 0..15, ADC1..ADC7, P23, vbat, or temp)" % target)
+    if not 0 <= ch <= 15:
+        raise ValueError("ADC channel %d out of range 0..15" % ch)
+    return ch
+
+
+def parse_adc_spec(spec, chip=""):
+    """Parse ``'CH:VALUE'`` or ``'PIN:VALUE'`` into ``(channel, raw_value)``.
+
+    ``VALUE`` may be an integer sample ``0..65535`` (decimal or ``0x`` hex), or
+    a voltage with ``V`` / ``mV`` suffix scaled against 3.3V full-scale (1023).
+    """
+    text = str(spec or "").strip()
+    sep = ":" if ":" in text else ("=" if "=" in text else None)
+    if not sep:
+        raise ValueError("bad --adc %r (want CH:VALUE or P<pin>:VALUE, e.g. 3:512 or P23:1.65V)" % spec)
+    lhs, rhs = text.split(sep, 1)
+    ch = parse_adc_channel(lhs, chip=chip)
+    rhs_s = rhs.strip()
+    rhs_low = rhs_s.lower()
+    try:
+        if rhs_low.endswith("mv"):
+            mv = float(rhs_s[:-2].strip())
+            val = int(round(mv * 1023.0 / 3300.0))
+        elif rhs_low.endswith("v") and not rhs_low.startswith("0x"):
+            volts = float(rhs_s[:-1].strip())
+            val = int(round(volts * 1023.0 / 3.3))
+        else:
+            val = int(rhs_s, 0)
+    except ValueError:
+        raise ValueError("bad --adc value in %r (want integer 0..65535 or voltage like 1.65V / 1650mV)" % spec)
+    if not 0 <= val <= 0xFFFF:
+        raise ValueError("bad --adc value %d in %r (must be 0..65535)" % (val, spec))
+    return ch, val
+
+
+def parse_adc_specs(specs, chip=""):
+    """Parse a list of ``--adc`` specifications into ``{channel: raw_value}``."""
+    out = {}
+    for spec in specs or ():
+        ch, val = parse_adc_spec(spec, chip=chip)
+        out[ch] = val
+    return out
+
+
+def describe_adc(saradc_channel=None, saradc_conversions=0, saradc_reads=0,
+                 adc_samples=None, adc_inputs=None, last_raw=None, chip=""):
+    """Summarize SARADC activity and configured channel sample values."""
+    convs = (sum(saradc_conversions.values())
+             if isinstance(saradc_conversions, dict)
+             else int(saradc_conversions or 0))
+    reads = (sum(saradc_reads.values())
+             if isinstance(saradc_reads, dict)
+             else int(saradc_reads or 0))
+    samples = {}
+    if adc_inputs:
+        samples.update((int(k), int(v)) for k, v in adc_inputs.items())
+    if adc_samples:
+        samples.update((int(k), int(v)) for k, v in adc_samples.items())
+    active = bool(saradc_channel is not None or convs > 0 or reads > 0)
+    if not active and not samples:
+        return {
+            "active": False,
+            "active_channel": None,
+            "conversions": convs,
+            "reads": reads,
+            "samples": samples,
+            "last_raw": last_raw,
+            "summary": "ADC: idle (default %d / %.2fV)" % (
+                DEFAULT_ADC_RAW, DEFAULT_ADC_RAW * 3.3 / 1023.0),
+        }
+    parts = []
+    if saradc_channel is not None:
+        raw = int(last_raw if last_raw is not None else samples.get(saradc_channel, DEFAULT_ADC_RAW))
+        volts = raw * 3.3 / 1023.0
+        parts.append("%s=%d (%.2fV)" % (adc_channel_label(saradc_channel, chip), raw, volts))
+    other_samples = [
+        "%s=%d (%.2fV)" % (adc_channel_label(ch, chip), val, val * 3.3 / 1023.0)
+        for ch, val in sorted(samples.items())
+        if ch != saradc_channel
+    ]
+    if other_samples:
+        parts.append(", ".join(other_samples))
+    if convs or reads:
+        parts.append("%d conv, %d reads" % (convs, reads))
+    return {
+        "active": active,
+        "active_channel": saradc_channel,
+        "conversions": convs,
+        "reads": reads,
+        "samples": samples,
+        "last_raw": last_raw,
+        "summary": "ADC: " + " — ".join(parts),
+    }
 
 
 def pwm_output_pins(gpio):
@@ -562,10 +762,13 @@ def tuya_i2c_channel_map(tuya_config):
 
 def describe_peripherals(tuya_config=None, decoded_state=None, i2c_frames=None,
                          i2c_last_on=None, ws2812_spi=None, bl0942_polls=0,
-                         meter_values=None):
-    """Synthesize LED driver and Energy Meter state from Tuya config + live hardware.
+                         meter_values=None, saradc_channel=None,
+                         saradc_conversions=None, saradc_reads=None,
+                         adc_samples=None, saradc_last_raw=None,
+                         adc_inputs=None, chip=""):
+    """Synthesize LED driver, Energy Meter, and SARADC state from Tuya config + live hardware.
 
-    Returns ``{"led": dict | None, "meter": dict | None}``.
+    Returns ``{"led": dict | None, "meter": dict | None, "adc": dict | None}``.
     """
     pairs = _tuya_pairs_dict(tuya_config)
     cmap = tuya_i2c_channel_map(tuya_config)
@@ -767,7 +970,16 @@ def describe_peripherals(tuya_config=None, decoded_state=None, i2c_frames=None,
             "sel_lv": 1 if sel_lv is None else sel_lv,
         }
 
-    return {"led": led, "meter": meter}
+    adc = describe_adc(
+        saradc_channel=saradc_channel,
+        saradc_conversions=saradc_conversions,
+        saradc_reads=saradc_reads,
+        adc_samples=adc_samples,
+        adc_inputs=adc_inputs,
+        last_raw=saradc_last_raw,
+        chip=chip,
+    )
+    return {"led": led, "meter": meter, "adc": adc}
 
 
 # Same captured offsets mean different peripherals per chip: 0x100+ is pwm_new
@@ -780,13 +992,16 @@ PWM_NEW_CHIPS = {"BK7231N", "BK7231M", "BL2028N", "BK7238"}
 
 def decode_state(gpio, pwm, chip="", i2c_frames=None, i2c_last_on=None,
                  ws2812_spi=None, tuya_config=None, bl0942_polls=0,
-                 meter_values=None):
+                 meter_values=None, saradc_channel=None,
+                 saradc_conversions=None, saradc_reads=None,
+                 adc_samples=None, saradc_last_raw=None, adc_inputs=None):
     """Decode raw {pin: value} / {offset: value} register maps.
 
     Returns the dict the report and the GUI both render, or None when the
     firmware has not touched any peripheral yet.
     """
-    if not gpio and not pwm and not i2c_frames and not ws2812_spi and not bl0942_polls:
+    if (not gpio and not pwm and not i2c_frames and not ws2812_spi
+            and not bl0942_polls and not saradc_conversions):
         return None
     if chip in PWM_NEW_CHIPS and any(off >= 0x100 for off in pwm):
         channels = pwm_new_channels(pwm)
@@ -811,16 +1026,20 @@ def decode_state(gpio, pwm, chip="", i2c_frames=None, i2c_last_on=None,
         tuya_config=tuya_config, decoded_state=out,
         i2c_frames=i2c_frames, i2c_last_on=i2c_last_on,
         ws2812_spi=ws2812_spi, bl0942_polls=bl0942_polls,
-        meter_values=meter_values)
+        meter_values=meter_values, saradc_channel=saradc_channel,
+        saradc_conversions=saradc_conversions, saradc_reads=saradc_reads,
+        adc_samples=adc_samples, saradc_last_raw=saradc_last_raw,
+        adc_inputs=adc_inputs, chip=chip)
     out["led"] = periphs["led"]
     out["meter"] = periphs["meter"]
+    out["adc"] = periphs["adc"]
     return out
 
 
 # Silicon name implied by a dump's filename. Report chip names (BK7231N,
 # BK7231T, ...) are finer-grained than the four -chip CLI identities, and
 # decode_state above needs the fine-grained one, so this lives beside it and
-# is shared by the self-test harness and the GUI.
+# is shared by the self-test report and the GUI.
 CHIP_RE = re.compile(r"(BL2028N|BK7252N|BK7231[TUNMQ]|BK7238|BK7252|BK7236|BK7258|BK3231)", re.I)
 
 
@@ -828,4 +1047,101 @@ def chip_from_name(filename):
     """Chip a dump's filename names, or "" when it says nothing."""
     m = CHIP_RE.search(os.path.basename(filename or ""))
     return m.group(1).upper() if m else ""
+
+
+def _self_test():
+    """Unit tests for peripheral decoders and SARADC emulation."""
+    import sys as _sys
+    _sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+    from src.emulator import BekenEmulator, CHIP_FAMILIES
+
+    # 1. GPIO slot & pin decoding
+    assert gpio_slot(10, extended=True) == 10
+    assert gpio_slot(32, extended=True) == 48
+    assert gpio_slot(39, extended=True) == 55
+    assert gpio_slot(32, extended=False) is None
+    assert "OUTPUT = 0" in decode_pin(0x00)
+    assert "OUTPUT = 1" in decode_pin(0x02)
+    assert "pull-up" in decode_pin(0x3C)
+    assert "pull-down" in decode_pin(0x2C)
+    assert "second function" in decode_pin(0x48)
+
+    # 2. PWM old & pwm_new decoders
+    old_ch, old_ctl, old_base = pwm_channels({0x80: 0x11, 0x88: 26000, 0x8C: 13000})
+    assert old_base == 0x80 and old_ctl == 0x11
+    assert len(old_ch) == 1 and old_ch[0][:3] == (0, 26000, 13000)
+    assert abs(old_ch[0][3] - 1000.0) < 0.1 and abs(old_ch[0][4] - 50.0) < 0.1
+
+    new_ch = pwm_new_channels({0x100: 0x09, 0x104: 0x171B, 0x108: 0x4E75, 0x110: 0x6590})
+    assert len(new_ch) == 1 and new_ch[0][0] == 0 and new_ch[0][1] == 0x6590
+    assert abs(new_ch[0][4] - 54.5) < 0.2
+
+    # 3. I2C LED decoders (SM2135, SM2235, BP5758D, BP1658CJ) & WS2812 SPI
+    sm2135 = decode_i2c_led(24, 26, bytes.fromhex("c01402ff00000000"))
+    assert sm2135 is not None and sm2135["driver"] == "SM2135" and sm2135["r"] == 1.0
+    sm2235 = decode_i2c_led(26, 24, bytes.fromhex("d82400000000000003a20000"))
+    assert sm2235 is not None and sm2235["driver"] == "SM2235" and sm2235["c"] > 0.9
+    bp5758 = decode_i2c_led(24, 26, bytes.fromhex("b01f0808081e1ebcbfbcbfbcbfa0a0a0a0"))
+    assert bp5758 is not None and bp5758["driver"] == "BP5758D" and bp5758["is_lit"]
+    bp1658 = decode_i2c_led(24, 26, bytes.fromhex("b8231f1f0000000000000000"))
+    assert bp1658 is not None and bp1658["driver"] == "BP1658CJ" and bp1658["r"] == 1.0
+
+    ws_spi = (b"\xf8" * 8 + b"\xc0" * 16) * 3   # 3 pure green GRB pixels
+    ws_px = decode_ws2812_spi(ws_spi)
+    assert ws_px == [(0, 255, 0), (0, 255, 0), (0, 255, 0)]
+
+    # 4. SARADC parser & descriptor helpers
+    assert parse_adc_channel("3") == 3
+    assert parse_adc_channel("ch5") == 5
+    assert parse_adc_channel("P26", chip="BK7231T") == 1
+    assert parse_adc_channel("P26", chip="BK7238") == 4
+    assert parse_adc_spec("3:512") == (3, 512)
+    assert parse_adc_spec("P23:1.65V", chip="BK7231T") == (3, 512)
+    assert parse_adc_spec("ch0:1650mV") == (0, 512)
+    assert parse_adc_specs(["0:420", "P26:777"], chip="BK7231N") == {0: 420, 1: 777}
+    adc_desc = describe_adc(saradc_channel=3, saradc_conversions=2, saradc_reads=2,
+                            adc_samples={3: 512}, last_raw=512, chip="BK7231T")
+    assert adc_desc["active"] and "ch3(P23)=512" in adc_desc["summary"]
+
+    # 5. BekenEmulator SARADC MMIO emulation (BK7231T/N and BK7238 register layouts)
+    import struct as _struct
+    emu_t = BekenEmulator(raw_flash=b"\xff" * 0x1000, bootloader=None, app=b"\x00" * 64,
+                          only_uart=True, chip_identity=CHIP_FAMILIES["BK7231"],
+                          chip_variant="BK7231", adc_inputs={1: 700, 3: 512})
+    emu_t.setup()
+    assert emu_t.get_adc_input(1) == 700 and emu_t.get_adc_input(3) == 512
+    assert emu_t.get_adc_input(2) == DEFAULT_ADC_RAW
+    emu_t.set_adc_input("P24", 888)   # P24 -> ch2 on BK7231T
+    assert emu_t.get_adc_input(2) == 888
+    # Trigger BK7231T SARADC on channel 3:
+    # mode=1 (bits 1:0), chn_en=1 (bit 2), chn_sel=3 (bits 5:3 -> 0x18), 4clk_delay (bit 6 -> 0x40)
+    emu_t.hook_mem_write_mmio(emu_t.mu, 0, 0x00802c00, 4, 0x01 | 0x04 | (3 << 3) | 0x40, None)
+    assert emu_t.state.saradc_channel == 3
+    assert emu_t.state.saradc_last_raw == 512
+    assert emu_t.state.saradc_pending == 32
+    samples = []
+    for _ in range(32):
+        emu_t.hook_mem_read_mmio(emu_t.mu, 0, 0x00802c04, 4, 0, None)
+        samples.append(_struct.unpack("<I", emu_t.mu.mem_read(0x00802c04, 4))[0])
+    assert samples == [512] * 32
+    emu_t.hook_mem_read_mmio(emu_t.mu, 0, 0x00802c00, 4, 0, None)
+    cfg_read = _struct.unpack("<I", emu_t.mu.mem_read(0x00802c00, 4))[0]
+    assert (cfg_read & (1 << 28)) != 0   # FIFO_EMPTY asserted after draining batch
+
+    # BK7238 SARADC layout (0x00802c08 CFG2, 0x00802c0c STATE, 0x00802c10 DATA)
+    emu_38 = BekenEmulator(raw_flash=b"\xff" * 0x1000, bootloader=None, app=b"\x00" * 64,
+                           only_uart=True, chip_identity=CHIP_FAMILIES["BK7238"],
+                           chip_variant="BK7238", adc_inputs={4: 640})
+    emu_38.setup()
+    emu_38.hook_mem_write_mmio(emu_38.mu, 0, 0x00802c08, 4, 4, None)        # channel 4 (P26 on BK7238)
+    emu_38.hook_mem_write_mmio(emu_38.mu, 0, 0x00802c0c, 4, 0x00004008, None)  # CHNL_EN
+    assert emu_38.state.saradc_channel == 4
+    emu_38.hook_mem_read_mmio(emu_38.mu, 0, 0x00802c10, 4, 0, None)
+    assert _struct.unpack("<I", emu_38.mu.mem_read(0x00802c10, 4))[0] == 640
+    print("periph.py: all self-tests passed")
+
+
+if __name__ == "__main__":
+    _self_test()
+
 

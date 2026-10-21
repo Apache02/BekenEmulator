@@ -185,7 +185,14 @@ class SimulatorState:
         self.timer3_5_ctl = 0
         self.efuse_ctrl = 0
         self.saradc_cfg = 0        # shadow of SARADC_ADC_CONFIG (0x802c00)
+        self.saradc_cfg2 = 0       # shadow of SARADC_ADC_CONFIG2 (0x802c08, BK7238/BK7252N)
+        self.saradc_state_reg = 0  # shadow of SARADC_ADC_STATE (0x802c0c, BK7238/BK7252N)
         self.saradc_pending = 0    # samples waiting in the emulated ADC FIFO
+        self.saradc_channel = None # active SARADC channel (0..15)
+        self.saradc_last_raw = None
+        self.saradc_conversions = 0
+        self.saradc_reads = 0
+        self.adc_samples = {}      # channel -> latest raw sample
         self.last_pc = 0           # start of the last basic block, for the GUI status bar
         self.last_slow = 0         # insn_count at last slow (timer) tick
         self.last_fast = 0         # insn_count at last ~1000-insn (UART) tick
@@ -415,7 +422,7 @@ class BekenEmulator:
     WDT_SECOND_KEY = 0xA5
     WDT_INSNS_PER_MS = SLOW_TICK_INSNS // SLOW_TICK_MS
 
-    def __init__(self, raw_flash, bootloader, app, with_boot=False, only_uart=False, chip_identity=None, uart1_hex=False, physical_flash=None, uart1_rx=b"", uart1_rx_delay=CONSOLE_RX_HOLDOFF_INSNS, tuyamcu_enabled=False, tuyamcu_pid=None, tuyamcu_raw=False, xvr_selfclear=False, tuyamcu_dps=None, tuyamcu_injects=None, uart_sink=None, ble_core=None, wifi=False, exception_vector_base=0, chip_variant=None, deep_sleep_wakes=None, gpio_inputs=None):
+    def __init__(self, raw_flash, bootloader, app, with_boot=False, only_uart=False, chip_identity=None, uart1_hex=False, physical_flash=None, uart1_rx=b"", uart1_rx_delay=CONSOLE_RX_HOLDOFF_INSNS, tuyamcu_enabled=False, tuyamcu_pid=None, tuyamcu_raw=False, xvr_selfclear=False, tuyamcu_dps=None, tuyamcu_injects=None, uart_sink=None, ble_core=None, wifi=False, exception_vector_base=0, chip_variant=None, deep_sleep_wakes=None, gpio_inputs=None, adc_inputs=None):
         self.raw_flash = raw_flash
         self.xvr_selfclear = xvr_selfclear
         self.chip_variant = (chip_variant or "").strip().upper()
@@ -449,8 +456,7 @@ class BekenEmulator:
             # there they were invisible exactly when they mattered.
             self.wifimac = _wifimac.MacHw(SLOW_TICK_INSNS // (SLOW_TICK_MS * 1000),
                                           log=self.net_log)
-            self.wifimac.mem = (lambda addr, size: self.mu.mem_read(addr, size),
-                                lambda addr, data: self.mu.mem_write(addr, bytes(data)))
+            self.wifimac.mem = self._guest_mem_callbacks()
             self.trng_state = 0x2545F491
         # RivieraWaves BLE core model over the 0x900000 block (src/blecore.py).
         # Real BLE 5.x silicon selected by an unambiguous chip identity gets
@@ -478,8 +484,7 @@ class BekenEmulator:
             self.blecore = _blecore.BleCore(self.XVR_BASE, SLOW_TICK_INSNS * 1000 // SLOW_TICK_MS,
                                             layout=layout)
             # Exchange memory is ordinary guest RAM, reached through Unicorn.
-            self.blecore.mem = (lambda addr, size: self.mu.mem_read(addr, size),
-                                lambda addr, data: self.mu.mem_write(addr, bytes(data)))
+            self.blecore.mem = self._guest_mem_callbacks()
         self.bootloader = bootloader
         self.app = app
         self.with_boot = with_boot
@@ -646,6 +651,11 @@ class BekenEmulator:
                 lvl = _gpio.GpioModel.check_level(level)
                 if lvl is not None:
                     self.state.gpio_hw.inputs[int(pin)] = lvl
+        self.adc_inputs = {}
+        self._adc_inputs = self.adc_inputs
+        if adc_inputs:
+            for ch, val in adc_inputs.items():
+                self.set_adc_input(ch, val)
         self._deep_sleep_wake_queue = list(deep_sleep_wakes or [])
         self._deep_sleep_wake_pending = None
         self.flash_state = FlashState()
@@ -887,6 +897,91 @@ class BekenEmulator:
                         bstate[1] = 0
                         bstate[2] = 0
 
+    @property
+    def chip_family_name(self):
+        if self.chip_variant:
+            return self.chip_variant
+        for name, ids in CHIP_FAMILIES.items():
+            if ids[0] == self.chip_id_value:
+                return name
+        return "BK7231"
+
+    def set_adc_input(self, channel, value):
+        """Set or clear a simulated SARADC input channel (0..15 or ``'P23'``).
+
+        ``value`` is a raw ADC sample (0..65535), a voltage string (``'1.65V'``,
+        ``'1650mV'``), or ``None`` to revert to the default sample (330).
+        Safe to call from a GUI thread while running.
+        """
+        ch = _periph.parse_adc_channel(channel, chip=self.chip_family_name)
+        if value is None:
+            self.adc_inputs.pop(ch, None)
+            self.state.adc_samples.pop(ch, None)
+            return
+        if isinstance(value, str):
+            _, value = _periph.parse_adc_spec("0:%s" % value, chip=self.chip_family_name)
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 0xFFFF:
+            raise ValueError("ADC sample value must be in 0..65535 (got %r)" % (value,))
+        self.adc_inputs[ch] = value
+        self.state.adc_samples[ch] = value
+
+    def get_adc_input(self, channel):
+        """Return the raw sample value configured for ``channel``."""
+        ch = _periph.parse_adc_channel(channel, chip=self.chip_family_name)
+        return self.state.adc_samples.get(
+            ch, self.adc_inputs.get(ch, _periph.DEFAULT_ADC_RAW))
+
+    def _saradc_sample_for(self, channel=None):
+        """Consume and record one sample read for the active SARADC channel."""
+        state = self.state
+        ch = state.saradc_channel if channel is None else channel
+        if ch is None:
+            ch = 0
+        val = self.get_adc_input(ch) & 0xFFFF
+        state.saradc_last_raw = val
+        state.adc_samples[ch] = val
+        state.saradc_reads += 1
+        return val
+
+    def _guest_mem_callbacks(self):
+        """Return (read, write) callables giving a peripheral model guest RAM access."""
+        return (
+            lambda addr, size: self.mu.mem_read(addr, size),
+            lambda addr, data: self.mu.mem_write(addr, bytes(data)),
+        )
+
+    def _bind_wifi_peer(self, peer, reset_device=False):
+        """Wire a WifiPeer to the current MacHw instance."""
+        if peer is None or self.wifimac is None:
+            return
+        self.wifimac.on_tx = peer.on_device_tx
+        peer.inject = lambda f, decr=None: self.wifimac.inject(
+            f, self.state.insn_count, decr=decr)
+        peer.now_us = self._network_now_us
+        if reset_device:
+            peer.device_reset(self._network_now_us())
+
+    def _write_mmio_reset_defaults(self):
+        """Write power-on reset values for UART FIFOs, SARADC, and WDT into MMIO."""
+        fifo_default = struct.pack("<I", 1 << 17 | 1 << 19 | 1 << 20)
+        self.mu.mem_write(self.UART1_FIFO_STATUS, fifo_default)
+        self.mu.mem_write(self.UART2_FIFO_STATUS, fifo_default)
+        self.mu.mem_write(0x00802c00, struct.pack("<I", 1 << 28 | 1 << 30))
+        self.mu.mem_write(self.WDT_CTRL, struct.pack("<I", 0))
+
+    def _clear_reset_memory(self):
+        """Zero RAM/MMIO/peripheral windows and restore power-on CPU context."""
+        self.mu.mem_write(self.RAM_BASE, b"\x00" * self.RAM_SIZE)
+        self.mu.mem_write(self.MMIO_BASE, b"\x00" * self.MMIO_SIZE)
+        self.mu.mem_write(self.PERIPH_BASE, b"\x00" * self.PERIPH_SIZE)
+        self.mu.mem_write(self.XVR_BASE,
+                          b"\x00" * (0x40000 if self.is_bk7252 else 0x1000))
+        if self.is_bk7252n:
+            self.mu.mem_write(0x00A00000, b"\x00" * 0x10000)
+        self.mu.mem_write(self.ACCEL_BASE, b"\x00" * 0x1000)
+        self._write_mmio_reset_defaults()
+        self.mu.context_restore(self._power_on_context)
+
     def set_gpio_input(self, pin, level):
         """Drive one GPIO input from a host thread, or release it with ``None``.
 
@@ -906,9 +1001,7 @@ class BekenEmulator:
 
     def _gpio_slot(self, pin):
         """Physical register slot for a logical GPIO number."""
-        if pin < self.GPIO_PIN_COUNT:
-            return pin
-        return self.GPIO_EXT_SLOT_FIRST + (pin - self.GPIO_EXT_PIN_FIRST)
+        return _periph.gpio_slot(pin, extended=self.has_extended_gpio)
 
     def _gpio_pin_at(self, address):
         """Logical GPIO at an MMIO address, excluding controller registers."""
@@ -1040,24 +1133,16 @@ class BekenEmulator:
             peer = self.wifi_peer
             self.wifimac = _wifimac.MacHw(
                 SLOW_TICK_INSNS // (SLOW_TICK_MS * 1000), log=self.net_log)
-            self.wifimac.mem = (
-                lambda addr, size: self.mu.mem_read(addr, size),
-                lambda addr, data: self.mu.mem_write(addr, bytes(data)))
+            self.wifimac.mem = self._guest_mem_callbacks()
             if peer is not None:
                 # The access point/router is outside the emulated chip, so it
                 # survives the reset.  Only the MAC endpoint is replaced.
-                self.wifimac.on_tx = peer.on_device_tx
-                peer.inject = lambda f, decr=None: self.wifimac.inject(
-                    f, self.state.insn_count, decr=decr)
-                peer.now_us = self._network_now_us
-                peer.device_reset(self._network_now_us())
+                self._bind_wifi_peer(peer, reset_device=True)
         if self.blecore is not None:
             self.blecore = _blecore.BleCore(
                 self.XVR_BASE, SLOW_TICK_INSNS * 1000 // SLOW_TICK_MS,
                 layout=self._ble_layout)
-            self.blecore.mem = (
-                lambda addr, size: self.mu.mem_read(addr, size),
-                lambda addr, data: self.mu.mem_write(addr, bytes(data)))
+            self.blecore.mem = self._guest_mem_callbacks()
 
     def _watchdog_reset(self):
         """Apply a chip reset and leave the emulator ready for a fresh boot."""
@@ -1069,22 +1154,7 @@ class BekenEmulator:
         # pending interrupts, RAM, and on-chip peripheral engines reset.
         gpio_inputs = dict(self.state.gpio_hw.inputs)
         self._network_insn_offset += self.state.insn_count
-
-        self.mu.mem_write(self.RAM_BASE, b"\x00" * self.RAM_SIZE)
-        self.mu.mem_write(self.MMIO_BASE, b"\x00" * self.MMIO_SIZE)
-        self.mu.mem_write(self.PERIPH_BASE, b"\x00" * self.PERIPH_SIZE)
-        self.mu.mem_write(self.XVR_BASE,
-                          b"\x00" * (0x40000 if self.is_bk7252 else 0x1000))
-        if self.is_bk7252n:
-            self.mu.mem_write(0x00A00000, b"\x00" * 0x10000)
-        self.mu.mem_write(self.ACCEL_BASE, b"\x00" * 0x1000)
-        self.mu.mem_write(self.UART1_FIFO_STATUS,
-                          struct.pack("<I", 1 << 17 | 1 << 19 | 1 << 20))
-        self.mu.mem_write(self.UART2_FIFO_STATUS,
-                          struct.pack("<I", 1 << 17 | 1 << 19 | 1 << 20))
-        self.mu.mem_write(0x00802c00, struct.pack("<I", 1 << 28 | 1 << 30))
-        self.mu.mem_write(self.WDT_CTRL, struct.pack("<I", 0))
-        self.mu.context_restore(self._power_on_context)
+        self._clear_reset_memory()
 
         self.state = SimulatorState()
         if self.is_bk7252n:
@@ -1092,6 +1162,7 @@ class BekenEmulator:
         if self.gpio_pin_count != self.state.gpio_hw.pin_count:
             self.state.gpio_hw = _gpio.GpioModel(self.gpio_pin_count)
         self.state.gpio_hw.inputs.update(gpio_inputs)
+        self.state.adc_samples.update(self._adc_inputs)
         self.flash_state = FlashState()
         self._uart_src = None
         self._resume_at = None
@@ -1262,22 +1333,7 @@ class BekenEmulator:
         info = old.deep_sleep_info or self._decode_deep_sleep_info(old, 0xADC1)
         reason, pin = self._resolve_wake_spec((reason, pin), info)
         self._network_insn_offset += old.insn_count
-
-        self.mu.mem_write(self.RAM_BASE, b"\x00" * self.RAM_SIZE)
-        self.mu.mem_write(self.MMIO_BASE, b"\x00" * self.MMIO_SIZE)
-        self.mu.mem_write(self.PERIPH_BASE, b"\x00" * self.PERIPH_SIZE)
-        self.mu.mem_write(self.XVR_BASE,
-                          b"\x00" * (0x40000 if self.is_bk7252 else 0x1000))
-        if self.is_bk7252n:
-            self.mu.mem_write(0x00A00000, b"\x00" * 0x10000)
-        self.mu.mem_write(self.ACCEL_BASE, b"\x00" * 0x1000)
-        self.mu.mem_write(self.UART1_FIFO_STATUS,
-                          struct.pack("<I", 1 << 17 | 1 << 19 | 1 << 20))
-        self.mu.mem_write(self.UART2_FIFO_STATUS,
-                          struct.pack("<I", 1 << 17 | 1 << 19 | 1 << 20))
-        self.mu.mem_write(0x00802c00, struct.pack("<I", 1 << 28 | 1 << 30))
-        self.mu.mem_write(self.WDT_CTRL, struct.pack("<I", 0))
-        self.mu.context_restore(self._power_on_context)
+        self._clear_reset_memory()
 
         new_state = SimulatorState()
         if self.is_bk7252n:
@@ -1285,6 +1341,7 @@ class BekenEmulator:
         if self.gpio_pin_count != new_state.gpio_hw.pin_count:
             new_state.gpio_hw = _gpio.GpioModel(self.gpio_pin_count)
         new_state.gpio_hw.inputs.update(gpio_inputs)
+        new_state.adc_samples.update(self._adc_inputs)
 
         # Always-On (AON) SCTRL wakeup configuration survives deep sleep reset.
         new_state.sctrl_rosc_timer = old.sctrl_rosc_timer
@@ -1461,7 +1518,7 @@ class BekenEmulator:
             # failed to start (an unwritable pcap path) must not keep them.
             net.close()
             raise
-        self.wifimac.on_tx = peer.on_device_tx
+        self._bind_wifi_peer(peer)
         self.wifi_peer = peer
         return peer
 
@@ -1912,37 +1969,8 @@ class BekenEmulator:
                 # it is killed once the harness has what it needs - so whatever
                 # has not been emitted by then is simply lost. The harness
                 # filters these lines out of the displayed log.
-                if ((state.gpio_dirty or state.pwm_dirty or state.i2c_dirty
-                     or state.uart1_events)
-                        and state.uart_at_line_start):
-                    buf = sys.__stdout__.buffer
-                    periph_changed = bool(state.gpio_dirty or state.pwm_dirty
-                                          or state.i2c_dirty)
-                    for pin in sorted(state.gpio_dirty):
-                        buf.write(b"[EMU_GPIO] %d %08x\n" % (pin, state.gpio_cfg[pin]))
-                    for off in sorted(state.pwm_dirty):
-                        buf.write(b"[EMU_PWM] %03x %08x\n" % (off, state.pwm_regs[off]))
-                    for scl, sda in sorted(state.i2c_dirty):
-                        raw = state.i2c_frames.get((scl, sda), b"")
-                        if raw:
-                            buf.write(b"[EMU_I2C] %d %d %s\n"
-                                      % (scl, sda, raw.hex().encode("ascii")))
-                    # Delimit the writes from one slow tick. The test harness
-                    # judges a state here, never midway through a multi-register
-                    # update that only happens to match by combining old/new data.
-                    if periph_changed:
-                        buf.write(b"[EMU_PERIPH]\n")
-                    # One line per UART1 byte: insn timestamp, direction, value.
-                    # The report coalesces consecutive same-direction bytes into
-                    # Sent:/Recv: frames; keeping raw bytes here means no framing
-                    # decision is baked into the capture.
-                    for _t, _d, _b in state.uart1_events:
-                        buf.write(b"[EMU_UART1] %d %c %02x\n" % (_t, ord(_d), _b))
-                    state.gpio_dirty.clear()
-                    state.pwm_dirty.clear()
-                    state.i2c_dirty.clear()
-                    state.uart1_events.clear()
-                    buf.flush()
+                if state.uart_at_line_start:
+                    self._flush_report_periph(state)
                 # Same line-boundary rule as the lines above, and for the same
                 # reason: this one used to open with "\n" unconditionally, so
                 # when the 1M-instruction tick landed mid-line it cut a guest
@@ -2499,25 +2527,27 @@ class BekenEmulator:
 
             value = value & ~(1 << 31)
             
-        # SARADC_ADC_CONFIG (BK7231N layout, verified against the OpenBK7231N
-        # SDK saradc.c). A write with CHNL_EN (bit 2) set starts a conversion;
+        # SARADC_ADC_CONFIG (BK7231T/U/N/M & BK7252 layout, verified against
+        # the SDK saradc.c). A write with CHNL_EN (bit 2) set starts a conversion;
         # fill the emulated FIFO with a batch of samples. The driver's ISR /
-        # poll loops read DAT_AFTER_STA until FIFO_EMPTY (config bit 30) is set,
-        # so each sample read drains one. Arming only from idle (pending==0)
+        # poll loops read DATA / DAT_AFTER_STA until FIFO_EMPTY (config bit 28/30)
+        # is set, so each sample read drains one. Arming only from idle (pending==0)
         # avoids an ever-full FIFO. BK7231N's temp read blocks forever without
         # this - it waits on the SARADC interrupt (ICU bit 11).
         if address == 0x00802c00:
             self.state.saradc_cfg = value
-            if os.environ.get("ADCDBG"):
-                sys.__stderr__.write(
-                    "ADCDBG cfg write=0x%08x chnl_en=%d chip=%#x\n"
-                    % (value, (value >> 2) & 1, self.chip_id_value))
-                sys.__stderr__.flush()
             # The BK7231(T/U/N/M) and BK7252 (SOC_BK7221U) SARADC layouts use
-            # this model; the 7238/7252N layout differs and is served via 0x802c0c.
+            # this model; the 7238/7252N layout differs and is served via 0x802c08/0c.
             if self.is_bk7231 or self.is_bk7252:
                 if value & (1 << 2):                # CHNL_EN: start converting
                     if self.state.saradc_pending == 0:
+                        ch_mask = 0xF if self.is_bk7252 else 0x7
+                        ch = (value >> 3) & ch_mask
+                        self.state.saradc_channel = ch
+                        self.state.saradc_conversions += 1
+                        raw = self.get_adc_input(ch)
+                        self.state.saradc_last_raw = raw
+                        self.state.adc_samples[ch] = raw
                         self.state.saradc_pending = 32
                 else:
                     # CHNL_EN cleared - the channel is stopped (saradc_pause /
@@ -2532,6 +2562,30 @@ class BekenEmulator:
                     # storm that starved the temp_detect thread, filled its
                     # queue ("temp_detect_send_msg failed") and wedged the boot.
                     self.state.saradc_pending = 0
+            elif value & 0x2:                       # BK7238/BK7252N FORCE_QUIT
+                self.state.saradc_pending = 0
+
+        if address == 0x00802c08 and not (self.is_bk7231 or self.is_bk7252):
+            # BK7238/BK7252N SARADC_ADC_CONFIG2: bits [3:0] select channel 0..12.
+            self.state.saradc_cfg2 = value & 0xFFFFFFFF
+            self.state.saradc_channel = value & 0xF
+
+        if address == 0x00802c0c and not (self.is_bk7231 or self.is_bk7252):
+            # BK7238/BK7252N SARADC_ADC_STATE: CHNL_EN (0x14008) enables FIFO/
+            # conversion interrupts; INT_CLR (0x28010) is write-1-to-clear.
+            self.state.saradc_state_reg = value & ~0x28010
+            if (value & 0x14008) and not (value & 0x28010):
+                ch = self.state.saradc_channel if self.state.saradc_channel is not None else 0
+                self.state.saradc_channel = ch
+                self.state.saradc_conversions += 1
+                raw = self.get_adc_input(ch)
+                self.state.saradc_last_raw = raw
+                self.state.adc_samples[ch] = raw
+                if ch < 7 or ch in self.adc_inputs:
+                    if self.state.saradc_pending == 0:
+                        self.state.saradc_pending = 32
+            elif not (value & 0x14008):
+                self.state.saradc_pending = 0
 
         # SCTRL_EFUSE_CTRL: EFUSE_OPER_EN (bit 0) self-clears when the efuse
         # operation completes; complete it instantly or sctrl_read_efuse spins
@@ -2780,14 +2834,19 @@ class BekenEmulator:
             return
 
         if address == 0x00802c00:
-            # Config readback: FIFO_EMPTY (bit 28 on SOC_BK7231 Q/T/U, bit 30
-            # on SOC_BK7231N/BK7252) reflects the emulated FIFO - set when drained,
-            # clear while samples pend so the ISR's `while((cfg & FIFO_EMPTY)==0)`
-            # loop reads them. INT_CLR (bit 7/8) is deliberately never reflected,
-            # so saradc_int_clr()'s do/while exits.
-            cfg = 0 if ((self.is_bk7231 or self.is_bk7252)
-                        and self.state.saradc_pending) else ((1 << 28) | (1 << 30))
-            mu.mem_write(address, struct.pack("<I", cfg))
+            # Config readback: preserve firmware-configured mode/channel/enable
+            # bits from saradc_cfg so saradc_int_clr()'s read-modify-write does
+            # not accidentally clear CHNL_EN (bit 2) and flush the FIFO before
+            # saradc_isr() can read a single sample. FIFO_EMPTY (bit 28 on
+            # SOC_BK7231 Q/T/U, bit 30 on SOC_BK7231N/BK7252) is set when
+            # drained and clear while samples pend; INT_CLR (bits 7/8) always
+            # reads back clear so saradc_int_clr()'s do/while loop exits.
+            base_cfg = self.state.saradc_cfg & ~((1 << 28) | (1 << 30) | 0x180)
+            if (self.is_bk7231 or self.is_bk7252) and self.state.saradc_pending:
+                cfg = base_cfg
+            else:
+                cfg = base_cfg | (1 << 28) | (1 << 30)
+            mu.mem_write(address, struct.pack("<I", cfg & 0xFFFFFFFF))
             return
 
         # BK7231N/BK7252 SARADC_ADC_CTRL_CFG (0x00802c08). Newer SDK builds
@@ -2802,10 +2861,13 @@ class BekenEmulator:
 
         # BK7238/BK7252N SARADC state register (SARADC_ADC_STATE). Its driver
         # drains the sample FIFO with `while(!(STATE & FIFO_EMPTY)) read DATA;`
-        # spin loops during init; report FIFO_EMPTY (bit 30) so they terminate
-        # immediately. Actual sampling is interrupt-driven, never polled here.
-        if address == 0x00802c0c and not self.is_bk7252:
-            mu.mem_write(address, struct.pack("<I", 1 << 30))
+        # spin loops; report FIFO_EMPTY (bit 30) once saradc_pending == 0, and
+        # clear while samples pend so saradc_isr drains them.
+        if address == 0x00802c0c and not (self.is_bk7231 or self.is_bk7252):
+            stat = self.state.saradc_state_reg & ~((1 << 30) | (1 << 31) | 0x28010)
+            if not self.state.saradc_pending:
+                stat |= (1 << 30)
+            mu.mem_write(address, struct.pack("<I", stat))
             return
 
         # BK7251/BK7252 SDCard controller (0x00802d00..0x00802d3c). Camera
@@ -2902,14 +2964,16 @@ class BekenEmulator:
             return
             
         if address == 0x00802c04 or address == 0x00802c10:
-            # SARADC sample registers: DATA (0x802c04) and DAT_AFTER_STA
-            # (0x802c10, the one BK7231N's ISR actually reads). Each read
-            # consumes one pending FIFO sample and returns a plausible raw value
-            # (330 -> roughly +30C through the BK7231N temperature formula).
-            if self.state.saradc_pending:
-                self.state.saradc_pending -= 1
-            mu.mem_write(address, struct.pack("<I", 330))
-            return
+            # SARADC sample registers: DATA (0x802c04 on BK7231/BK7252) and
+            # DAT_AFTER_STA / BK7238 DATA (0x802c10). Each read consumes one
+            # pending FIFO sample and returns the configured channel's raw
+            # value (default 330 -> roughly +30C on BK7231N ch7).
+            if self.is_bk7231 or self.is_bk7252 or address == 0x00802c10:
+                if self.state.saradc_pending:
+                    self.state.saradc_pending -= 1
+                val = self._saradc_sample_for(self.state.saradc_channel)
+                mu.mem_write(address, struct.pack("<I", val))
+                return
 
         if address == 0x00803004:
             if hasattr(self.flash_state, 'data'):
@@ -3103,12 +3167,7 @@ class BekenEmulator:
             app_img = self._patch_ldm_caret_stubs(self.app)
             self.mu.mem_write(0x00010000, app_img)
 
-        self.mu.mem_write(self.UART1_FIFO_STATUS, struct.pack("<I", 1 << 17 | 1 << 19 | 1 << 20))
-        self.mu.mem_write(self.UART2_FIFO_STATUS, struct.pack("<I", 1 << 17 | 1 << 19 | 1 << 20))
-
-        SARADC_ADC_CONFIG = 0x00802c00
-        self.mu.mem_write(SARADC_ADC_CONFIG, struct.pack("<I", 1 << 28 | 1 << 30))
-        self.mu.mem_write(self.WDT_CTRL, struct.pack("<I", 0))
+        self._write_mmio_reset_defaults()
 
         # Mirror the raw flash at the SPI-flash window. Cap the size so it can
         # never run into the RAM region: dumps larger than 2MB (e.g. 4MB BK7238
@@ -3295,9 +3354,14 @@ class BekenEmulator:
                             ("ejpeg_dma_node_len", 0), ("ejpeg_tick_div", 0),
                             ("camera_frame_count", 0), ("camera_last_jpeg", b""),
                             ("camera_frame_rgb", b""), ("camera_width", 640),
-                            ("camera_height", 480), ("gdma_remain", {})):
+                            ("camera_height", 480), ("gdma_remain", {}),
+                            ("saradc_cfg2", 0), ("saradc_state_reg", 0),
+                            ("saradc_channel", None), ("saradc_last_raw", None),
+                            ("saradc_conversions", 0), ("saradc_reads", 0),
+                            ("adc_samples", {})):
             if not hasattr(self.state, name):
                 setattr(self.state, name, value)
+        self.state.adc_samples.update(self.adc_inputs)
         if not hasattr(self.state, "gpio_hw"):
             # BKSNAP01 predates the GPIO model.  Preserve its register state as
             # far as that format permits: INTEN/INTLV were formerly ordinary
@@ -3324,21 +3388,16 @@ class BekenEmulator:
         self._network_insn_offset = snap.get("network_insn_offset", 0)
         if snap["blecore"] is not None:
             self.blecore = snap["blecore"]
-            self.blecore.mem = (lambda addr, size: self.mu.mem_read(addr, size),
-                                lambda addr, data: self.mu.mem_write(addr, bytes(data)))
+            self.blecore.mem = self._guest_mem_callbacks()
         if snap["wifimac"] is not None:
             peer = self.wifi_peer
             self.wifimac = snap["wifimac"]
-            self.wifimac.mem = (lambda addr, size: self.mu.mem_read(addr, size),
-                                lambda addr, data: self.mu.mem_write(addr, bytes(data)))
+            self.wifimac.mem = self._guest_mem_callbacks()
             self.wifimac.log = self.net_log      # not _print: --only-uart silences that
             self.wifimac.debug = bool(os.environ.get("WIFIDBG"))
             if peer is not None:
                 # a peer attached before the load binds to the restored MAC
-                self.wifimac.on_tx = peer.on_device_tx
-                peer.inject = lambda f, decr=None: self.wifimac.inject(
-                    f, self.state.insn_count, decr=decr)
-                peer.now_us = self._network_now_us
+                self._bind_wifi_peer(peer)
         # The run starts where the snapshot was taken: a block boundary.
         pc = self.mu.reg_read(UC_ARM_REG_PC)
         cpsr = self.mu.reg_read(UC_ARM_REG_CPSR)

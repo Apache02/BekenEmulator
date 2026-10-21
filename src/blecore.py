@@ -300,7 +300,10 @@ class BleCore:
         base = self.em_base()
         if not base:
             return
-        from Crypto.Cipher import AES      # pycryptodome, see requirements.txt
+        try:
+            from Crypto.Cipher import AES      # pycryptodome, see requirements.txt
+        except ImportError:
+            from Cryptodome.Cipher import AES
         key_le = b"".join((self.regs.get(k, 0) & 0xFFFFFFFF).to_bytes(4, "little")
                           for k in AESKEY)
         ptr = base + (self.regs.get(AESPTR, 0) & 0xFFFF)
