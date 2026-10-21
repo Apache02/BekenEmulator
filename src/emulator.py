@@ -16,60 +16,14 @@ try:
     from . import wifimac as _wifimac
     from . import gpio as _gpio
     from . import periph as _periph
+    from .chips import DEFAULT_CHIP
 except ImportError:
     import tuyamcu as _tuyamcu
     import blecore as _blecore
     import wifimac as _wifimac
     import gpio as _gpio
     import periph as _periph
-
-# Known chip identities served from the SCTRL id registers (0x00800000 chip
-# id, 0x00800004 device id), selectable with --chip. Values extracted from
-# each OpenBeken firmware's bk_check_chip_id (which hangs forever on a
-# mismatch after printing "Unsupported chip or dev"). BK7231T-era firmwares
-# do not check these registers at all, so the BK7231 default is safe for them.
-CHIP_FAMILIES = {
-    "BK7231": (0x0007231A, 0x18520001),   # BK7231T/U family (default)
-    # Same served ID as the generic family, but a distinct selection lets the
-    # emulator expose the U variant's GPIO32..39 bank without mapping those
-    # addresses as pins for BK7231T firmware.
-    "BK7231U": (0x0007231A, 0x18520001),
-    # BK7231N/M silicon's own identity (sys_ctrl.h: CHIP_ID_BK7231N,
-    # DEVICE_ID_BK7231N_A). Most N-family builds run fine on the default
-    # above, but newer SDK builds check it: their bk_check_chip_id accepts
-    # chip 0x7231C with device 0x2015xxxx / 0x2052xxxx / 0x20A2xxxx only, and
-    # hangs after "Unsupported chip or dev (7231a.18520001)" otherwise (VeSync
-    # plug 1.0.02, ChinaMobile HeJiaQin plug). Not the default because the
-    # real id also selects the full BK7231N RF calibration (bk7231N_cal.c),
-    # which measures test tones through the unmodelled RC block at 0x01050000
-    # between thousands of busy-wait delays: still inside calibration_main
-    # after 70M instructions. Fine where the check demands it; slow otherwise.
-    "BK7231N": (0x0007231C, 0x20521023),
-    "BK7238": (0x00007238, 0x21128000),   # accepts dev 0x2112xxxx or 0x2206xxxx
-    "BK7252": (0x0007221A, 0x18221020),   # BK7252 = BK7221U silicon
-    "BK7252N": (0x0007252A, 0x23A18000),  # accepts dev 0x23A1xxxx or 0x2431xxxx
-}
-
-# BLE core generation per chip id (CFG_BLE_VERSION in each chip's
-# sys_config_*.h).  The generic BK7231 identity is deliberately present for
-# the legacy --ble-core override: it is shared by T/U firmware (BLE 4.2, not
-# modelled) and many N/M/BL2028N images (BLE 5.1), so the identity alone cannot
-# safely turn the 5.1 model on.  The distinct BK7231N and BK7238 identities are
-# unambiguous and get their real BLE 5.x hardware automatically. BK7252 and
-# BK7252N have no modelled 5.x core; on BK7252 0x900000 is SDRAM.
-BLE_CORE_LAYOUTS = {
-    CHIP_FAMILIES["BK7231"][0]: "5.1",
-    CHIP_FAMILIES["BK7231N"][0]: "5.1",
-    CHIP_FAMILIES["BK7238"][0]: "5.2",
-}
-AUTO_BLE_CORE_CHIP_IDS = frozenset((
-    CHIP_FAMILIES["BK7231N"][0],
-    CHIP_FAMILIES["BK7238"][0],
-))
-
-# Chip ids that are the BK7231 die (T/U/N/M): same SARADC layout, and the
-# pwm_new block on N/M.
-BK7231_CHIP_IDS = (CHIP_FAMILIES["BK7231"][0], CHIP_FAMILIES["BK7231N"][0])
+    from chips import DEFAULT_CHIP
 
 # Instructions between raises of the guest's periodic timer (see hook_block),
 # and the slice of DEVICE time one such tick stands for. Together they are the
@@ -346,14 +300,15 @@ class BekenEmulator:
     # Hardware base addresses
     FLASH_BASE = 0x00000000
     FLASH_SIZE = 2 * 1024 * 1024
-    RAM_BASE = 0x00400000
-    RAM_SIZE = 1 * 1024 * 1024
     MMIO_BASE = 0x00800000
     MMIO_SIZE = 0x010000
     PERIPH_BASE = 0xc0000000
     PERIPH_SIZE = 0x100000
     SPI_FLASH_BASE = 0x00200000
     XVR_BASE = 0x00900000
+    EJPEG_FIFO = {"v1": 0x0080A014, "v2": 0x00A03014}   # RX FIFO per EJPEG variant
+    EJPEG2_BASE = 0x00A00000      # EJPEG v2 block (registers at 0x00A03000)
+    EJPEG2_SIZE = 0x10000
     ACCEL_BASE = 0x00810000
     PWM_BASE = 0x00802A00
     # pwm_new (0x802B00, three groups of 0x40): REG_PWM_GROUP_CTRL and
@@ -415,10 +370,10 @@ class BekenEmulator:
     WDT_SECOND_KEY = 0xA5
     WDT_INSNS_PER_MS = SLOW_TICK_INSNS // SLOW_TICK_MS
 
-    def __init__(self, raw_flash, bootloader, app, with_boot=False, only_uart=False, chip_identity=None, uart1_hex=False, physical_flash=None, uart1_rx=b"", uart1_rx_delay=CONSOLE_RX_HOLDOFF_INSNS, tuyamcu_enabled=False, tuyamcu_pid=None, tuyamcu_raw=False, xvr_selfclear=False, tuyamcu_dps=None, tuyamcu_injects=None, uart_sink=None, ble_core=None, wifi=False, exception_vector_base=0, chip_variant=None, deep_sleep_wakes=None, gpio_inputs=None):
+    def __init__(self, raw_flash, bootloader, app, with_boot=False, only_uart=False, chip=None, uart1_hex=False, physical_flash=None, uart1_rx=b"", uart1_rx_delay=CONSOLE_RX_HOLDOFF_INSNS, tuyamcu_enabled=False, tuyamcu_pid=None, tuyamcu_raw=False, xvr_selfclear=False, tuyamcu_dps=None, tuyamcu_injects=None, uart_sink=None, ble_core=None, wifi=False, exception_vector_base=0, deep_sleep_wakes=None, gpio_inputs=None):
         self.raw_flash = raw_flash
         self.xvr_selfclear = xvr_selfclear
-        self.chip_variant = (chip_variant or "").strip().upper()
+        self.chip = chip or DEFAULT_CHIP
         # Opt-in RivieraWaves Wi-Fi MAC model over 0xC0000000 (src/wifimac.py).
         # Off, the block is plain memory and the firmware's Wi-Fi stack comes up
         # but can never move a frame or see time pass; on, TX/RX descriptors,
@@ -460,18 +415,17 @@ class BekenEmulator:
         # for diagnostics.  A modelled controller gets a slot clock, wake-ups,
         # interrupt registers and the BLE/BTDM FIQ lines (ICU bits 29/30).
         self.blecore = None
-        chip_id = (chip_identity or CHIP_FAMILIES["BK7231"])[0]
-        layout = BLE_CORE_LAYOUTS.get(chip_id)
+        layout = self.chip.ble_core
         self._ble_layout = layout
-        if ble_core is True and (layout is None or self.chip_variant == "BK7231U"):
+        if ble_core is True and layout is None:
             raise ValueError("--ble-core models the BLE 5.x core of BK7231N/M (5.1) and "
                              "BK7238 (5.2); this chip has no such core.")
         want_ble_core = (ble_core is True or
-                         (ble_core is None and chip_id in AUTO_BLE_CORE_CHIP_IDS))
+                         (ble_core is None and self.chip.ble_auto))
         if want_ble_core:
-            # The auto set is a strict subset of BLE_CORE_LAYOUTS; keep this
-            # assertion close to selection so a future chip addition cannot
-            # accidentally instantiate a layout-less core.
+            # Auto chips must have a BLE layout; keep this assertion close to
+            # selection so a future chip file cannot accidentally instantiate
+            # a layout-less core.
             if layout is None:
                 raise ValueError("--ble-core models the BLE 5.x core of BK7231N/M (5.1) and "
                                  "BK7238 (5.2); this chip has no such core.")
@@ -615,28 +569,12 @@ class BekenEmulator:
         # runs are not polluted, and the emit is throttled + piggybacks the
         # existing slow tick, so it never touches the per-block hot path.
         self._emit_insns = bool(os.environ.get("EMU_REPORT"))
-        self.chip_id_value, self.device_id_value = chip_identity or CHIP_FAMILIES["BK7231"]
-        # BK7252 (BK7221U silicon, the A9-style WiFi cameras) is the odd one
-        # out of the Beken family: it has external SDRAM at 0x00900000, and its
-        # RT-Thread firmware puts the whole system heap there
-        # (rt_system_heap_init(RT_HW_SDRAM_BEGIN=0x900000, +256K)). On every
-        # other supported chip 0x900000 is the XVR register block instead. So
-        # this flag switches that window between "RAM" and "XVR registers".
-        self.is_bk7252 = (self.chip_id_value == CHIP_FAMILIES["BK7252"][0])
-        self.is_bk7252n = (self.chip_id_value == CHIP_FAMILIES["BK7252N"][0])
-        self.has_extended_gpio = (self.is_bk7252 or self.chip_variant == "BK7231U")
-        self.gpio_pin_count = (self.GPIO_EXT_PIN_FIRST + self.GPIO_EXT_PIN_COUNT
-                               if self.has_extended_gpio else self.GPIO_PIN_COUNT)
-        # Chips whose 0x802B00 block is pwm_new (pwm_bk7231n.c). On the 7252
-        # family the same window is the audio block. The BK7231 identity also
-        # covers T/U, which never touch 0x802B00, so modelling it there is inert.
-        self.has_pwm_new = self.chip_id_value in BK7231_CHIP_IDS + (CHIP_FAMILIES["BK7238"][0],)
-        # The BK7231 SARADC model (CHNL_EN arms a sample batch) applies to the
-        # whole BK7231 die, whichever of its identities is served.
-        self.is_bk7231 = self.chip_id_value in BK7231_CHIP_IDS
+        self.chip_id_value, self.device_id_value = self.chip.chip_id, self.chip.dev_id
+        self.ram_base, self.ram_size = self.chip.ram_base, self.chip.ram_size
+        self.gpio_pin_count = self.chip.gpio_pins
 
         self.state = SimulatorState()
-        if self.is_bk7252n:
+        if self.chip.i2c == "v2":
             self.state.hw_i2c[1]["v2"] = True
         if self.gpio_pin_count != self.state.gpio_hw.pin_count:
             self.state.gpio_hw = _gpio.GpioModel(self.gpio_pin_count)
@@ -740,7 +678,7 @@ class BekenEmulator:
     def _rx_ready_for_console(self):
         """Hold back console commands on RT-Thread until FinSH prints msh />."""
         state = self.state
-        if state.rtt_boot_seen or ((self.is_bk7252 or self.is_bk7252n) and not state.obk_boot_seen):
+        if state.rtt_boot_seen or (self.chip.rtthread_console and not state.obk_boot_seen):
             if state.msh_prompt_seen:
                 return True
             if state.rx_next_line_insn:
@@ -915,7 +853,7 @@ class BekenEmulator:
         # This helper is reached from the hooks for every MMIO access in the
         # system.  Reject the overwhelmingly common non-GPIO case before doing
         # alignment or division work.
-        end = self.GPIO_EXT_PIN_END if self.has_extended_gpio else self.GPIO_PIN_END
+        end = self.GPIO_EXT_PIN_END if self.chip.gpio_pins > self.GPIO_PIN_COUNT else self.GPIO_PIN_END
         if address < self.GPIO_BASE or address >= end:
             return None
         if address & 3:
@@ -923,7 +861,7 @@ class BekenEmulator:
         slot = (address - self.GPIO_BASE) // 4
         if 0 <= slot < self.GPIO_PIN_COUNT:
             return slot
-        if (self.has_extended_gpio and self.GPIO_EXT_SLOT_FIRST <= slot
+        if (self.chip.gpio_pins > self.GPIO_PIN_COUNT and self.GPIO_EXT_SLOT_FIRST <= slot
                 < self.GPIO_EXT_SLOT_FIRST + self.GPIO_EXT_PIN_COUNT):
             return self.GPIO_EXT_PIN_FIRST + (slot - self.GPIO_EXT_SLOT_FIRST)
         return None
@@ -970,12 +908,12 @@ class BekenEmulator:
 
         gpio_hw = _gpio.GpioModel(self.gpio_pin_count)
         enabled = word(self.GPIO_INTEN)
-        if self.has_extended_gpio:
+        if self.chip.gpio_pins > self.GPIO_PIN_COUNT:
             enabled |= (word(self.GPIO_INTEN2) & 0xFF) << 32
         gpio_hw.write_enable(enabled)
         gpio_hw.write_mode_word(0, word(self.GPIO_INTLV0))
         gpio_hw.write_mode_word(16, word(self.GPIO_INTLV1))
-        if self.has_extended_gpio:
+        if self.chip.gpio_pins > self.GPIO_PIN_COUNT:
             gpio_hw.write_mode_word(32, word(self.GPIO_INTLV3), count=8)
             for pin in range(self.GPIO_EXT_PIN_FIRST,
                              self.GPIO_EXT_PIN_FIRST + self.GPIO_EXT_PIN_COUNT):
@@ -1059,6 +997,25 @@ class BekenEmulator:
                 lambda addr, size: self.mu.mem_read(addr, size),
                 lambda addr, data: self.mu.mem_write(addr, bytes(data)))
 
+    def _chip_windows(self):
+        """(base, size, hooked) of the regions this chip adds to the common map.
+
+        The 0x900000 window is external SDRAM where the chip has it (BK7252: the
+        RT-Thread system heap lives there, so it is plain RAM and must not get
+        the XVR hooks, which would answer heap reads with fake register values
+        and wreck the free list). Otherwise it is the XVR (RF transceiver)
+        register block: one hooked page, so the 0x900100 transaction trigger
+        reads back as always-complete. The EJPEG v2 block is registers.
+        """
+        windows = []
+        if self.chip.sdram:
+            windows.append((self.chip.sdram[0], self.chip.sdram[1], False))
+        elif self.chip.xvr:
+            windows.append((self.XVR_BASE, 0x1000, True))
+        if self.chip.ejpeg == "v2":
+            windows.append((self.EJPEG2_BASE, self.EJPEG2_SIZE, True))
+        return windows
+
     def _watchdog_reset(self):
         """Apply a chip reset and leave the emulator ready for a fresh boot."""
         if self._power_on_context is None:
@@ -1070,13 +1027,11 @@ class BekenEmulator:
         gpio_inputs = dict(self.state.gpio_hw.inputs)
         self._network_insn_offset += self.state.insn_count
 
-        self.mu.mem_write(self.RAM_BASE, b"\x00" * self.RAM_SIZE)
+        self.mu.mem_write(self.ram_base, b"\x00" * self.ram_size)
         self.mu.mem_write(self.MMIO_BASE, b"\x00" * self.MMIO_SIZE)
         self.mu.mem_write(self.PERIPH_BASE, b"\x00" * self.PERIPH_SIZE)
-        self.mu.mem_write(self.XVR_BASE,
-                          b"\x00" * (0x40000 if self.is_bk7252 else 0x1000))
-        if self.is_bk7252n:
-            self.mu.mem_write(0x00A00000, b"\x00" * 0x10000)
+        for base, size, _hooked in self._chip_windows():
+            self.mu.mem_write(base, b"\x00" * size)
         self.mu.mem_write(self.ACCEL_BASE, b"\x00" * 0x1000)
         self.mu.mem_write(self.UART1_FIFO_STATUS,
                           struct.pack("<I", 1 << 17 | 1 << 19 | 1 << 20))
@@ -1087,7 +1042,7 @@ class BekenEmulator:
         self.mu.context_restore(self._power_on_context)
 
         self.state = SimulatorState()
-        if self.is_bk7252n:
+        if self.chip.i2c == "v2":
             self.state.hw_i2c[1]["v2"] = True
         if self.gpio_pin_count != self.state.gpio_hw.pin_count:
             self.state.gpio_hw = _gpio.GpioModel(self.gpio_pin_count)
@@ -1263,13 +1218,11 @@ class BekenEmulator:
         reason, pin = self._resolve_wake_spec((reason, pin), info)
         self._network_insn_offset += old.insn_count
 
-        self.mu.mem_write(self.RAM_BASE, b"\x00" * self.RAM_SIZE)
+        self.mu.mem_write(self.ram_base, b"\x00" * self.ram_size)
         self.mu.mem_write(self.MMIO_BASE, b"\x00" * self.MMIO_SIZE)
         self.mu.mem_write(self.PERIPH_BASE, b"\x00" * self.PERIPH_SIZE)
-        self.mu.mem_write(self.XVR_BASE,
-                          b"\x00" * (0x40000 if self.is_bk7252 else 0x1000))
-        if self.is_bk7252n:
-            self.mu.mem_write(0x00A00000, b"\x00" * 0x10000)
+        for base, size, _hooked in self._chip_windows():
+            self.mu.mem_write(base, b"\x00" * size)
         self.mu.mem_write(self.ACCEL_BASE, b"\x00" * 0x1000)
         self.mu.mem_write(self.UART1_FIFO_STATUS,
                           struct.pack("<I", 1 << 17 | 1 << 19 | 1 << 20))
@@ -1280,7 +1233,7 @@ class BekenEmulator:
         self.mu.context_restore(self._power_on_context)
 
         new_state = SimulatorState()
-        if self.is_bk7252n:
+        if self.chip.i2c == "v2":
             new_state.hw_i2c[1]["v2"] = True
         if self.gpio_pin_count != new_state.gpio_hw.pin_count:
             new_state.gpio_hw = _gpio.GpioModel(self.gpio_pin_count)
@@ -1713,7 +1666,7 @@ class BekenEmulator:
                       or (state.ejpeg_reg1 & (1 << 4)))
         if not enc_en:
             return
-        fiq_mask = (1 << 23) if self.is_bk7252n else ((1 << 23) | (1 << 29))
+        fiq_mask = (1 << 23) if self.chip.ejpeg == "v2" else ((1 << 23) | (1 << 29))
         fiq_bits = state.icu_int_enable & fiq_mask
         if not fiq_bits:
             return
@@ -1972,11 +1925,11 @@ class BekenEmulator:
                 pwm_ctl = state.pwm_regs.get(0, 0)
                 state.pwm_status |= self._old_pwm_timer_status_mask(pwm_ctl)
             if state.icu_int_enable & (1 << 8): # BKTIMER (OpenBK + BK7252 camera Timer 5)
-                if self.is_bk7252 or self.is_bk7252n:
+                if self.chip.bktimer_v2:
                     state.timer3_5_ctl |= (((state.timer3_5_ctl & 0x7) or 0x1) << 7)
                 else:
                     state.timer3_5_ctl |= (1 << 7) # Set Timer 3 Int Status
-            if ((self.is_bk7252 or self.is_bk7252n)
+            if (self.chip.audio is not None
                     and (state.icu_int_enable & (1 << 10))
                     and (state.audio_fifo_conf & 0x3C)):
                 state.audio_dac_writes = 0
@@ -2114,7 +2067,7 @@ class BekenEmulator:
 
     def _gdma_channel(self, address):
         """Channel number if address is a GDMA CONF register, else None."""
-        if self.is_bk7252n:
+        if self.chip.gdma == "v2":
             if not (0x00809040 <= address < 0x00809240):
                 return None
             channel, within = divmod(address - 0x00809040, 0x40)
@@ -2143,7 +2096,7 @@ class BekenEmulator:
         """
         length = ((conf >> self.GDMA_TRANS_LEN_POSI) & 0xFFFF) + 1
         base = (0x00809040 + channel * 0x40
-                if self.is_bk7252n
+                if self.chip.gdma == "v2"
                 else self.GDMA_BASE + channel * self.GDMA_CH_STRIDE)
         try:
             dst = struct.unpack("<I", mu.mem_read(base + 0x04, 4))[0]
@@ -2172,8 +2125,8 @@ class BekenEmulator:
             except UcError:
                 pass
         elif (not (conf & self.GDMA_SRCADDR_INC) and (conf & self.GDMA_DSTADDR_INC)
-              and (src in (0x0080A014, 0x00A03014) or dst >= 0x00400000)):
-            # EJPEG RX FIFO (0x0080A014 / 0x00A03014) -> circular RAM/SDRAM destination buffer.
+              and (src == self.EJPEG_FIFO.get(self.chip.ejpeg) or dst >= 0x00400000)):
+            # EJPEG RX FIFO -> circular RAM/SDRAM destination buffer.
             self.state.ejpeg_dma_ch = channel
             self.state.ejpeg_dma_dst = dst
             self.state.ejpeg_dma_node_len = length
@@ -2198,7 +2151,7 @@ class BekenEmulator:
         if 0x00802600 <= address < 0x0080260C:
             self._hw_i2c_write(2, address - 0x00802600, value)
             return
-        if 0x0080A000 <= address < 0x0080A100:
+        if self.chip.ejpeg == "v1" and 0x0080A000 <= address < 0x0080A100:
             off = address - 0x0080A000
             if off == 0x00:
                 self.state.ejpeg_reg0 = value & 0xFFFFFFFF
@@ -2228,7 +2181,7 @@ class BekenEmulator:
             except Exception:
                 pass
             return
-        if 0x00A03000 <= address < 0x00A05000:
+        if self.chip.ejpeg == "v2" and 0x00A03000 <= address < 0x00A05000:
             if address < 0x00A03100:
                 off = address - 0x00A03000
                 if off == 0x08:
@@ -2329,14 +2282,14 @@ class BekenEmulator:
         elif address == self.GPIO_INTSTA:
             self.state.gpio_hw.clear_status(value & 0xFFFFFFFF)
             self._sync_gpio_irq(self.state)
-        elif self.has_extended_gpio and address == self.GPIO_INTEN2:
+        elif self.chip.gpio_pins > self.GPIO_PIN_COUNT and address == self.GPIO_INTEN2:
             low = self.state.gpio_hw.int_enable & 0xFFFFFFFF
             self.state.gpio_hw.write_enable(low | ((value & 0xFF) << 32))
             self._sync_gpio_irq(self.state)
-        elif self.has_extended_gpio and address == self.GPIO_INTLV3:
+        elif self.chip.gpio_pins > self.GPIO_PIN_COUNT and address == self.GPIO_INTLV3:
             self.state.gpio_hw.write_mode_word(32, value, count=8)
             self._sync_gpio_irq(self.state)
-        elif self.has_extended_gpio and address == self.GPIO_INTSTA2:
+        elif self.chip.gpio_pins > self.GPIO_PIN_COUNT and address == self.GPIO_INTSTA2:
             self.state.gpio_hw.clear_status((value & 0xFF) << 32)
             self._sync_gpio_irq(self.state)
         elif address in (self.GPIO_FUNC_CFG, self.GPIO_FUNC_CFG_2, self.GPIO_FUNC_CFG_3):
@@ -2355,7 +2308,7 @@ class BekenEmulator:
         # in pwm_regs are therefore pwm_new registers. On 7252-family chips
         # 0x802B00 is the audio block instead, so the DECODER gates on chip
         # identity - capture here just records writes.
-        if address in self.PWMN_CTRL_REGS and self.has_pwm_new:
+        if address in self.PWMN_CTRL_REGS and self.chip.pwm == "v2":
             # Write-1-to-clear the group's interrupt status (see the read hook).
             group = (address - self.PWMN_BASE) >> 6
             self.state.pwmn_seen = True
@@ -2367,7 +2320,7 @@ class BekenEmulator:
             if self._emit_insns:
                 self.state.pwm_dirty.add(_off)
 
-        if self.is_bk7252 or self.is_bk7252n:
+        if self.chip.audio is not None:
             if address == 0x00802B08:
                 self.state.audio_fifo_conf = value & 0xFFFFFFFF
                 if not (value & 0x3C):
@@ -2515,7 +2468,7 @@ class BekenEmulator:
                 sys.__stderr__.flush()
             # The BK7231(T/U/N/M) and BK7252 (SOC_BK7221U) SARADC layouts use
             # this model; the 7238/7252N layout differs and is served via 0x802c0c.
-            if self.is_bk7231 or self.is_bk7252:
+            if self.chip.saradc in ("v1", "v2"):
                 if value & (1 << 2):                # CHNL_EN: start converting
                     if self.state.saradc_pending == 0:
                         self.state.saradc_pending = 32
@@ -2602,7 +2555,7 @@ class BekenEmulator:
             val = self._hw_i2c_read(2, address - 0x00802600)
             mu.mem_write(address, struct.pack("<I", val & 0xFFFFFFFF))
             return
-        if 0x0080A000 <= address < 0x0080A100:
+        if self.chip.ejpeg == "v1" and 0x0080A000 <= address < 0x0080A100:
             off = address - 0x0080A000
             if off == 0x00:
                 mu.mem_write(address, struct.pack("<I", self.state.ejpeg_reg0))
@@ -2617,7 +2570,7 @@ class BekenEmulator:
             elif off == 0x1C:
                 mu.mem_write(address, struct.pack("<I", self.state.ejpeg_frame_len))
             return
-        if 0x00A03000 <= address < 0x00A05000:
+        if self.chip.ejpeg == "v2" and 0x00A03000 <= address < 0x00A05000:
             if address == 0x00A03008:
                 mu.mem_write(address, struct.pack("<I", self.state.ejpeg_reg0))
             elif address == 0x00A03018:
@@ -2681,7 +2634,7 @@ class BekenEmulator:
         # reports USB 5V power present so battery-powered cameras (CYCAM/T99)
         # stay awake and boot their application instead of shutting down into
         # deep sleep when the power button is not held.
-        if address == 0x00800084 and self.is_bk7252:
+        if address == 0x00800084 and self.chip.usb_plug_wake:
             cur = struct.unpack("<I", mu.mem_read(address, 4))[0]
             mu.mem_write(address, struct.pack("<I", cur | (1 << 21)))
             return
@@ -2725,15 +2678,15 @@ class BekenEmulator:
         if address == self.GPIO_INTSTA:
             mu.mem_write(address, struct.pack("<I", self.state.gpio_hw.int_status & 0xFFFFFFFF))
             return
-        if self.has_extended_gpio and address == self.GPIO_INTEN2:
+        if self.chip.gpio_pins > self.GPIO_PIN_COUNT and address == self.GPIO_INTEN2:
             mu.mem_write(address, struct.pack("<I",
                                               (self.state.gpio_hw.int_enable >> 32) & 0xFF))
             return
-        if self.has_extended_gpio and address == self.GPIO_INTLV3:
+        if self.chip.gpio_pins > self.GPIO_PIN_COUNT and address == self.GPIO_INTLV3:
             mu.mem_write(address, struct.pack("<I",
                                               self.state.gpio_hw.read_mode_word(32, count=8)))
             return
-        if self.has_extended_gpio and address == self.GPIO_INTSTA2:
+        if self.chip.gpio_pins > self.GPIO_PIN_COUNT and address == self.GPIO_INTSTA2:
             mu.mem_write(address, struct.pack("<I",
                                               (self.state.gpio_hw.int_status >> 32) & 0xFF))
             return
@@ -2752,7 +2705,7 @@ class BekenEmulator:
         # bits clear, i.e. the count already latched; RD_DATA itself stays
         # plain memory. Gated to the chips whose 0x802B00 block is pwm_new; on
         # the 7252 family it is the audio block.
-        if address in self.PWM_CPU_REGS and self.has_pwm_new:
+        if address in self.PWM_CPU_REGS and self.chip.pwm == "v2":
             cur = struct.unpack("<I", mu.mem_read(address, 4))[0]
             mu.mem_write(address, struct.pack("<I", cur & ~0x3))
             return
@@ -2761,7 +2714,7 @@ class BekenEmulator:
         # and plain memory would keep them set - its PWM ISR then sees a
         # phantom capture interrupt, acks it and spins forever waiting for the
         # ack to take. CFG_UPDATA reads back clear: the new config is latched.
-        if address in self.PWMN_CTRL_REGS and self.has_pwm_new:
+        if address in self.PWMN_CTRL_REGS and self.chip.pwm == "v2":
             group = (address - self.PWMN_BASE) >> 6
             cur = struct.unpack("<I", mu.mem_read(address, 4))[0]
             stat = ((self.state.pwmn_stat >> (2 * group)) & 0x3) << 30
@@ -2785,7 +2738,7 @@ class BekenEmulator:
             # clear while samples pend so the ISR's `while((cfg & FIFO_EMPTY)==0)`
             # loop reads them. INT_CLR (bit 7/8) is deliberately never reflected,
             # so saradc_int_clr()'s do/while exits.
-            cfg = 0 if ((self.is_bk7231 or self.is_bk7252)
+            cfg = 0 if ((self.chip.saradc in ("v1", "v2"))
                         and self.state.saradc_pending) else ((1 << 28) | (1 << 30))
             mu.mem_write(address, struct.pack("<I", cfg))
             return
@@ -2795,7 +2748,7 @@ class BekenEmulator:
         # HeJiaQin) set bit 8 (0x100) here during calibration_main's SARADC
         # reads and spin on `while (REG_READ(0x802c08) & 0x100)` waiting for
         # hardware to clear the trigger bit.
-        if address == 0x00802c08 and (self.is_bk7231 or self.is_bk7252):
+        if address == 0x00802c08 and (self.chip.saradc in ("v1", "v2")):
             cur = struct.unpack("<I", mu.mem_read(address, 4))[0]
             mu.mem_write(address, struct.pack("<I", cur & ~0x100))
             return
@@ -2804,7 +2757,7 @@ class BekenEmulator:
         # drains the sample FIFO with `while(!(STATE & FIFO_EMPTY)) read DATA;`
         # spin loops during init; report FIFO_EMPTY (bit 30) so they terminate
         # immediately. Actual sampling is interrupt-driven, never polled here.
-        if address == 0x00802c0c and not self.is_bk7252:
+        if address == 0x00802c0c and self.chip.saradc != "v2":
             mu.mem_write(address, struct.pack("<I", 1 << 30))
             return
 
@@ -2928,7 +2881,7 @@ class BekenEmulator:
                 # wait-for-completion spin exits.
                 mu.mem_write(address, struct.pack("<I", self.state.gdma_conf[channel]))
                 return
-            if self.is_bk7252n and 0x00809040 <= address < 0x00809240:
+            if self.chip.gdma == "v2" and 0x00809040 <= address < 0x00809240:
                 ch, within = divmod(address - 0x00809040, 0x40)
                 if within == 0x30:
                     mu.mem_write(address, struct.pack("<I", self.state.gdma_remain.get(ch, 0) & 0x1FFFF))
@@ -2984,7 +2937,7 @@ class BekenEmulator:
             b = self.uart1_rx.pop(0)
             if (b == 0x0A and self.uart1_rx and self.tuyamcu is None
                     and (self.state.rtt_boot_seen
-                         or ((self.is_bk7252 or self.is_bk7252n) and not self.state.obk_boot_seen))):
+                         or (self.chip.rtthread_console and not self.state.obk_boot_seen))):
                 self.state.msh_prompt_seen = False
                 self.state.rx_next_line_insn = self.state.insn_count + 3_000_000
             if self._emit_insns:
@@ -2996,7 +2949,7 @@ class BekenEmulator:
             b = self.uart1_rx.pop(0)
             if (b == 0x0A and self.uart1_rx and self.tuyamcu is None
                     and (self.state.rtt_boot_seen
-                         or ((self.is_bk7252 or self.is_bk7252n) and not self.state.obk_boot_seen))):
+                         or (self.chip.rtthread_console and not self.state.obk_boot_seen))):
                 self.state.msh_prompt_seen = False
                 self.state.rx_next_line_insn = self.state.insn_count + 3_000_000
             mu.mem_write(address, struct.pack("<I", (b & 0xFF) << 8))
@@ -3014,7 +2967,7 @@ class BekenEmulator:
             mu.mem_write(address, struct.pack("<I", status))
             return
 
-        if (self.is_bk7252 or self.is_bk7252n) and address == 0x00802B38:
+        if self.chip.audio is not None and address == 0x00802B38:
             sta = ((1 << 18) | (1 << 19)) if (self.state.audio_fifo_conf & 0x3C) else 0
             if self.state.audio_dac_writes >= 256:
                 sta |= 0x4000 | 0x8000
@@ -3090,7 +3043,7 @@ class BekenEmulator:
 
     def setup(self):
         self.mu.mem_map(self.FLASH_BASE, self.FLASH_SIZE)
-        self.mu.mem_map(self.RAM_BASE, self.RAM_SIZE)
+        self.mu.mem_map(self.ram_base, self.ram_size)
         self.mu.mem_map(self.MMIO_BASE, self.MMIO_SIZE)
         self.mu.mem_map(self.PERIPH_BASE, self.PERIPH_SIZE)
         
@@ -3098,10 +3051,10 @@ class BekenEmulator:
         
         if self.bootloader:
             boot_img = self._patch_ldm_caret_stubs(self.bootloader)
-            self.mu.mem_write(0x00000000, boot_img)
+            self.mu.mem_write(self.chip.bootloader_addr, boot_img)
         if self.app:
             app_img = self._patch_ldm_caret_stubs(self.app)
-            self.mu.mem_write(0x00010000, app_img)
+            self.mu.mem_write(self.chip.app_addr, app_img)
 
         self.mu.mem_write(self.UART1_FIFO_STATUS, struct.pack("<I", 1 << 17 | 1 << 19 | 1 << 20))
         self.mu.mem_write(self.UART2_FIFO_STATUS, struct.pack("<I", 1 << 17 | 1 << 19 | 1 << 20))
@@ -3116,22 +3069,13 @@ class BekenEmulator:
         # before any code runs. Code/data live in the low 2MB, so the upper part
         # of the mirror is not needed for boot.
         spi_flash_size = (len(self.raw_flash) + 0xFFF) & ~0xFFF
-        spi_flash_size = min(spi_flash_size, self.RAM_BASE - self.SPI_FLASH_BASE)
+        spi_flash_size = min(spi_flash_size, self.ram_base - self.SPI_FLASH_BASE)
         self.mu.mem_map(self.SPI_FLASH_BASE, spi_flash_size)
         self.mu.mem_write(self.SPI_FLASH_BASE, self.raw_flash[:spi_flash_size])
 
-        # The 0x00900000 window. On BK7252 this is external SDRAM holding the
-        # RT-Thread heap, so back it with 256K of real RAM and DO NOT install
-        # the XVR register hooks below (they would answer heap reads with fake
-        # register values and wreck the free list). On every other chip it is
-        # the XVR (RF transceiver) register block: map one page and hook it so
-        # the 0x900100 transaction trigger reads back as always-complete.
-        if self.is_bk7252:
-            self.mu.mem_map(self.XVR_BASE, 0x40000)  # 256K SDRAM (heap)
-        else:
-            self.mu.mem_map(self.XVR_BASE, 0x1000)
-        if self.is_bk7252n:
-            self.mu.mem_map(0x00A00000, 0x10000)
+        windows = self._chip_windows()
+        for base, size, _hooked in windows:
+            self.mu.mem_map(base, size)
         # Accelerator block just past the main MMIO window (0x810000); mapped
         # and hooked so the 0x81001c transaction trigger can be served.
         self.mu.mem_map(self.ACCEL_BASE, 0x1000)
@@ -3140,12 +3084,10 @@ class BekenEmulator:
         self.mu.hook_add(UC_HOOK_MEM_READ, self.hook_mem_read_mmio, begin=self.MMIO_BASE, end=self.MMIO_BASE + self.MMIO_SIZE)
         self.mu.hook_add(UC_HOOK_MEM_WRITE, self.hook_mem_write_mmio, begin=self.PERIPH_BASE, end=self.PERIPH_BASE + self.PERIPH_SIZE)
         self.mu.hook_add(UC_HOOK_MEM_READ, self.hook_mem_read_mmio, begin=self.PERIPH_BASE, end=self.PERIPH_BASE + self.PERIPH_SIZE)
-        if not self.is_bk7252:
-            self.mu.hook_add(UC_HOOK_MEM_WRITE, self.hook_mem_write_mmio, begin=self.XVR_BASE, end=self.XVR_BASE + 0x1000)
-            self.mu.hook_add(UC_HOOK_MEM_READ, self.hook_mem_read_mmio, begin=self.XVR_BASE, end=self.XVR_BASE + 0x1000)
-        if self.is_bk7252n:
-            self.mu.hook_add(UC_HOOK_MEM_WRITE, self.hook_mem_write_mmio, begin=0x00A00000, end=0x00A10000)
-            self.mu.hook_add(UC_HOOK_MEM_READ, self.hook_mem_read_mmio, begin=0x00A00000, end=0x00A10000)
+        for base, size, hooked in windows:
+            if hooked:
+                self.mu.hook_add(UC_HOOK_MEM_WRITE, self.hook_mem_write_mmio, begin=base, end=base + size)
+                self.mu.hook_add(UC_HOOK_MEM_READ, self.hook_mem_read_mmio, begin=base, end=base + size)
         self.mu.hook_add(UC_HOOK_MEM_WRITE, self.hook_mem_write_mmio, begin=self.ACCEL_BASE, end=self.ACCEL_BASE + 0x1000)
         self.mu.hook_add(UC_HOOK_MEM_READ, self.hook_mem_read_mmio, begin=self.ACCEL_BASE, end=self.ACCEL_BASE + 0x1000)
         self.mu.hook_add(UC_HOOK_MEM_UNMAPPED, self.hook_unmapped)
@@ -3221,8 +3163,7 @@ class BekenEmulator:
                 "tuyamcu": self.tuyamcu,
                 "blecore": self.blecore,
                 "wifimac": self.wifimac,
-                "chip": (self.chip_id_value, self.device_id_value),
-                "chip_variant": self.chip_variant,
+                "chip": self.chip.name,
                 "ble_adv_seen": self._ble_adv_seen,
                 "trng_state": self.trng_state,
                 "network_insn_offset": self._network_insn_offset,
@@ -3243,11 +3184,9 @@ class BekenEmulator:
             snap = pickle.load(f)
         if snap.get("magic") != self.SNAPSHOT_MAGIC:
             raise ValueError("%s is not a snapshot of this emulator" % path)
-        if snap["chip"] != (self.chip_id_value, self.device_id_value):
-            raise ValueError("snapshot was taken with a different -chip identity")
-        if (snap.get("chip_variant") is not None
-                and snap["chip_variant"] != self.chip_variant):
-            raise ValueError("snapshot was taken with a different -chip variant")
+        if snap["chip"] != self.chip.name:
+            raise ValueError("snapshot was taken with a different -chip (%s, not %s)"
+                             % (snap["chip"], self.chip.name))
         if (snap["wifimac"] is None) != (self.wifimac is None):
             raise ValueError("snapshot was taken %s the Wi-Fi MAC model (--wifi); use the same option"
                              % ("with" if snap["wifimac"] is not None else "without"))
@@ -3558,34 +3497,35 @@ class BekenEmulator:
         pxStack up to the block, which the heap allocates right after it;
         anything else and idle skipping simply stays off for this firmware.
         """
-        ram = bytes(self.mu.mem_read(self.RAM_BASE, self.RAM_SIZE))
+        ram = bytes(self.mu.mem_read(self.ram_base, self.ram_size))
         for name in (b"IDLE\x00", b"idle\x00"):
             at = ram.find(name)
             while at >= 0:
                 tcb_off = at - 0x34
                 if tcb_off >= 0 and tcb_off % 4 == 0:
-                    tcb = self.RAM_BASE + tcb_off
+                    tcb = self.ram_base + tcb_off
                     own1 = struct.unpack_from("<I", ram, tcb_off + 0x10)[0]
                     own2 = struct.unpack_from("<I", ram, tcb_off + 0x24)[0]
                     prio, stack = struct.unpack_from("<II", ram, tcb_off + 0x2C)
                     if (own1 == tcb and own2 == tcb and prio == 0
-                            and self.RAM_BASE <= stack < tcb and tcb - stack <= 0x4000):
+                            and self.ram_base <= stack < tcb and tcb - stack <= 0x4000):
                         return (stack, tcb)
                 at = ram.find(name, at + 1)
         return None
 
     def _cold_vector_base(self):
         if self.with_boot:
-            return 0x00000000
-        vector_base = 0x00010000
+            return self.chip.bootloader_addr
+        app_addr = self.chip.app_addr
+        vector_base = app_addr
         try:
             val = struct.unpack("<I", self.mu.mem_read(vector_base, 4))[0]
             if (val & 0xFE000000) != 0xEA000000 and (val & 0xFFFFF000) != 0xE59FF000:
-                val100 = struct.unpack("<I", self.mu.mem_read(0x00010100, 4))[0]
+                val100 = struct.unpack("<I", self.mu.mem_read(app_addr + 0x100, 4))[0]
                 if (val100 & 0xFE000000) == 0xEA000000 or (val100 & 0xFFFFF000) == 0xE59FF000:
-                    vector_base = 0x00010100
+                    vector_base = app_addr + 0x100
                 elif val == 0xFFFFFFFF or val == 0x94b5072f:
-                    vector_base = 0x00011000
+                    vector_base = app_addr + 0x1000
         except Exception:
             pass
         return vector_base

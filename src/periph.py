@@ -25,9 +25,20 @@ whatever reset state the pad has, and the emulator has not been told otherwise.
 import os
 import re
 
+try:
+    from .chips import CHIPS
+except ImportError:
+    from chips import CHIPS
+
 PIN_COUNT = 32
-BK7252_PIN_COUNT = 40
 BK7252_EXT_SLOT = 48
+
+
+def chip_pin_count(chip):
+    """GPIO pins of a chip name. Names with no chip file (report-only, such as
+    BK7231M or BL2028N from a firmware's file name) have the base bank."""
+    found = CHIPS.get(chip)
+    return found.gpio_pins if found else PIN_COUNT
 FUNC_REGS = {32: "REG_GPIO_FUNC_CFG", 46: "REG_GPIO_FUNC_CFG_2",
              47: "REG_GPIO_FUNC_CFG_3"}
 
@@ -167,8 +178,8 @@ def parse_i2c_lines(lines):
 def gpio_pin_values(gpio, chip=""):
     """Return a logical ``pin -> config`` map, excluding controller words."""
     pins = {pin: value for pin, value in gpio.items() if 0 <= pin < PIN_COUNT}
-    if chip in ("BK7231U", "BK7252"):
-        for pin in range(PIN_COUNT, BK7252_PIN_COUNT):
+    if chip_pin_count(chip) > PIN_COUNT:
+        for pin in range(PIN_COUNT, chip_pin_count(chip)):
             slot = BK7252_EXT_SLOT + pin - PIN_COUNT
             if slot in gpio:
                 pins[pin] = gpio[slot]
@@ -795,7 +806,7 @@ def decode_state(gpio, pwm, chip="", i2c_frames=None, i2c_last_on=None,
         channels, ctl, base = pwm_channels(pwm)
         layout = "old"
     logical_gpio = gpio_pin_values(gpio, chip)
-    pin_count = BK7252_PIN_COUNT if chip in ("BK7231U", "BK7252") else PIN_COUNT
+    pin_count = chip_pin_count(chip)
     out = {"gpio": gpio_table(logical_gpio, pin_count),
            "pwm_layout": layout,
            # Logical pin keys are what GUI actions and report assertions need;

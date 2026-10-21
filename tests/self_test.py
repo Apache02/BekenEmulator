@@ -1531,7 +1531,7 @@ TEST_CASES = [
         # Two things make it worth its own case:
         #
         # 1. The firmware reads the SCTRL device-id register back and PRINTS it
-        #    ("device_id=0x21128000"), which is exactly the value CHIP_FAMILIES
+        #    ("device_id=0x21128000"), which is exactly the value src/chips/bk7238.py
         #    serves for -chip BK7238. No other case asserts a chip-id round
         #    trip: here the firmware itself confirms the identity we hand it,
         #    so a wrong -chip would show up in the device's own log.
